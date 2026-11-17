@@ -11,6 +11,7 @@ __pycache__/
 
 # Node
 node_modules/
+bindings/wasm/pkg/
 
 # Local secrets and editor files
 .env
