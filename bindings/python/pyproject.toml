@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "geosquare-engine"
+version = "0.1.0"
+description = "GeoSquare V2 grid engine: GID codec, Int64 packing, topology, and column detection (spec 2.0)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.maturin]
+module-name = "geosquare_engine._core"
+python-source = "python"
