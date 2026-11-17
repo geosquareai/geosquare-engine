@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vectors-manifest:
+    name: Vector copy matches manifest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check SHA-256 of every vector file
+        working-directory: vectors/spec-2.0
+        run: |
+          python3 - <<'PY'
+          import hashlib, json
+          manifest = json.load(open("manifest.json"))
+          for name, entry in manifest["files"].items():
+              digest = hashlib.sha256(open(name, "rb").read()).hexdigest()
+              assert digest == entry["sha256"], f"{name} differs from manifest"
+          print("ok", len(manifest["files"]), "files")
+          PY
+
+  core:
+    name: Rust core (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.0
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Check formatting
+        working-directory: core
+        run: cargo fmt --check
+
+      - name: Run clippy with warnings as errors
+        working-directory: core
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests against spec 2.0 vectors
+        working-directory: core
+        run: cargo test --all-targets --locked
