@@ -31,6 +31,8 @@ pub enum CodecError {
     InvalidLevel(u8),
     IndexOutOfRange { level: u8, x_idx: u64, y_idx: u64 },
     InvalidGid(String),
+    LevelMismatch { first: u8, second: u8 },
+    ChildBelowParent { parent: u8, child: u8 },
 }
 
 impl fmt::Display for CodecError {
@@ -48,6 +50,12 @@ impl fmt::Display for CodecError {
                 )
             }
             CodecError::InvalidGid(gid) => write!(f, "GID {gid:?} is not a valid V2 GID"),
+            CodecError::LevelMismatch { first, second } => {
+                write!(f, "cells are on different levels ({first} and {second})")
+            }
+            CodecError::ChildBelowParent { parent, child } => {
+                write!(f, "child level {child} is above parent level {parent}")
+            }
         }
     }
 }

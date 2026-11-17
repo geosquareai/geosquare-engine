@@ -47,10 +47,16 @@ pub fn descendant_range(
     parent: Cell,
     child_level: u8,
 ) -> Result<(i64, i64), PackingError> {
-    if child_level < parent.level || child_level > MAX_LEVEL {
+    if child_level > MAX_LEVEL {
         return Err(PackingError::InvalidCell(CodecError::InvalidLevel(
             child_level,
         )));
+    }
+    if child_level < parent.level {
+        return Err(PackingError::InvalidCell(CodecError::ChildBelowParent {
+            parent: parent.level,
+            child: child_level,
+        }));
     }
     let packed = packing::pack(domain_id, parent)? as u64;
     let parent_bits = packing::path_bits(parent.level);
@@ -69,9 +75,9 @@ pub fn k_disk(cell: Cell, k: u64) -> Result<Vec<Cell>, CodecError> {
     let n = codec::validate(cell)?;
     let (x0, y0) = (cell.x_idx, cell.y_idx);
     let x_lo = x0.saturating_sub(k);
-    let x_hi = (x0 + k).min(n - 1);
+    let x_hi = x0.saturating_add(k).min(n - 1);
     let y_lo = y0.saturating_sub(k);
-    let y_hi = (y0 + k).min(n - 1);
+    let y_hi = y0.saturating_add(k).min(n - 1);
     let mut out = Vec::new();
     for y in y_lo..=y_hi {
         for x in x_lo..=x_hi {
@@ -103,7 +109,10 @@ pub fn k_ring(cell: Cell, k: u64) -> Result<Vec<Cell>, CodecError> {
 /// Grid distance in metres between two cells on the same level.
 pub fn distance_m(a: Cell, b: Cell) -> Result<f64, CodecError> {
     if a.level != b.level {
-        return Err(CodecError::InvalidLevel(b.level));
+        return Err(CodecError::LevelMismatch {
+            first: a.level,
+            second: b.level,
+        });
     }
     codec::validate(a)?;
     codec::validate(b)?;
@@ -173,6 +182,54 @@ mod tests {
         };
         assert_eq!(k_ring(inner, 1).unwrap().len(), 8);
         assert!(!k_ring(inner, 1).unwrap().contains(&inner));
+    }
+
+    #[test]
+    fn huge_k_clips_to_the_grid_without_overflow() {
+        let cell = Cell {
+            level: 2,
+            x_idx: 3,
+            y_idx: 4,
+        };
+        assert_eq!(k_disk(cell, u64::MAX).unwrap().len(), 100);
+        assert!(k_ring(cell, u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn distance_rejects_different_levels_with_a_clear_error() {
+        let a = Cell {
+            level: 3,
+            x_idx: 0,
+            y_idx: 0,
+        };
+        let b = Cell {
+            level: 4,
+            x_idx: 0,
+            y_idx: 0,
+        };
+        assert_eq!(
+            distance_m(a, b),
+            Err(CodecError::LevelMismatch {
+                first: 3,
+                second: 4
+            })
+        );
+    }
+
+    #[test]
+    fn descendant_range_rejects_child_above_parent() {
+        let parent = Cell {
+            level: 4,
+            x_idx: 0,
+            y_idx: 0,
+        };
+        assert_eq!(
+            descendant_range(1, parent, 3),
+            Err(PackingError::InvalidCell(CodecError::ChildBelowParent {
+                parent: 4,
+                child: 3
+            }))
+        );
     }
 
     #[test]

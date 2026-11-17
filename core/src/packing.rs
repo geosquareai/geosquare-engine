@@ -5,6 +5,7 @@
 //! level, coarse level first: 5 bits for a 5x5 level and 2 bits for a 2x2 level.
 
 use crate::codec::{self, Cell, CodecError, MAX_LEVEL, SUBDIVISIONS};
+use std::fmt;
 
 /// Smallest valid domain ID.
 pub const DOMAIN_ID_MIN: u16 = 1;
@@ -26,6 +27,25 @@ impl From<CodecError> for PackingError {
         PackingError::InvalidCell(error)
     }
 }
+
+impl fmt::Display for PackingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PackingError::InvalidDomain(id) => {
+                write!(
+                    f,
+                    "domain ID {id} is outside {DOMAIN_ID_MIN}..={DOMAIN_ID_MAX}"
+                )
+            }
+            PackingError::InvalidCell(error) => write!(f, "{error}"),
+            PackingError::InvalidPacked(value) => {
+                write!(f, "{value} is not a valid V2 packed ID")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PackingError {}
 
 fn width(step: u64) -> u32 {
     if step == 5 {
