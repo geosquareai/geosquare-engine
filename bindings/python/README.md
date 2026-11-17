@@ -33,3 +33,12 @@ gs.distance_m(gid, gs.k_ring(gid, 1)[0])
 - `detect_table` menerima `str`, `int`, dan `None`. Float atau bool melempar `TypeError`. Ubah NaN jadi `None` dulu.
 - Kolom `int64` yang nilainya di luar rentang Int64 melempar `OverflowError`.
 - Hasil harus sama dengan `vectors/spec-2.0`. Test ada di `tests/test_vectors.py`.
+
+## Uji file nyata
+
+```zsh
+GEOSQUARE_REAL_DATA_ROOT=/Users/sawungrana/Documents/map/geosquare \
+  .venv/bin/python -m pytest -q tests/test_real_files.py
+```
+
+Folder yang dipakai harus berisi `geosquare-risk/`, `pandaigadai/`, dan `dukcapil/`. Tanpa variabel itu, test ini dilewati. Butuh `pyarrow`.
