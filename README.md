@@ -1,6 +1,6 @@
 # geosquare-engine
 
-Status: kerangka saja. Belum ada kode. Kode mulai ditulis di Fase 1.
+Status: core Rust sudah lulus semua vector spec 2.0 yang tidak butuh CRS (codec, Int64, topologi, deteksi). Binding Python dan JS belum ada.
 
 ## Fungsi repo ini
 
