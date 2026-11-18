@@ -136,7 +136,9 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/p/geosquare-engine
+    # A job-level permissions block replaces the top-level one, so contents: read must be listed here.
     permissions:
+      contents: read
       id-token: write
     steps:
       - name: Check out repository
