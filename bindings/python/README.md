@@ -1,5 +1,58 @@
 # geosquare-engine (Python)
 
+Python binding for the GeoSquare V2 core. It has the same code as `core/` in Rust, wrapped with PyO3.
+
+Status: codec, packing, topology, and detector are done. Every spec 2.0 vector that does not need CRS passes in Python.
+
+## Install
+
+```zsh
+pip install geosquare-engine
+```
+
+## Develop
+
+```zsh
+cd bindings/python
+uv venv .venv
+uv pip install --python .venv/bin/python maturin pytest
+.venv/bin/maturin develop
+.venv/bin/python -m pytest -q
+```
+
+## Example
+
+```python
+import geosquare_engine as gs
+
+gid = gs.encode(12, 475168, 491792)   # "H2X545M5X4E2"
+gs.decode(gid)                         # (12, 475168, 491792)
+packed = gs.pack(1, gid)               # Int64, domain ID 1
+gs.unpack(packed)                      # (1, "H2X545M5X4E2")
+gs.k_ring(gid, 1)                      # 8 neighbours, not including the cell itself
+gs.distance_m(gid, gs.k_ring(gid, 1)[0])
+```
+
+## Rules
+
+- Invalid input always raises an error. Nothing is repaired silently.
+- `detect_table` accepts `str`, `int`, and `None`. A float or bool raises `TypeError`. Turn NaN into `None` first.
+- An `int64` column value outside the Int64 range raises `OverflowError`.
+- Results must match `vectors/spec-2.0`. The tests are in `tests/test_vectors.py`.
+
+## Real file tests
+
+```zsh
+GEOSQUARE_REAL_DATA_ROOT=/path/to/data \
+  .venv/bin/python -m pytest -q tests/test_real_files.py
+```
+
+The folder must contain `geosquare-risk/`, `pandaigadai/`, and `dukcapil/`. Without that variable, the test is skipped. It needs `pyarrow`.
+
+---
+
+# Bahasa Indonesia
+
 Binding Python untuk core GeoSquare V2. Isinya sama dengan `core/` di Rust, dibungkus PyO3.
 
 Status: codec, packing, topologi, dan detector sudah ada. Semua vector spec 2.0 yang tidak butuh CRS lulus di Python.
@@ -37,7 +90,7 @@ gs.distance_m(gid, gs.k_ring(gid, 1)[0])
 ## Uji file nyata
 
 ```zsh
-GEOSQUARE_REAL_DATA_ROOT=/Users/sawungrana/Documents/map/geosquare \
+GEOSQUARE_REAL_DATA_ROOT=/path/to/data \
   .venv/bin/python -m pytest -q tests/test_real_files.py
 ```
 

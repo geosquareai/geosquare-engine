@@ -1,0 +1,164 @@
+name: Release geosquare-engine
+
+# Two ways to publish:
+#   1. Run this workflow by hand (Actions -> Run workflow). It uploads to TestPyPI.
+#   2. Push a tag named py-v<version>, for example py-v0.1.0. It uploads to PyPI.
+# The tag must match the version in bindings/python/pyproject.toml.
+
+on:
+  push:
+    tags:
+      - "py-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64
+            os: macos-14
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: windows-x86_64
+            os: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.0
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: build
+          args: --release --locked --out dist
+          manylinux: auto
+          before-script-linux: |
+            rustup toolchain install 1.94.0 --profile minimal
+            rustup default 1.94.0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Test wheel from a clean environment
+        shell: bash
+        run: |
+          wheel=$(ls bindings/python/dist/*.whl)
+          for py in 3.11 3.14; do
+            uv run --no-project --python "$py" --with "$wheel" --with "pytest>=8" \
+              python -c "import pathlib, geosquare_engine._core as c; p = pathlib.Path(c.__file__); assert 'bindings' not in p.parts, p"
+            uv run --no-project --python "$py" --with "$wheel" --with "pytest>=8" \
+              python -m pytest -q bindings/python/tests
+          done
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheel-${{ matrix.name }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Build and test sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.0
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: --out dist
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.3.3
+
+      - name: Check that the sdist builds and imports
+        shell: bash
+        run: |
+          sdist=$(ls bindings/python/dist/*.tar.gz)
+          uv run --no-project --python 3.11 --with "$sdist" python -c "import geosquare_engine as gs; assert gs.k_ring(gs.encode(3, 1, 1), 1)"
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: bindings/python/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: [build, sdist]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/geosquare-engine
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels and sdist
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/geosquare-engine
+    permissions:
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check that the tag matches the package version
+        shell: bash
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('bindings/python/pyproject.toml', 'rb'))['project']['version'])")
+          tag="${GITHUB_REF_NAME#py-v}"
+          if [ "$version" != "$tag" ]; then
+            echo "Tag $tag does not match pyproject.toml version $version"
+            exit 1
+          fi
+
+      - name: Download wheels and sdist
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
