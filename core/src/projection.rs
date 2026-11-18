@@ -6,9 +6,8 @@
 //!
 //! Angles are in degrees, and projected coordinates are in metres. The reference is PROJ
 //! 9.5.1 (via `pyproj` 3.7.1). This module reproduces the projection step of that reference
-//! exactly. PROJ also applies a datum shift from WGS 84 for some domains, and this module
-//! does not. [`crate::domain::CRS_DATUM_SHIFT_UNDECLARED`] lists those domains, and
-//! `tests/crs_points.rs` checks the rest.
+//! exactly. Profile-owned datum operations are applied before projection, without a native
+//! dependency or CRS database lookup.
 //!
 //! Inputs must be finite. The functions do not check ranges. Callers check them.
 
@@ -58,10 +57,32 @@ pub enum Projection {
     },
 }
 
-/// A projected CRS: an ellipsoid, a projection, and the false origin offsets.
+/// A WGS84-to-grid geodetic operation. Rotations use arc-seconds; scale uses ppm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DatumOperation {
+    None,
+    GeocentricTranslation {
+        x_m: f64,
+        y_m: f64,
+        z_m: f64,
+    },
+    CoordinateFrame {
+        x_m: f64,
+        y_m: f64,
+        z_m: f64,
+        rx_arcsec: f64,
+        ry_arcsec: f64,
+        rz_arcsec: f64,
+        scale_ppm: f64,
+        inverse: bool,
+    },
+}
+
+/// A projected CRS: an ellipsoid, a datum operation, a projection, and false offsets.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridCrs {
     pub ellipsoid: Ellipsoid,
+    pub datum_operation: DatumOperation,
     pub projection: Projection,
     pub false_easting_m: f64,
     pub false_northing_m: f64,
@@ -73,6 +94,9 @@ impl GridCrs {
     /// Returns `None` where the projection is undefined. For a transverse Mercator that is
     /// more than 90 degrees of longitude from the central meridian.
     pub fn forward(&self, lon_deg: f64, lat_deg: f64) -> Option<(f64, f64)> {
+        let (lon_deg, lat_deg) = self
+            .datum_operation
+            .forward(lon_deg, lat_deg, self.ellipsoid);
         let lon = lon_deg.to_radians();
         let lat = lat_deg.to_radians();
         let (x, y) = match self.projection {
@@ -143,14 +167,178 @@ impl GridCrs {
                 y,
             ),
         };
-        let lon_deg = wrap_radians(lon).to_degrees();
-        let lat_deg = lat.to_degrees();
-        let valid = lon.is_finite() && lat.is_finite() && lat.abs() <= FRAC_PI_2;
+        let (lon_deg, lat_deg) =
+            self.datum_operation
+                .inverse(lon.to_degrees(), lat.to_degrees(), self.ellipsoid);
+        let lon_deg = wrap_radians(lon_deg.to_radians()).to_degrees();
+        let valid = lon_deg.is_finite() && lat_deg.is_finite() && (-90.0..=90.0).contains(&lat_deg);
         valid.then_some((lon_deg, lat_deg))
     }
 }
 
-/// Wrap an angle in radians to the range -pi..=pi.
+/// WGS84 is the input geodetic frame for every profile pipeline.
+const WGS84: Ellipsoid = Ellipsoid::new(6_378_137.0, 298.257_223_563);
+
+impl DatumOperation {
+    fn forward(self, lon_deg: f64, lat_deg: f64, target: Ellipsoid) -> (f64, f64) {
+        self.transform(lon_deg, lat_deg, target, false)
+    }
+
+    fn inverse(self, lon_deg: f64, lat_deg: f64, target: Ellipsoid) -> (f64, f64) {
+        self.transform(lon_deg, lat_deg, target, true)
+    }
+
+    fn transform(
+        self,
+        lon_deg: f64,
+        lat_deg: f64,
+        target: Ellipsoid,
+        inverse_direction: bool,
+    ) -> (f64, f64) {
+        if matches!(self, DatumOperation::None) {
+            return (lon_deg, lat_deg);
+        }
+        let input_ellipsoid = if inverse_direction { target } else { WGS84 };
+        let output_ellipsoid = if inverse_direction { WGS84 } else { target };
+        let (mut x, mut y, mut z) = geodetic_to_cartesian(input_ellipsoid, lon_deg, lat_deg);
+        match self {
+            DatumOperation::None => unreachable!(),
+            DatumOperation::GeocentricTranslation { x_m, y_m, z_m } => {
+                if inverse_direction {
+                    x -= x_m;
+                    y -= y_m;
+                    z -= z_m;
+                } else {
+                    x += x_m;
+                    y += y_m;
+                    z += z_m;
+                }
+            }
+            DatumOperation::CoordinateFrame {
+                x_m,
+                y_m,
+                z_m,
+                rx_arcsec,
+                ry_arcsec,
+                rz_arcsec,
+                scale_ppm,
+                inverse,
+            } => {
+                let invert_matrix = inverse ^ inverse_direction;
+                (x, y, z) = coordinate_frame(
+                    (x, y, z),
+                    (x_m, y_m, z_m),
+                    (rx_arcsec, ry_arcsec, rz_arcsec),
+                    scale_ppm,
+                    invert_matrix,
+                );
+            }
+        }
+        cartesian_to_geodetic(output_ellipsoid, x, y, z)
+    }
+}
+
+fn geodetic_to_cartesian(ellipsoid: Ellipsoid, lon_deg: f64, lat_deg: f64) -> (f64, f64, f64) {
+    let lon = lon_deg.to_radians();
+    let lat = lat_deg.to_radians();
+    let e2 = ellipsoid.e2();
+    let sin_lat = lat.sin();
+    let radius = ellipsoid.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+    (
+        radius * lat.cos() * lon.cos(),
+        radius * lat.cos() * lon.sin(),
+        radius * (1.0 - e2) * sin_lat,
+    )
+}
+
+fn cartesian_to_geodetic(ellipsoid: Ellipsoid, x: f64, y: f64, z: f64) -> (f64, f64) {
+    let e2 = ellipsoid.e2();
+    let horizontal = x.hypot(y);
+    let mut latitude = z.atan2(horizontal * (1.0 - e2));
+    for _ in 0..20 {
+        let sin_lat = latitude.sin();
+        let radius = ellipsoid.semi_major_m / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+        let height = horizontal / latitude.cos() - radius;
+        let next = z.atan2(horizontal * (1.0 - e2 * radius / (radius + height)));
+        if (next - latitude).abs() < 1e-15 {
+            latitude = next;
+            break;
+        }
+        latitude = next;
+    }
+    (y.atan2(x).to_degrees(), latitude.to_degrees())
+}
+
+fn coordinate_frame(
+    point: (f64, f64, f64),
+    translation: (f64, f64, f64),
+    rotations_arcsec: (f64, f64, f64),
+    scale_ppm: f64,
+    inverse: bool,
+) -> (f64, f64, f64) {
+    let (rx_arcsec, ry_arcsec, rz_arcsec) = rotations_arcsec;
+    let (rx, ry, rz) = (
+        rx_arcsec.to_radians() / 3_600.0,
+        ry_arcsec.to_radians() / 3_600.0,
+        rz_arcsec.to_radians() / 3_600.0,
+    );
+    let scale = 1.0 + scale_ppm * 1e-6;
+    let matrix = [[scale, rz, -ry], [-rz, scale, rx], [ry, -rx, scale]];
+    if !inverse {
+        return (
+            translation.0
+                + matrix[0][0] * point.0
+                + matrix[0][1] * point.1
+                + matrix[0][2] * point.2,
+            translation.1
+                + matrix[1][0] * point.0
+                + matrix[1][1] * point.1
+                + matrix[1][2] * point.2,
+            translation.2
+                + matrix[2][0] * point.0
+                + matrix[2][1] * point.1
+                + matrix[2][2] * point.2,
+        );
+    }
+
+    let determinant = matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]);
+    let inverse_matrix = [
+        [
+            (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1]) / determinant,
+            (matrix[0][2] * matrix[2][1] - matrix[0][1] * matrix[2][2]) / determinant,
+            (matrix[0][1] * matrix[1][2] - matrix[0][2] * matrix[1][1]) / determinant,
+        ],
+        [
+            (matrix[1][2] * matrix[2][0] - matrix[1][0] * matrix[2][2]) / determinant,
+            (matrix[0][0] * matrix[2][2] - matrix[0][2] * matrix[2][0]) / determinant,
+            (matrix[0][2] * matrix[1][0] - matrix[0][0] * matrix[1][2]) / determinant,
+        ],
+        [
+            (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0]) / determinant,
+            (matrix[0][1] * matrix[2][0] - matrix[0][0] * matrix[2][1]) / determinant,
+            (matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0]) / determinant,
+        ],
+    ];
+    let shifted = (
+        point.0 - translation.0,
+        point.1 - translation.1,
+        point.2 - translation.2,
+    );
+    (
+        inverse_matrix[0][0] * shifted.0
+            + inverse_matrix[0][1] * shifted.1
+            + inverse_matrix[0][2] * shifted.2,
+        inverse_matrix[1][0] * shifted.0
+            + inverse_matrix[1][1] * shifted.1
+            + inverse_matrix[1][2] * shifted.2,
+        inverse_matrix[2][0] * shifted.0
+            + inverse_matrix[2][1] * shifted.1
+            + inverse_matrix[2][2] * shifted.2,
+    )
+}
+
 fn wrap_radians(angle: f64) -> f64 {
     let wrapped = (angle + PI).rem_euclid(TAU) - PI;
     if wrapped.is_finite() {
@@ -380,6 +568,7 @@ mod tests {
     fn lcc_id() -> GridCrs {
         GridCrs {
             ellipsoid: WGS84,
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: -2.550_295_649_999_98,
                 lon_origin: 118.015_214_45,
@@ -394,6 +583,7 @@ mod tests {
     fn tm_sg() -> GridCrs {
         GridCrs {
             ellipsoid: WGS84,
+            datum_operation: DatumOperation::None,
             projection: Projection::TransverseMercator {
                 lat_origin: 1.3299809,
                 lon_origin: 103.8469117,
@@ -453,6 +643,39 @@ mod tests {
     fn transverse_mercator_is_undefined_beyond_ninety_degrees_of_longitude() {
         assert!(tm_sg().forward(103.8469117 + 91.0, 1.0).is_none());
         assert!(tm_sg().forward(103.8469117 - 89.0, 1.0).is_some());
+    }
+
+    #[test]
+    fn explicit_datum_operations_match_profile_pipelines() {
+        let cases = [
+            (
+                "ID",
+                113.321534,
+                0.114714,
+                -520_545.2190706509,
+                292_422.3528325562,
+            ),
+            (
+                "LA",
+                104.692439,
+                18.206297,
+                87_993.78708440889,
+                205.00526371566863,
+            ),
+            (
+                "PH",
+                125.236552,
+                7.689755,
+                528_532.9425309931,
+                -564_362.7348385843,
+            ),
+        ];
+        for (code, lon, lat, expected_x, expected_y) in cases {
+            let domain = crate::domain::by_code(code).unwrap();
+            let (x, y) = domain.grid_crs.forward(lon, lat).unwrap();
+            assert!((x - expected_x).abs() < 0.001, "{code} x: {x}");
+            assert!((y - expected_y).abs() < 0.001, "{code} y: {y}");
+        }
     }
 
     #[test]

@@ -1,9 +1,8 @@
 //! CRS parity: lon/lat to GID against `points.json`, which the Python oracle generated with
 //! pyproj 3.7.1 (PROJ 9.5.1).
 //!
-//! A released domain must match every listed GID at every level. A domain whose CRS does not
-//! match pyproj must refuse lon/lat with `CrsNotReleased`, so it never returns a wrong cell.
-//! The 300-point measurements behind the released list are in `domain::CRS_DATUM_SHIFT_UNDECLARED`.
+//! A domain whose explicit datum operation is blocked must refuse lon/lat, so it never
+//! returns a cell based on an unapproved operation.
 
 use geosquare_core::codec;
 use geosquare_core::domain;
@@ -65,15 +64,18 @@ fn released_domains_match_pyproj_at_every_listed_level() {
         }
     }
 
-    eprintln!("released and matching pyproj: {released_checked:?}");
     eprintln!(
-        "not released (datum shift undeclared): {:?}",
-        domain::CRS_DATUM_SHIFT_UNDECLARED
+        "blocked explicit datum operations: {:?}",
+        domain::CRS_DOMAINS_BLOCKED
     );
     assert!(
         failures.is_empty(),
         "parity failures:\n{}",
         failures.join("\n")
     );
-    assert_eq!(released_checked.len(), 7, "seven domains are released");
+    assert_eq!(
+        released_checked.len(),
+        11,
+        "ten domains have released operations plus an extra ID case"
+    );
 }

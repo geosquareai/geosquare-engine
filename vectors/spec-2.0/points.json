@@ -36,8 +36,8 @@
       },
       "lat": 15.981051,
       "lon": 107.868144,
-      "production_ready": true,
-      "support_status": "production_ready"
+      "production_ready": false,
+      "support_status": "blocked_datum_review"
     },
     {
       "domain_code": "BN",

@@ -4,77 +4,77 @@
       "domain_code": "ID",
       "domain_id": 1,
       "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "production_ready"
     },
     {
       "domain_code": "VN",
       "domain_id": 2,
-      "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
-      "support_status": "production_ready"
+      "production_ready": false,
+      "profile_version": "2.2.0-explicit-datum",
+      "support_status": "blocked_datum_review"
     },
     {
       "domain_code": "BN",
       "domain_id": 3,
       "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "production_ready"
     },
     {
       "domain_code": "KH",
       "domain_id": 4,
       "production_ready": false,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "provisional_technical_candidate"
     },
     {
       "domain_code": "LA",
       "domain_id": 5,
       "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "production_ready"
     },
     {
       "domain_code": "MY",
       "domain_id": 6,
       "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "production_ready"
     },
     {
       "domain_code": "MM",
       "domain_id": 7,
       "production_ready": false,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "provisional_technical_candidate"
     },
     {
       "domain_code": "PH",
       "domain_id": 8,
       "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "production_ready"
     },
     {
       "domain_code": "SG",
       "domain_id": 9,
       "production_ready": true,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "production_ready"
     },
     {
       "domain_code": "TH",
       "domain_id": 10,
       "production_ready": false,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "provisional_technical_candidate"
     },
     {
       "domain_code": "TL",
       "domain_id": 11,
       "production_ready": false,
-      "profile_version": "2.1.0-static-datum",
+      "profile_version": "2.2.0-explicit-datum",
       "support_status": "provisional_technical_candidate"
     }
   ],
@@ -88,8 +88,8 @@
       "sha256": "5828f8cffba2857317badba2fba95d4ed39cc522fe48c6054fbf8b8a49d390cb"
     },
     "points.json": {
-      "bytes": 3733,
-      "sha256": "109b631ba5570250b05e2c033c07b42cd4779ded0681aa35b4951bd725ee19a0"
+      "bytes": 3738,
+      "sha256": "6d9e7ac85845b30970dccd54f3a1097788eca689a7690e1601229e9a00e7332b"
     },
     "projected.json": {
       "bytes": 95402,

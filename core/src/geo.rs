@@ -18,7 +18,7 @@ pub enum GeoError {
         lon: f64,
         lat: f64,
     },
-    /// The domain's lon/lat results do not match pyproj yet, so the domain is not released.
+    /// The domain's explicit datum operation is not released for lon/lat work.
     CrsNotReleased {
         code: &'static str,
     },
@@ -52,7 +52,7 @@ impl fmt::Display for GeoError {
             GeoError::CrsNotReleased { code } => {
                 write!(
                     f,
-                    "domain {code} is not released for lon/lat: its CRS does not match pyproj"
+                    "domain {code} is not released for lon/lat: its explicit datum operation is blocked"
                 )
             }
             GeoError::ForwardUndefined { lon, lat } => {
@@ -346,12 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn domains_with_undeclared_datum_shift_are_not_released() {
-        let d = id();
+    fn explicit_operation_block_is_not_released() {
+        let d = domain::by_code("VN").unwrap();
         assert!(!d.crs_released());
         assert_eq!(
-            point_to_cell(d, 106.8456, -6.2088, 5),
-            Err(GeoError::CrsNotReleased { code: "ID" })
+            point_to_cell(d, 107.868144, 15.981051, 5),
+            Err(GeoError::CrsNotReleased { code: "VN" })
         );
         assert_eq!(
             cell_polygon_wgs84(
@@ -363,7 +363,7 @@ mod tests {
                 },
                 1_000.0
             ),
-            Err(GeoError::CrsNotReleased { code: "ID" })
+            Err(GeoError::CrsNotReleased { code: "VN" })
         );
         // The projected square needs no CRS, so it stays available.
         assert!(cell_bounds(
