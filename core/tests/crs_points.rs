@@ -75,7 +75,7 @@ fn released_domains_match_pyproj_at_every_listed_level() {
     );
     assert_eq!(
         released_checked.len(),
-        11,
-        "ten domains have released operations plus an extra ID case"
+        12,
+        "all 11 domains plus one extra ID case have released operations"
     );
 }
