@@ -8,12 +8,12 @@
 //! `production_ready: false` is provisional and must not be released.
 
 use crate::codec::ROOT_SIDE_M;
-use crate::projection::{Ellipsoid, GridCrs, Projection};
+use crate::projection::{DatumOperation, Ellipsoid, GridCrs, Projection};
 
 /// Registry version this table is pinned to.
 pub const REGISTRY_VERSION: &str = "2.0.0";
 /// Profile version of the grid CRS definitions in this table.
-pub const PROFILE_VERSION: &str = "2.1.0-static-datum";
+pub const PROFILE_VERSION: &str = "2.2.0-explicit-datum";
 
 /// One country domain: its ID, code, grid origin, and grid CRS.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,26 +32,14 @@ impl Domain {
         ROOT_SIDE_M
     }
 
-    /// True when lon/lat to cell matches pyproj for this domain (see [`CRS_DATUM_SHIFT_UNDECLARED`]).
+    /// True when the profile's explicit datum operation is available in this engine.
     pub fn crs_released(&self) -> bool {
-        !CRS_DATUM_SHIFT_UNDECLARED.contains(&self.code)
+        !CRS_DOMAINS_BLOCKED.contains(&self.code)
     }
 }
 
-/// Domains whose lon/lat results differ from pyproj 3.7.1 (PROJ 9.5.1), because PROJ applies a
-/// datum shift from WGS 84 that the profile does not declare.
-///
-/// Measured on 300 random points inside each boundary. Residual is the grid CRS distance from
-/// pyproj:
-///
-/// - ID: 0.31 m max, 2 of 300 points in another 50 m cell.
-/// - LA: 24.7 m max, 114 of 300 points in another 50 m cell.
-/// - VN: 226.8 m max, 300 of 300 points in another 50 m cell.
-/// - PH: 235.1 m max, 300 of 300 points in another 50 m cell.
-///
-/// The other seven domains match to under 0.1 micrometre. These four stay unreleased until the
-/// spec declares how inputs relate to the grid datum.
-pub const CRS_DATUM_SHIFT_UNDECLARED: [&str; 4] = ["ID", "LA", "VN", "PH"];
+/// Domains whose explicit WGS84-to-grid operation is not released yet.
+pub const CRS_DOMAINS_BLOCKED: [&str; 1] = ["VN"];
 
 /// Look up a domain by its code, such as `"ID"`.
 pub fn by_code(code: &str) -> Option<&'static Domain> {
@@ -74,6 +62,16 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: true,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::CoordinateFrame {
+                x_m: -0.2773,
+                y_m: 0.0534,
+                z_m: 0.4819,
+                rx_arcsec: 0.0192857593841035,
+                ry_arcsec: -0.00589917345866696,
+                rz_arcsec: 0.00199870597253436,
+                scale_ppm: -0.028,
+                inverse: false,
+            },
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: -2.55029564999998,
                 lon_origin: 118.01521445,
@@ -90,9 +88,19 @@ pub const DOMAINS: [Domain; 11] = [
         code: "VN",
         origin_x_m: -25_000_000.0,
         origin_y_m: -25_000_000.0,
-        production_ready: true,
+        production_ready: false,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::CoordinateFrame {
+                x_m: -191.90441429,
+                y_m: -39.30318279,
+                z_m: -111.45032835,
+                rx_arcsec: -0.00928836,
+                ry_arcsec: 0.01975479,
+                rz_arcsec: -0.00427372,
+                scale_ppm: 0.252906278,
+                inverse: true,
+            },
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 16.0,
                 lon_origin: 107.5,
@@ -112,6 +120,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: true,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257222101),
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 4.52406018063286,
                 lon_origin: 114.722756845902,
@@ -131,6 +140,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: false,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 12.30190505,
                 lon_origin: 104.9807535,
@@ -150,6 +160,11 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: true,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378245.0, 298.3),
+            datum_operation: DatumOperation::GeocentricTranslation {
+                x_m: -44.585,
+                y_m: 131.212,
+                z_m: 39.544,
+            },
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 18.2061856,
                 lon_origin: 103.8596618,
@@ -169,6 +184,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: true,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257222101),
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 4.10831925000002,
                 lon_origin: 109.4548108,
@@ -188,6 +204,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: false,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 19.108395482,
                 lon_origin: 96.6713193360001,
@@ -207,6 +224,16 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: true,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378206.4, 294.978698213898),
+            datum_operation: DatumOperation::CoordinateFrame {
+                x_m: -127.62,
+                y_m: -67.24,
+                z_m: -47.04,
+                rx_arcsec: 3.068,
+                ry_arcsec: -4.903,
+                rz_arcsec: -1.578,
+                scale_ppm: -1.06,
+                inverse: true,
+            },
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 12.8545389070001,
                 lon_origin: 120.441429557,
@@ -226,6 +253,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: true,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::None,
             projection: Projection::TransverseMercator {
                 lat_origin: 1.3299809,
                 lon_origin: 103.8469117,
@@ -244,6 +272,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: false,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: 13.03884235,
                 lon_origin: 101.4903096,
@@ -263,6 +292,7 @@ pub const DOMAINS: [Domain; 11] = [
         production_ready: false,
         grid_crs: GridCrs {
             ellipsoid: Ellipsoid::new(6378137.0, 298.257223563),
+            datum_operation: DatumOperation::None,
             projection: Projection::LambertConformalConic2Sp {
                 lat_origin: -8.81553470000003,
                 lon_origin: 125.6918511,
@@ -314,6 +344,6 @@ mod tests {
             .filter(|d| !d.production_ready)
             .map(|d| d.code)
             .collect();
-        assert_eq!(provisional, ["KH", "MM", "TH", "TL"]);
+        assert_eq!(provisional, ["VN", "KH", "MM", "TH", "TL"]);
     }
 }
