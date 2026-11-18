@@ -9,6 +9,8 @@ description = "GeoSquare V2 grid engine: GID codec, Int64 packing, topology, and
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["geosquare", "gis", "geospatial", "grid", "gid"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
