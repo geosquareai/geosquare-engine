@@ -1,13 +1,13 @@
 # geosquare-engine
 
-Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. Ten domains have an engine operation. VN remains blocked until its operation review closes. See "CRS status" below.
+Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. All 11 domains have an engine operation. VN remains non-production and provisional. See "CRS status" below.
 
 | Part | Status | Location |
 |---|---|---|
 | Rust core: GID codec, Int64 packing, topology, column detection | Done. Passes the spec 2.0 vectors | `core/` |
 | Python binding (PyO3) | Done | `bindings/python/` |
 | WebAssembly / npm binding | Done | `bindings/wasm/` |
-| CRS: point to cell, cell to polygon | Phase 3 E8. Explicit datum operations for 10 domains; VN blocked | `core/src/projection.rs`, `core/src/domain.rs`, `core/src/geo.rs` |
+| CRS: point to cell, cell to polygon | Phase 3 E8. Explicit datum operations for all 11 domains; VN provisional | `core/src/projection.rs`, `core/src/domain.rs`, `core/src/geo.rs` |
 | `points.json` and `projected.json` vectors | Pass for released domains. Blocked domains must refuse lon/lat | `vectors/spec-2.0/` |
 | DuckDB, Postgres, BigQuery bindings | Planned | - |
 
@@ -39,9 +39,9 @@ Measured on 300 spread-out points inside each boundary. The explicit pipelines m
 | ID | `INVERSE(EPSG:15912) + EPSG:9472` | Available |
 | LA | `INVERSE(EPSG:1065)` | Available |
 | PH | `INVERSE(EPSG:15708)` | Available |
-| VN | `INVERSE(EPSG:6960)` | Blocked. Operation review remains open |
+| VN | `INVERSE(EPSG:6960)` | Available for provisional technical use |
 
-The Rust engine applies the profile-owned operation before projection. It does not query a CRS database. VN stays blocked because EPSG offers competing operations. Independent control points are still needed before any production claim.
+The Rust engine applies the profile-owned operation before projection. It does not query a CRS database. VN is provisional because EPSG offers competing operations. Independent control points are still needed before any production claim.
 
 ## Rules
 
@@ -69,7 +69,7 @@ For Python, see `bindings/python/README.md`.
 
 # Bahasa Indonesia
 
-Status: Fase 1 selesai. Bagian CRS Fase 3 sekarang memakai datum operation yang tertulis. Sepuluh domain punya operation di engine. VN masih diblokir sampai review operation selesai. Lihat bagian "CRS status" di atas.
+Status: Fase 1 selesai. Bagian CRS Fase 3 sekarang memakai datum operation yang tertulis. Semua 11 domain punya operation di engine. VN masih provisional dan bukan produksi. Lihat bagian "CRS status" di atas.
 
 Tabel status ada di atas.
 

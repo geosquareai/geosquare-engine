@@ -38,8 +38,8 @@ impl Domain {
     }
 }
 
-/// Domains whose explicit WGS84-to-grid operation is not released yet.
-pub const CRS_DOMAINS_BLOCKED: [&str; 1] = ["VN"];
+/// No domains are blocked in this technical candidate. VN remains non-production.
+pub const CRS_DOMAINS_BLOCKED: [&str; 0] = [];
 
 /// Look up a domain by its code, such as `"ID"`.
 pub fn by_code(code: &str) -> Option<&'static Domain> {

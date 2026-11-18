@@ -346,33 +346,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_operation_block_is_not_released() {
+    fn provisional_vn_operation_is_available() {
         let d = domain::by_code("VN").unwrap();
-        assert!(!d.crs_released());
-        assert_eq!(
-            point_to_cell(d, 107.868144, 15.981051, 5),
-            Err(GeoError::CrsNotReleased { code: "VN" })
-        );
-        assert_eq!(
-            cell_polygon_wgs84(
-                d,
-                Cell {
-                    level: 3,
-                    x_idx: 0,
-                    y_idx: 0
-                },
-                1_000.0
-            ),
-            Err(GeoError::CrsNotReleased { code: "VN" })
-        );
-        // The projected square needs no CRS, so it stays available.
-        assert!(cell_bounds(
+        assert!(d.crs_released());
+        assert!(point_to_cell(d, 107.868144, 15.981051, 5).is_ok());
+        assert!(cell_polygon_wgs84(
             d,
             Cell {
                 level: 3,
                 x_idx: 0,
                 y_idx: 0
-            }
+            },
+            1_000.0
         )
         .is_ok());
     }
