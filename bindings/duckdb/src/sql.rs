@@ -610,6 +610,13 @@ impl Drop for Running {
 unsafe fn start(sql: &str) -> Result<Running, E> {
     unsafe {
         let lease = lease()?;
+        // A streamed result runs ahead of the consumer only by this much; the default (~1 MB)
+        // keeps remote scans almost sequential, which is slow on S3/HTTP latency.
+        let buffer = std::env::var("GEOSQUARE_V2_STREAM_BUFFER").unwrap_or_else(|_| "256MB".into());
+        let _ = exec_on(
+            &lease,
+            &format!("SET streaming_buffer_size = {}", lit(&buffer)),
+        );
         let c = CString::new(sql)?;
         let mut run = Running {
             _lease: None,
@@ -662,8 +669,10 @@ unsafe extern "C" fn proxy_init(info: duckdb_init_info) {
                         }
                     })
                     .collect();
+                // No column wanted (count(*)): one constant, so the inner scan reads nothing
+                // it does not need; only the output's columns are copied.
                 let sql = if cols.is_empty() {
-                    sql.clone()
+                    format!("SELECT 0::BIGINT AS gs_row FROM ({sql}) AS gs_proj")
                 } else {
                     format!("SELECT {} FROM ({sql}) AS gs_proj", cols.join(", "))
                 };
@@ -835,7 +844,8 @@ unsafe extern "C" fn proxy_function(info: duckdb_function_info, output: duckdb_d
                     return Ok(());
                 }
                 let n = duckdb_data_chunk_get_size(chunk) as usize;
-                let cols = duckdb_data_chunk_get_column_count(chunk);
+                let cols = duckdb_data_chunk_get_column_count(chunk)
+                    .min(duckdb_data_chunk_get_column_count(output));
                 for c in 0..cols {
                     let src = duckdb_data_chunk_get_vector(chunk, c);
                     let dst = duckdb_data_chunk_get_vector(output, c);

@@ -262,6 +262,10 @@ ratios of a line always sum to 1, whereas the Shapely oracle can count such a se
 `snapshot_id := <id>` / `as_of := <timestamp>` on `read_cell_dataset`, `query_cell_dataset` and
 `query_cell_datasets` read an older Iceberg snapshot.
 
+Remote reads stream through an internal connection with a 256 MB read-ahead buffer
+(`GEOSQUARE_V2_STREAM_BUFFER`, e.g. `1GB`); DuckDB's ~1 MB default made S3 scans nearly
+sequential.
+
 `compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset with one file per
 partition and keeps its metadata.
 
