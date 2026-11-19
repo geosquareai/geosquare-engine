@@ -12,6 +12,7 @@ mod geom;
 mod grid;
 mod iceberg;
 mod icefast;
+mod inspect;
 mod lines;
 mod maintenance;
 mod metadata;
@@ -226,6 +227,27 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("dry_run", Bool),
             ];
             ex.extend(s3_named());
+            for (name, extra, plan) in [
+                (
+                    "list_cell_datasets",
+                    vec![],
+                    inspect::plan_list as sql::Planner,
+                ),
+                (
+                    "validate_cell_dataset",
+                    vec![],
+                    inspect::plan_validate as sql::Planner,
+                ),
+                (
+                    "cell_dataset_stats",
+                    vec![("exact", Bool)],
+                    inspect::plan_stats as sql::Planner,
+                ),
+            ] {
+                let mut named = extra;
+                named.extend(s3_named());
+                sql::register(con, name, vec![Text], named, plan, pool.clone())?;
+            }
             let mut cp = vec![("partition_level", Int)];
             cp.extend(s3_named());
             sql::register(

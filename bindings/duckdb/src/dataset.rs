@@ -307,10 +307,13 @@ fn from_clause(lease: &Lease, src: &Source, files: Option<&[String]>) -> Result<
     }
     Ok(match &src.layout {
         Layout::Flat if is_http(&src.root) => format!(
-            "read_parquet({})",
+            "read_parquet({}, hive_partitioning = false)",
             lit(&join(&src.root, "data/part-00000.parquet"))
         ),
-        Layout::Flat => format!("read_parquet({})", lit(&join(&src.root, "data/*.parquet"))),
+        Layout::Flat => format!(
+            "read_parquet({}, hive_partitioning = false)",
+            lit(&join(&src.root, "data/*.parquet"))
+        ),
         Layout::Partitioned(_) => match files {
             Some(list) => format!(
                 "read_parquet([{}], hive_partitioning = false)",
@@ -506,6 +509,50 @@ pub fn select_snapshot(lease: &Lease, src: &mut Source, p: &Params) -> Result<()
     Ok(())
 }
 
+/// A whole Iceberg table read with read_parquet over its live files (from the cached
+/// manifests) instead of iceberg_scan, which is very slow on S3. None when the table needs
+/// iceberg_scan (delete files, nothing to prune on, not Iceberg).
+fn iceberg_read_plan(lease: &Lease, src: &Source) -> Result<Option<(Plan, Vec<String>)>, E> {
+    let Layout::Iceberg { metadata } = &src.layout else {
+        return Ok(None);
+    };
+    let (key, meta) = match src.snapshot {
+        Some(id) => (
+            format!("{metadata}#{id}"),
+            meta_at_snapshot(&metadata_json(lease, metadata)?, id),
+        ),
+        None => (metadata.clone(), metadata_json(lease, metadata)?),
+    };
+    let Some(t) = crate::icefast::load(lease, &src.root, &key, &meta)? else {
+        return Ok(None);
+    };
+    let Some(files) = t.all_files(lease)? else {
+        return Ok(None);
+    };
+    let names: Vec<String> = t.columns.iter().map(|(n, _)| n.clone()).collect();
+    let probe = format!("SELECT {}", t.empty_select());
+    if files.is_empty() {
+        return Ok(Some((Plan::Query(format!("{probe} LIMIT 0")), names)));
+    }
+    let cols: Vec<String> = t
+        .columns
+        .iter()
+        .map(|(n, ty)| format!("CAST({0} AS {ty}) AS {0}", sql::ident(n)))
+        .collect();
+    let list: Vec<String> = files.iter().map(|f| lit(f)).collect();
+    Ok(Some((
+        Plan::Typed(
+            format!(
+                "SELECT {} FROM read_parquet([{}], hive_partitioning = false)",
+                cols.join(", "),
+                list.join(", ")
+            ),
+            probe,
+        ),
+        names,
+    )))
+}
+
 pub fn plan_read(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
     let lease = sql::lease()?;
@@ -516,10 +563,17 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
     } else {
         None
     };
-    let plan = Plan::Query(format!(
-        "SELECT * FROM {}",
-        from_clause(&lease, &src, None)?
-    ));
+    let mut present = None;
+    let plan = match iceberg_read_plan(&lease, &src)? {
+        Some((plan, cols)) => {
+            present = Some(cols);
+            plan
+        }
+        None => Plan::Query(format!(
+            "SELECT * FROM {}",
+            from_clause(&lease, &src, None)?
+        )),
+    };
     let plan = match id {
         Some((d, level)) => add_rollup(
             plan,
@@ -530,7 +584,7 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
                 manifest: src.manifest.clone(),
                 weight: None,
                 extra: None,
-                present: None,
+                present,
             },
         )?,
         None if p.int("rollup_level").is_some() => {

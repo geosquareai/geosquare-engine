@@ -168,8 +168,14 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
     if !matches!(o.layout.as_str(), "flat" | "partitioned" | "iceberg") {
         return Err("layout must be 'flat', 'partitioned' or 'iceberg'".into());
     }
-    if !matches!(o.mode.as_str(), "create" | "overwrite" | "append") {
-        return Err("mode must be 'create', 'overwrite' or 'append'".into());
+    if !matches!(
+        o.mode.as_str(),
+        "create" | "overwrite" | "append" | "upsert"
+    ) {
+        return Err("mode must be 'create', 'overwrite', 'append' or 'upsert'".into());
+    }
+    if o.mode == "upsert" && o.layout != "iceberg" {
+        return Err("mode 'upsert' is only for layout 'iceberg' (folders are rewritten whole: use 'overwrite')".into());
     }
     if o.mode == "append" && o.layout != "iceberg" {
         return Err("mode 'append' is only for layout 'iceberg' (a contract folder embeds row_count in every file)".into());
@@ -1365,6 +1371,48 @@ pub(crate) fn max_metadata_version(lease: &Lease, root: &str) -> Result<Option<u
     .max())
 }
 
+/// A DataFile (path, counts, partition, metrics) from a manifest entry's data_file record.
+fn data_file_from_entry(df: &crate::avro::D) -> Option<DataFile> {
+    use crate::avro::D;
+    let path = match df.get("file_path")? {
+        D::Str(s) => s.clone(),
+        _ => return None,
+    };
+    let partition = df.get("partition")?.get(iceberg::PARTITION_FIELD)?.long()?;
+    let longs = |n: &str| -> Vec<(i64, i64)> {
+        match df.get(n) {
+            Some(D::Arr(items)) => items
+                .iter()
+                .filter_map(|kv| Some((kv.get("key")?.long()?, kv.get("value")?.long()?)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let bytes = |n: &str| -> Vec<(i64, Vec<u8>)> {
+        match df.get(n) {
+            Some(D::Arr(items)) => items
+                .iter()
+                .filter_map(|kv| match kv.get("value")? {
+                    D::Bytes(b) => Some((kv.get("key")?.long()?, b.clone())),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    Some(DataFile {
+        path,
+        record_count: df.get("record_count")?.long()?,
+        size: df.get("file_size_in_bytes")?.long()?,
+        partition,
+        column_sizes: longs("column_sizes"),
+        value_counts: longs("value_counts"),
+        null_counts: longs("null_value_counts"),
+        lower: bytes("lower_bounds"),
+        upper: bytes("upper_bounds"),
+    })
+}
+
 fn write_iceberg(
     lease: &Lease,
     root: &str,
@@ -1443,6 +1491,32 @@ fn write_iceberg(
         }
         let (ty, cast) = iceberg_type(t)?;
         wanted.push((c.clone(), ty, cast));
+    }
+
+    // append / upsert: numbers of another numeric type (e.g. a DECIMAL literal) are cast to
+    // the table's column type instead of refusing the write.
+    if prev.is_some() && !overwrite {
+        let numeric =
+            |t: &str| matches!(t, "double" | "float" | "long" | "int") || t.starts_with("decimal");
+        let duck = |t: &str| -> Option<&'static str> {
+            match t {
+                "double" => Some("DOUBLE"),
+                "float" => Some("FLOAT"),
+                "long" => Some("BIGINT"),
+                "int" => Some("INTEGER"),
+                _ => None,
+            }
+        };
+        for w in wanted.iter_mut() {
+            if let Some(cf) = cur_fields.iter().find(|f| f.name == w.0) {
+                if cf.ty != w.1 && numeric(&cf.ty) && numeric(&w.1) {
+                    if let Some(d) = duck(&cf.ty) {
+                        w.1 = cf.ty.clone();
+                        w.2 = Some(d);
+                    }
+                }
+            }
+        }
     }
 
     // Field ids: reuse ids of unchanged columns; new or retyped columns get new ids.
@@ -1590,32 +1664,116 @@ fn write_iceberg(
         )
     };
 
-    // cell_values on append: no cell may already be in the table.
-    if let (Some((meta_path, _)), false) = (&prev, overwrite) {
-        dataset::load_iceberg_ext(lease)?;
-        let scan = match meta_path.rsplit_once("/metadata/") {
-            Some((dir, file)) => format!(
-                "iceberg_scan({}, version = {}, allow_moved_paths = true)",
-                lit(dir),
-                lit(file.strip_suffix(".metadata.json").unwrap_or(file))
-            ),
-            None => format!("iceberg_scan({})", lit(meta_path)),
-        };
-        // Only the staged packed_id range can collide, so the scan prunes files outside it.
-        let r = one_row(
+    // Append: no cell may already be in the table. Upsert: merge the staged rows with the
+    // rows of the partitions they touch (staged rows win); only those partitions are written.
+    let upsert = o.mode == "upsert";
+    if upsert && prev.is_none() {
+        return Err(format!("{root}: mode 'upsert' needs an existing Iceberg table").into());
+    }
+    if upsert && (schema_changed || spec_changed) {
+        return Err("mode 'upsert' keeps the table's columns, types and partition level; the input differs: use mode := 'overwrite'".into());
+    }
+    let mut replaced: std::collections::HashSet<String> = Default::default();
+    let mut replaced_rows = 0i64;
+    let mut staged_rows = st.rows;
+    if let (Some((meta_path, meta)), false) = (&prev, overwrite) {
+        let parts_in: Vec<i64> = rows(
             lease,
-            &format!("SELECT min(packed_id), max(packed_id) FROM {stage}"),
-        )?;
-        let (lo, hi) = (num(&r[0]), num(&r[1]));
-        let dup = num(&one_row(
-            lease,
-            &format!(
-                "SELECT count(*) FROM {stage} s JOIN (SELECT packed_id FROM {scan} \
-                 WHERE packed_id BETWEEN {lo} AND {hi}) t ON s.packed_id = t.packed_id"
-            ),
-        )?[0]);
-        if dup > 0 {
-            return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'overwrite' to replace it)").into());
+            &format!("SELECT DISTINCT packed_id - (packed_id % {width}) FROM {stage} ORDER BY 1"),
+        )?
+        .iter()
+        .map(|r| num(&r[0]))
+        .collect();
+        // files_for takes cell ids: give the first and last id of every partition so its
+        // packed_id bounds check covers whole partitions.
+        let span: Vec<i64> = parts_in.iter().flat_map(|p| [*p, p + width - 1]).collect();
+        let planned = crate::icefast::load(lease, root, meta_path, meta)?
+            .map(|t| t.files_for(lease, &span))
+            .transpose()?
+            .flatten();
+        match (planned, upsert) {
+            (Some(old_files), _) if old_files.is_empty() => {}
+            (Some(old_files), false) => {
+                let list: Vec<String> = old_files.iter().map(|f| lit(f)).collect();
+                let dup = num(&one_row(
+                    lease,
+                    &format!(
+                        "SELECT count(*) FROM {stage} s SEMI JOIN read_parquet([{}], hive_partitioning = false) t ON s.packed_id = t.packed_id",
+                        list.join(", ")
+                    ),
+                )?[0]);
+                if dup > 0 {
+                    return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'upsert' or 'overwrite')").into());
+                }
+            }
+            (Some(old_files), true) => {
+                let list: Vec<String> = old_files.iter().map(|f| lit(f)).collect();
+                let old = format!(
+                    "read_parquet([{}], hive_partitioning = false)",
+                    list.join(", ")
+                );
+                let cols: Vec<String> = st
+                    .columns
+                    .iter()
+                    .map(|(c, _)| {
+                        let c = ident(c);
+                        if c == "\"packed_id\"" {
+                            "coalesce(n.packed_id, o.packed_id) AS packed_id".to_string()
+                        } else {
+                            format!("CASE WHEN n.packed_id IS NOT NULL THEN n.{c} ELSE o.{c} END AS {c}")
+                        }
+                    })
+                    .collect();
+                replaced_rows = num(&one_row(lease, &format!("SELECT count(*) FROM {old}"))?[0]);
+                // stage is `db.main."w_<uuid>"`: the merged table goes next to it.
+                let merged = match stage.strip_suffix('"') {
+                    Some(q) => format!("{q}_u\""),
+                    None => format!("{stage}_u"),
+                };
+                sql::exec_on(lease, &format!("DROP TABLE IF EXISTS {merged}"))?;
+                sql::exec_on(
+                    lease,
+                    &format!(
+                        "CREATE TABLE {merged} AS SELECT {} FROM {stage} n FULL JOIN (SELECT * FROM {old}) o ON n.packed_id = o.packed_id ORDER BY packed_id",
+                        cols.join(", ")
+                    ),
+                )?;
+                sql::exec_on(lease, &format!("DROP TABLE {stage}"))?;
+                let short = stage.rsplit('.').next().unwrap_or(&stage).to_string();
+                sql::exec_on(lease, &format!("ALTER TABLE {merged} RENAME TO {short}"))?;
+                staged_rows = num(&one_row(lease, &format!("SELECT count(*) FROM {stage}"))?[0]);
+                replaced = old_files.into_iter().collect();
+            }
+            (None, true) => {
+                return Err("this table cannot be planned (delete files or no partition values): use mode := 'overwrite'".into());
+            }
+            (None, false) => {
+                // Fallback for tables icefast cannot plan: iceberg_scan over the staged range.
+                dataset::load_iceberg_ext(lease)?;
+                let scan = match meta_path.rsplit_once("/metadata/") {
+                    Some((dir, file)) => format!(
+                        "iceberg_scan({}, version = {}, allow_moved_paths = true)",
+                        lit(dir),
+                        lit(file.strip_suffix(".metadata.json").unwrap_or(file))
+                    ),
+                    None => format!("iceberg_scan({})", lit(meta_path)),
+                };
+                let r = one_row(
+                    lease,
+                    &format!("SELECT min(packed_id), max(packed_id) FROM {stage}"),
+                )?;
+                let (lo, hi) = (num(&r[0]), num(&r[1]));
+                let dup = num(&one_row(
+                    lease,
+                    &format!(
+                        "SELECT count(*) FROM {stage} s JOIN (SELECT packed_id FROM {scan} \
+                         WHERE packed_id BETWEEN {lo} AND {hi}) t ON s.packed_id = t.packed_id"
+                    ),
+                )?[0]);
+                if dup > 0 {
+                    return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'overwrite' to replace it)").into());
+                }
+            }
         }
     }
 
@@ -1676,7 +1834,7 @@ fn write_iceberg(
             "level".into(),
             format!("iceberg:truncate({width},packed_id)"),
         ],
-        prev_total + st.rows,
+        prev_total - replaced_rows + staged_rows,
     )?;
 
     // Data files: one sorted file per partition, written by DuckDB (staged locally for S3).
@@ -1796,9 +1954,75 @@ fn write_iceberg(
             entries = iceberg::read_manifest_list(&bytes)?;
         }
     }
+    let mut carried: Vec<DataFile> = Vec::new();
+    let mut replaced_size = 0i64;
+    if upsert && !replaced.is_empty() {
+        let mut keep = Vec::new();
+        for e in entries {
+            let range = e
+                .partitions
+                .as_ref()
+                .and_then(|p| p.first())
+                .and_then(|(_, lo, hi)| {
+                    let f = |b: &Option<Vec<u8>>| {
+                        Some(i64::from_le_bytes(b.as_ref()?.get(..8)?.try_into().ok()?))
+                    };
+                    f(lo).zip(f(hi))
+                });
+            let touched = match range {
+                Some((lo, hi)) => parts.iter().any(|p| *p >= lo && *p <= hi),
+                None => true,
+            };
+            if !touched {
+                keep.push(e);
+                continue;
+            }
+            if e.spec_id != spec_id {
+                return Err("the table has files of an older partition spec: run compact_cell_dataset first".into());
+            }
+            let bytes = store.get(&relocate(&e.path))?;
+            let (_, recs) = crate::avro::read_container(&bytes)?;
+            let mut hit = false;
+            let mut rest = Vec::new();
+            let mut gone_size = 0i64;
+            for r in recs {
+                if r.get("status").and_then(crate::avro::D::long) == Some(2) {
+                    continue;
+                }
+                let Some(df) = r.get("data_file") else {
+                    continue;
+                };
+                let Some(f) = data_file_from_entry(df) else {
+                    return Err("cannot carry a manifest entry over (unexpected layout): use mode := 'overwrite'".into());
+                };
+                if replaced.contains(&relocate(&f.path)) {
+                    hit = true;
+                    gone_size += f.size;
+                } else {
+                    rest.push(f);
+                }
+            }
+            if hit {
+                carried.extend(rest);
+                replaced_size += gone_size;
+            } else {
+                keep.push(e);
+            }
+        }
+        entries = keep;
+    }
+    // Files kept from manifests an upsert touched: listed again in new manifests.
+    let mut written_carried = Vec::new();
+    for (k, chunk) in carried.chunks(MANIFEST_FILES).enumerate() {
+        let rel = format!("metadata/{write_uuid}-c{k}.avro");
+        let bytes = iceberg::manifest_bytes(chunk, snapshot_id, &schema, &spec, sync_marker());
+        let len = bytes.len() as i64;
+        store.put(&join(root, &rel), bytes)?;
+        written_carried.push((rel, len, chunk));
+    }
     let le = |v: i64| v.to_le_bytes().to_vec();
     let added_rows: i64 = files.iter().map(|f| f.record_count).sum();
-    for (rel, len, chunk) in &written {
+    for (rel, len, chunk) in written.iter().chain(written_carried.iter()) {
         entries.push(ManifestFile {
             path: join(&location, rel),
             length: *len,
@@ -1837,19 +2061,24 @@ fn write_iceberg(
         }
     };
     let mut summary = json!({
-        "operation": if overwrite { "overwrite" } else { "append" },
+        "operation": if overwrite || upsert { "overwrite" } else { "append" },
         "added-data-files": files.len().to_string(),
         "added-records": added_rows.to_string(),
         "added-files-size": added_size.to_string(),
         "changed-partition-count": parts.len().to_string(),
-        "total-records": (base("total-records") + added_rows).to_string(),
-        "total-data-files": (base("total-data-files") + files.len() as i64).to_string(),
-        "total-files-size": (base("total-files-size") + added_size).to_string(),
+        "total-records": (base("total-records") + added_rows - replaced_rows).to_string(),
+        "total-data-files": (base("total-data-files") + files.len() as i64 - replaced.len() as i64).to_string(),
+        "total-files-size": (base("total-files-size") + added_size - replaced_size).to_string(),
         "total-delete-files": "0",
         "total-position-deletes": "0",
         "total-equality-deletes": "0",
         "geosquare-writer": format!("geosquare_v2 duckdb extension {}", env!("CARGO_PKG_VERSION"))
     });
+    if upsert {
+        summary["deleted-data-files"] = json!(replaced.len().to_string());
+        summary["deleted-records"] = json!(replaced_rows.to_string());
+        summary["removed-files-size"] = json!(replaced_size.to_string());
+    }
     if overwrite {
         if let Some((_, m)) = &prev {
             summary["deleted-data-files"] = json!(summary_i64(m, "total-data-files").to_string());
@@ -1991,12 +2220,14 @@ fn write_iceberg(
     Ok(vec![vec![
         Some(if overwrite {
             "iceberg (overwrite)".into()
+        } else if upsert {
+            "iceberg (upsert)".into()
         } else {
             "iceberg".into()
         }),
         Some(join(root, &meta_rel)),
         Some(files.len().to_string()),
-        Some(st.rows.to_string()),
+        Some(staged_rows.to_string()),
     ]])
 }
 

@@ -98,6 +98,18 @@ impl Table {
         Ok(Some(out))
     }
 
+    /// Every live data file of the snapshot, or None when a manifest needs iceberg_scan.
+    pub fn all_files(&self, lease: &Lease) -> Result<Option<Vec<String>>, E> {
+        let mut out = Vec::new();
+        for m in &self.manifests {
+            let Some(files) = manifest_files(lease, self, m)? else {
+                return Ok(None);
+            };
+            out.extend(files.iter().map(|f| f.path.clone()));
+        }
+        Ok(Some(out))
+    }
+
     /// `SELECT NULL::type AS col, ...` with the table's columns and no rows.
     pub fn empty_select(&self) -> String {
         self.columns

@@ -235,6 +235,57 @@ impl Storage {
         Err("no S3 client".into())
     }
 
+    /// Immediate sub-folders of `prefix` (full paths, no trailing slash).
+    pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, E> {
+        if is_local(prefix) {
+            let shown = prefix.trim_end_matches('/');
+            let mut out: Vec<String> = std::fs::read_dir(local(prefix))
+                .map_err(|e| format!("cannot list {prefix}: {e}"))?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| format!("{shown}/{}", e.file_name().to_string_lossy()))
+                .collect();
+            out.sort();
+            return Ok(out);
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.list_dirs(prefix);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Read many objects with `threads` requests at a time, in the order given.
+    pub fn get_many(&self, paths: &[String], threads: usize) -> Result<Vec<Vec<u8>>, E> {
+        let threads = threads.max(1).min(paths.len().max(1));
+        let chunk = paths.len().div_ceil(threads).max(1);
+        let parts: Vec<Result<Vec<Vec<u8>>, String>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = paths
+                .chunks(chunk)
+                .map(|c| {
+                    sc.spawn(move || {
+                        c.iter()
+                            .map(|p| self.get(p).map_err(|e| e.to_string()))
+                            .collect::<Result<Vec<_>, String>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("reader thread panicked".into()))
+                })
+                .collect()
+        });
+        let mut out = Vec::with_capacity(paths.len());
+        for p in parts {
+            out.extend(p?);
+        }
+        Ok(out)
+    }
+
     /// Delete these objects (files, not folders). Returns how many were deleted.
     pub fn delete_many(&self, paths: &[String]) -> Result<usize, E> {
         if paths.is_empty() {
@@ -583,6 +634,21 @@ mod s3 {
                     )
                 })
                 .collect())
+        }
+
+        pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, E> {
+            let (bucket, key) = split_s3(prefix)?;
+            let store = self.store(&bucket)?;
+            let base = ObjPath::from(key.trim_end_matches('/').to_string());
+            let r =
+                runtime()?.block_on(async move { store.list_with_delimiter(Some(&base)).await })?;
+            let mut out: Vec<String> = r
+                .common_prefixes
+                .into_iter()
+                .map(|p| format!("s3://{bucket}/{p}"))
+                .collect();
+            out.sort();
+            Ok(out)
         }
 
         pub fn delete_many(&self, paths: &[String]) -> Result<usize, E> {

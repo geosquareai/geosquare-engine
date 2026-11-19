@@ -8,7 +8,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 |---|---|---|
 | create | `mode := 'create'` (default) | `mode := 'create'` (default) |
 | insert new cells | rewrite: old + new, `mode := 'overwrite'` | `mode := 'append'` (refuses cells already in the table) |
-| update / upsert cells | rewrite: merged rows, `mode := 'overwrite'` | merged rows, `mode := 'overwrite'` (one atomic snapshot) |
+| update / upsert cells | rewrite: merged rows, `mode := 'overwrite'` | `mode := 'upsert'`: only the touched partitions are rewritten |
 | delete cells | rewrite without them, `mode := 'overwrite'` | rows to keep, `mode := 'overwrite'` |
 | add / drop / retype a column | `mode := 'overwrite'` | `mode := 'overwrite'` (new schema id; old snapshots readable) |
 | overview at a coarser level | `rollup_level := L` | `rollup_level := L` |
@@ -127,6 +127,17 @@ SELECT * FROM write_cell_dataset(
 ```
 
 To update in place without adding cells, use `LEFT JOIN changes` instead of `FULL JOIN`.
+
+Iceberg: `mode := 'upsert'` does the merge itself and rewrites only the partitions the changes
+fall in (other files stay as they are), so updating a few areas of a large table is cheap.
+The changes need the table's columns; values are cast to the table's numeric types.
+
+```sql
+CREATE TABLE fixes AS
+SELECT packed_id, 7.0 AS population, 3.0 AS workers
+FROM read_cell_dataset('/data/w_ice') LIMIT 20;
+SELECT * FROM write_cell_dataset('SELECT * FROM fixes', '/data/w_ice', layout := 'iceberg', mode := 'upsert');
+```
 
 ## Delete cells
 
