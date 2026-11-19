@@ -1,0 +1,28 @@
+{
+  "name": "geosquare-v2-duckdb-examples",
+  "private": true,
+  "description": "Ready-to-use readers/writers for GeoSquare V2 cell datasets (flat, partitioned, Iceberg) with DuckDB in Node and in the browser (DuckDB-Wasm).",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:node": "tsx test/node.test.ts",
+    "test:web": "node test/web.test.mjs",
+    "test": "tsx test/node.test.ts /tmp/gs_ts_examples && node test/web.test.mjs /tmp/gs_ts_examples",
+    "demo:query": "tsx examples/node-query.ts",
+    "demo:write": "tsx examples/node-write.ts",
+    "demo:web": "node examples/web/serve.mjs"
+  },
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "1.33.1-dev118.0",
+    "@duckdb/node-api": "1.4.5-r.1",
+    "apache-arrow": "17.0.0"
+  },
+  "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "playwright-core": "^1.56.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

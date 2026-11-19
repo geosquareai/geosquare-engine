@@ -1,0 +1,35 @@
+# Draft for https://github.com/duckdb/community-extensions (extensions/geosquare_v2/description.yml).
+# Requirements before submitting (see community/README.md):
+#   - a PUBLIC repository whose root is this extension (extension-template-rs layout:
+#     Makefile including extension-ci-tools, Cargo crate at the root), with the
+#     geosquare-core crate vendored or published, since geosquare-engine is private;
+#   - `ref` pinned to a commit of that repository.
+extension:
+  name: geosquare_v2
+  description: GeoSquare V2 square-grid cells in SQL - point/polygon/line to cells, packed ids, topology, and cell datasets on Parquet and Iceberg
+  version: 0.1.0
+  language: Rust
+  build: cargo
+  license: Apache-2.0
+  excluded_platforms: "wasm_mvp;wasm_threads;windows_amd64_rtools;windows_amd64_mingw;linux_amd64_musl"
+  requires_toolchains: "rust;python3"
+  maintainers:
+    - geosquareai
+
+repo:
+  github: geosquareai/duckdb-geosquare-v2   # public mirror, to be created
+  ref: 0000000000000000000000000000000000000000
+
+docs:
+  hello_world: |
+    INSTALL geosquare_v2 FROM community;
+    LOAD geosquare_v2;
+    SELECT point_to_cell('ID', 106.8456, -6.2088, 12).gid;
+    SELECT gid, coverage_ratio
+    FROM polygon_to_cells('ID', 'POLYGON ((106.80 -6.25, 106.85 -6.25, 106.85 -6.20, 106.80 -6.20, 106.80 -6.25))', 12);
+  extended_description: |
+    GeoSquare V2 maps each country domain onto exact metric squares (50 km to 5 m) using
+    country-specific projections. The extension wraps the GeoSquare V2 Rust engine:
+    lon/lat to cell, polygon/line to cells with coverage ratios (spec 2.0), Int64 packed
+    ids and topology, and cell datasets (flat or gid_prefix-partitioned Parquet and
+    Iceberg tables) read and written from SQL.

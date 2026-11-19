@@ -1,0 +1,33 @@
+[package]
+name = "geosquare-duckdb"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "DuckDB extension (C API, loadable) for the GeoSquare V2 grid core, spec 2.0."
+publish = false
+
+[lib]
+name = "geosquare_v2"
+crate-type = ["cdylib"]
+
+[dependencies]
+geosquare-core = { path = "../../core" }
+# Pinned: the C API (v1.2.0 struct) keeps one binary loadable in DuckDB 1.4 to 2.0.
+duckdb = { version = "=1.20000.2", default-features = false, features = ["loadable-extension", "vscalar", "vtab"] }
+serde_json = "1"
+miniz_oxide = "0.9"
+i_overlay = "9.2"
+# Native S3 client for metadata/deletes (left out of the Wasm build: --no-default-features).
+object_store = { version = "0.14", default-features = false, features = ["aws"], optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[features]
+default = ["native-s3"]
+native-s3 = ["dep:object_store", "dep:tokio", "dep:futures"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

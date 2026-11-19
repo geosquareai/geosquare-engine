@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>geosquare_v2 wasm test</title>
+<script type="importmap">{"imports": {
+  "apache-arrow": "/node_modules/apache-arrow/Arrow.dom.mjs",
+  "flatbuffers": "/node_modules/flatbuffers/mjs/flatbuffers.js",
+  "tslib": "/node_modules/tslib/tslib.es6.mjs"
+}}</script>
+<script type="module">
+import * as duckdb from "/node_modules/@duckdb/duckdb-wasm/dist/duckdb-browser.mjs";
+const results = {};
+try {
+  const dist = location.origin + "/node_modules/@duckdb/duckdb-wasm/dist/";
+  const bundle = await duckdb.selectBundle({ base: { mainModule: dist + "duckdb-base.wasm", mainWorker: dist + "duckdb-browser-base.worker.js" } });
+  const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), new Worker(bundle.mainWorker));
+  await db.instantiate(bundle.mainModule);
+  await db.open({ allowUnsignedExtensions: true });
+  const c = await db.connect();
+  const one = async (s) => Object.values((await c.query(s)).toArray()[0].toJSON()).map((v) => (v === null ? null : String(v)));
+  results.duckdb = (await one("SELECT version()"))[0];
+  await c.query(`LOAD '${location.origin}/geosquare_v2.duckdb_extension.wasm'`);
+  results.point_to_cell = (await one("SELECT point_to_cell('ID', 106.894082, -6.26109, 12).gid"))[0];
+  const wkt = await (await fetch("/www/query.wkt")).text();
+  for (const layout of ["flat", "partitioned", "iceberg"]) {
+    const p = `${location.origin}/www/${layout}`;
+    results[`${layout}_read`] = await one(`SELECT count(*), sum(population) FROM read_cell_dataset('${p}')`);
+    results[`${layout}_query`] = await one(`SELECT count(*), sum(population) FROM query_cell_dataset('${p}', geometry := '${wkt}', min_coverage := 0.5)`);
+    results[`${layout}_line`] = await one(`SELECT count(*), sum(population), round(sum(length_ratio), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := 'LINESTRING (106.82 -6.22, 106.86 -6.18)')`);
+    results[`${layout}_points`] = await one(`SELECT count(*), sum(point_count) FROM query_cell_dataset('${p}', geometry := 'MULTIPOINT ((106.85 -6.2), (106.85 -6.2), (106.81 -6.24))')`);
+  }
+} catch (e) { results.error = String((e && e.message) || e); }
+window.__results = results;
+</script>
