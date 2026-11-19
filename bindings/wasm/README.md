@@ -33,3 +33,16 @@ npm run build
 npm test
 npm run pack:check
 ```
+## Geographic cell operations
+
+The CRS-aware exports use a numeric registry domain ID and keep the core CRS gate:
+
+```js
+const gid = pointToCell(1, 118.01521445, -2.55029565, 5, false);
+const ring = cellPolygonWgs84(1, gid, 25000, false);
+```
+
+- `pointToCell(domainId, longitude, latitude, level, allowCandidateCrs)` returns a GID.
+- `cellPolygonWgs84(domainId, gid, maxSegmentLengthM, allowCandidateCrs)` returns a closed array of `[longitude, latitude]` pairs.
+- `domainId`, coordinates, level, and segment length are checked JavaScript `Number` values. Invalid, non-finite, fractional, or out-of-range values throw.
+- Released domains use `false` for `allowCandidateCrs`. Candidate domains are refused unless that final argument is explicitly `true`.

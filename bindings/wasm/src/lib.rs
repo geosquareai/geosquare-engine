@@ -7,7 +7,7 @@
 
 use geosquare_core::codec::{self, Cell};
 use geosquare_core::detect::{self, Column, ColumnDetection, DType, Kind, Status, Value};
-use geosquare_core::{packing, topology};
+use geosquare_core::{domain, geo, packing, topology};
 use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -25,6 +25,17 @@ fn cell_of(gid: &str) -> Result<Cell, JsError> {
 
 fn gid_of(cell: Cell) -> Result<String, JsError> {
     codec::encode(cell).map_err(js_error)
+}
+
+fn domain_of(domain_id: &JsValue) -> Result<&'static domain::Domain, JsError> {
+    let id: u16 = whole(domain_id, "domainId")?;
+    domain::by_id(id).ok_or_else(|| JsError::new(&format!("unknown domain ID {id}")))
+}
+
+fn coordinate_array(lon: f64, lat: f64) -> Array {
+    [JsValue::from_f64(lon), JsValue::from_f64(lat)]
+        .into_iter()
+        .collect()
 }
 
 /// Reads a JavaScript `number`. `wasm-bindgen` would turn `null` into 0 and a numeric
@@ -205,6 +216,57 @@ pub fn cell_side_m(
     #[wasm_bindgen(unchecked_param_type = "number")] level: JsValue,
 ) -> Result<f64, JsError> {
     codec::cell_side_m(whole(&level, "level")?).map_err(js_error)
+}
+
+/// Convert a WGS84 longitude/latitude to a GID in a domain.
+///
+/// `domainId`, `longitude`, and `latitude` are JavaScript Numbers and are checked
+/// before the core operation. Candidate CRS domains remain refused unless the final
+/// `allowCandidateCrs` argument is explicitly `true`.
+#[wasm_bindgen(js_name = pointToCell)]
+pub fn point_to_cell(
+    #[wasm_bindgen(unchecked_param_type = "number")] domain_id: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "number")] longitude: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "number")] latitude: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "number")] level: JsValue,
+    allow_candidate_crs: bool,
+) -> Result<String, JsError> {
+    let domain = domain_of(&domain_id)?;
+    let cell = geo::point_to_cell_with_options(
+        domain,
+        number_arg(&longitude, "longitude")?,
+        number_arg(&latitude, "latitude")?,
+        whole(&level, "level")?,
+        allow_candidate_crs,
+    )
+    .map_err(js_error)?;
+    gid_of(cell)
+}
+
+/// Return the closed WGS84 `(longitude, latitude)` ring for a GID.
+///
+/// The ring is densified in the grid CRS before inverse projection. `domainId`,
+/// `maxSegmentLengthM`, and the candidate opt-in follow the same rules as
+/// `pointToCell`; the returned coordinates are plain JavaScript Numbers.
+#[wasm_bindgen(js_name = cellPolygonWgs84)]
+pub fn cell_polygon_wgs84(
+    #[wasm_bindgen(unchecked_param_type = "number")] domain_id: JsValue,
+    gid: &str,
+    #[wasm_bindgen(unchecked_param_type = "number")] max_segment_length_m: JsValue,
+    allow_candidate_crs: bool,
+) -> Result<Array, JsError> {
+    let domain = domain_of(&domain_id)?;
+    let ring = geo::cell_polygon_wgs84_with_options(
+        domain,
+        cell_of(gid)?,
+        number_arg(&max_segment_length_m, "maxSegmentLengthM")?,
+        allow_candidate_crs,
+    )
+    .map_err(js_error)?;
+    Ok(ring
+        .into_iter()
+        .map(|(lon, lat)| JsValue::from(coordinate_array(lon, lat)))
+        .collect())
 }
 
 /// Version of this binding.
