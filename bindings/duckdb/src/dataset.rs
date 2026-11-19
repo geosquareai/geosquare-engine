@@ -539,14 +539,9 @@ fn iceberg_read_plan(lease: &Lease, src: &Source) -> Result<Option<(Plan, Vec<St
         .iter()
         .map(|(n, ty)| format!("CAST({0} AS {ty}) AS {0}", sql::ident(n)))
         .collect();
-    let list: Vec<String> = files.iter().map(|f| lit(f)).collect();
     Ok(Some((
         Plan::Typed(
-            format!(
-                "SELECT {} FROM read_parquet([{}], hive_partitioning = false)",
-                cols.join(", "),
-                list.join(", ")
-            ),
+            format!("SELECT {} FROM {}", cols.join(", "), t.scan(&files)),
             probe,
         ),
         names,
@@ -1102,7 +1097,6 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
                     ));
                 }
                 ctx.present = Some(t.columns.iter().map(|(n, _)| n.clone()).collect());
-                let list: Vec<String> = sel.iter().map(|f| lit(f)).collect();
                 // Every column is cast to the type the probe declares: the proxy copies values
                 // by the declared type, so they must match exactly (e.g. point_count BIGINT).
                 let cols: Vec<String> = t
@@ -1112,10 +1106,10 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
                     .collect();
                 return Ok((Plan::Typed(
                     format!(
-                        "SELECT {}, CAST(k.{extra} AS {extra_type}) AS {extra} FROM read_parquet([{}], hive_partitioning = false) AS d \
+                        "SELECT {}, CAST(k.{extra} AS {extra_type}) AS {extra} FROM {} AS d \
                          JOIN {keys} AS k ON d.packed_id = k.packed_id WHERE d.packed_id BETWEEN {lo} AND {hi}",
                         cols.join(", "),
-                        list.join(", ")
+                        t.scan(&sel)
                     ),
                     format!("SELECT {}, NULL::{extra_type} AS {extra}", t.empty_select()),
                 ), ctx));

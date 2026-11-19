@@ -1687,19 +1687,29 @@ fn write_iceberg(
         // files_for takes cell ids: give the first and last id of every partition so its
         // packed_id bounds check covers whole partitions.
         let span: Vec<i64> = parts_in.iter().flat_map(|p| [*p, p + width - 1]).collect();
-        let planned = crate::icefast::load(lease, root, meta_path, meta)?
+        let table = crate::icefast::load(lease, root, meta_path, meta)?;
+        let planned = table
+            .as_ref()
             .map(|t| t.files_for(lease, &span))
             .transpose()?
             .flatten();
+        let scan = |files: &[String]| -> String {
+            match &table {
+                Some(t) => t.scan(files),
+                None => format!(
+                    "read_parquet([{}], hive_partitioning = false)",
+                    files.iter().map(|f| lit(f)).collect::<Vec<_>>().join(", ")
+                ),
+            }
+        };
         match (planned, upsert) {
             (Some(old_files), _) if old_files.is_empty() => {}
             (Some(old_files), false) => {
-                let list: Vec<String> = old_files.iter().map(|f| lit(f)).collect();
                 let dup = num(&one_row(
                     lease,
                     &format!(
-                        "SELECT count(*) FROM {stage} s SEMI JOIN read_parquet([{}], hive_partitioning = false) t ON s.packed_id = t.packed_id",
-                        list.join(", ")
+                        "SELECT count(*) FROM {stage} s SEMI JOIN {} t ON s.packed_id = t.packed_id",
+                        scan(&old_files)
                     ),
                 )?[0]);
                 if dup > 0 {
@@ -1707,11 +1717,7 @@ fn write_iceberg(
                 }
             }
             (Some(old_files), true) => {
-                let list: Vec<String> = old_files.iter().map(|f| lit(f)).collect();
-                let old = format!(
-                    "read_parquet([{}], hive_partitioning = false)",
-                    list.join(", ")
-                );
+                let old = scan(&old_files);
                 let cols: Vec<String> = st
                     .columns
                     .iter()
@@ -2228,6 +2234,252 @@ fn write_iceberg(
         Some(join(root, &meta_rel)),
         Some(files.len().to_string()),
         Some(staged_rows.to_string()),
+    ]])
+}
+
+// ---------------------------------------------------------------------------
+// alter_cell_dataset: drop, rename or add columns without rewriting data (Iceberg)
+// ---------------------------------------------------------------------------
+
+/// alter_cell_dataset(path, drop_columns := 'a,b' | '["a","b"]', rename_columns :=
+/// '{"old": "new"}', add_columns := '{"name": "DOUBLE"}'). Iceberg only: a new schema with the
+/// same field ids, so data files stay as they are and are read by field id (renamed columns
+/// under their new name, dropped columns left out, added columns 0 until rewritten). The cell
+/// manifest and the column descriptions follow.
+pub fn plan_alter(p: &Params) -> Result<Plan, E> {
+    let path = p.pos_text(0, "path")?;
+    let drop: Vec<String> = match p.text("drop_columns") {
+        None => Vec::new(),
+        Some(t) if t.trim_start().starts_with('[') => serde_json::from_str(&t)
+            .map_err(|_| "drop_columns must be 'a,b' or a JSON list of names")?,
+        Some(t) => t
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+    };
+    let rename: Vec<(String, String)> = match p.text("rename_columns") {
+        None => Vec::new(),
+        Some(t) => match serde_json::from_str::<Json>(&t) {
+            Ok(Json::Object(m)) => m
+                .into_iter()
+                .map(|(k, v)| {
+                    Ok((
+                        k,
+                        v.as_str()
+                            .ok_or("rename_columns values must be names")?
+                            .to_string(),
+                    ))
+                })
+                .collect::<Result<_, E>>()?,
+            _ => return Err("rename_columns must be a JSON object {\"old\": \"new\"}".into()),
+        },
+    };
+    let add: Vec<(String, String)> = match p.text("add_columns") {
+        None => Vec::new(),
+        Some(t) => match serde_json::from_str::<Json>(&t) {
+            Ok(Json::Object(m)) => m
+                .into_iter()
+                .map(|(k, v)| Ok((k, v.as_str().unwrap_or("DOUBLE").to_ascii_uppercase())))
+                .collect::<Result<_, E>>()?,
+            _ => return Err("add_columns must be a JSON object {\"name\": \"DOUBLE\"}".into()),
+        },
+    };
+    if drop.is_empty() && rename.is_empty() && add.is_empty() {
+        return Err("nothing to alter: pass drop_columns, rename_columns or add_columns".into());
+    }
+    let s3 = s3_params(p);
+    Ok(Plan::Action(
+        Box::new(move || alter(&path, &drop, &rename, &add, &s3)),
+        vec!["path".into(), "metadata".into(), "columns".into()],
+    ))
+}
+
+fn alter(
+    path: &str,
+    drop: &[String],
+    rename: &[(String, String)],
+    add: &[(String, String)],
+    s3: &S3Params,
+) -> Result<Vec<Vec<Option<String>>>, E> {
+    let lease = sql::lease()?;
+    let root = path.trim_end_matches('/').to_string();
+    let store = Storage::for_path(&lease, &root, s3)?;
+    let src = dataset::open(&lease, &root)?;
+    let dataset::Layout::Iceberg { metadata } = &src.layout else {
+        return Err("alter_cell_dataset changes Iceberg tables; rewrite a folder dataset with mode := 'overwrite'".into());
+    };
+    let hint_path = join(&root, "metadata/version-hint.text");
+    let hint_tag = store.version_tag(&hint_path)?;
+    let mut meta = dataset::metadata_json(&lease, metadata)?;
+    let sid = meta
+        .get("current-schema-id")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let schemas = meta
+        .get("schemas")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let current = schemas
+        .iter()
+        .find(|s| s.get("schema-id").and_then(Json::as_i64) == Some(sid))
+        .ok_or("current schema not found")?;
+    let mut fields: Vec<Json> = current
+        .get("fields")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let name_of = |f: &Json| {
+        f.get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let protected = ["gid", "packed_id", "x_idx", "y_idx"];
+    for d in drop {
+        if protected.contains(&d.as_str()) {
+            return Err(format!("{d} is a cell id column and cannot be dropped").into());
+        }
+        let n = fields.len();
+        fields.retain(|f| &name_of(f) != d);
+        if fields.len() == n {
+            return Err(format!("drop_columns: no column {d}").into());
+        }
+    }
+    for (old, new) in rename {
+        if protected.contains(&old.as_str()) || protected.contains(&new.as_str()) {
+            return Err(format!("cell id columns cannot be renamed ({old} -> {new})").into());
+        }
+        if fields.iter().any(|f| &name_of(f) == new) {
+            return Err(format!("rename_columns: {new} already exists").into());
+        }
+        let f = fields
+            .iter_mut()
+            .find(|f| &name_of(f) == old)
+            .ok_or_else(|| format!("rename_columns: no column {old}"))?;
+        f["name"] = json!(new);
+        if let Some(o) = f.as_object_mut() {
+            o.remove("doc");
+        }
+    }
+    let mut last_id = meta
+        .get("last-column-id")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let mut added_fields = Vec::new();
+    for (name, ty) in add {
+        if fields.iter().any(|f| &name_of(f) == name) {
+            return Err(format!("add_columns: {name} already exists").into());
+        }
+        let ice = match ty.as_str() {
+            "DOUBLE" => "double",
+            "FLOAT" | "REAL" => "float",
+            "BIGINT" | "LONG" => "long",
+            "INTEGER" | "INT" => "int",
+            other => {
+                return Err(format!(
+                    "add_columns: type {other} is not supported (DOUBLE, FLOAT, BIGINT, INTEGER)"
+                )
+                .into())
+            }
+        };
+        last_id += 1;
+        fields.push(
+            json!({"id": last_id, "name": name, "required": false, "type": ice,
+                           "initial-default": 0, "write-default": 0}),
+        );
+        added_fields.push((name.clone(), ice));
+    }
+    let new_sid = schemas
+        .iter()
+        .filter_map(|s| s.get("schema-id").and_then(Json::as_i64))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut schema = json!({"type": "struct", "schema-id": new_sid, "fields": fields});
+    if let Some(ids) = current.get("identifier-field-ids") {
+        schema["identifier-field-ids"] = ids.clone();
+    }
+
+    // Cell manifest and dataset_info follow the columns.
+    let prop = |m: &Json, k: &str| -> Option<Json> {
+        m.pointer(&format!("/properties/{}", k.replace('/', "~1")))
+            .and_then(Json::as_str)
+            .and_then(|t| serde_json::from_str(t).ok())
+    };
+    let mut manifest = prop(&meta, MANIFEST_KEY).ok_or("the table has no cell manifest")?;
+    let mut info = prop(&meta, crate::metadata::INFO_KEY).unwrap_or_else(|| json!({}));
+    if let Some(vf) = manifest
+        .get_mut("value_fields")
+        .and_then(Json::as_array_mut)
+    {
+        vf.retain(|f| {
+            !drop
+                .iter()
+                .any(|d| f.get("name").and_then(Json::as_str) == Some(d))
+        });
+        for f in vf.iter_mut() {
+            if let Some((_, new)) = rename
+                .iter()
+                .find(|(o, _)| f.get("name").and_then(Json::as_str) == Some(o))
+            {
+                f["name"] = json!(new);
+            }
+        }
+        for (name, ice) in &added_fields {
+            vf.push(json!({"name": name, "parquet_type": ice, "logical_type": "numeric", "semantics": "MEASUREMENT",
+                           "aggregation_rule": null, "unit": null, "nullable": true}));
+        }
+    }
+    if let Some(cols) = info.get_mut("columns").and_then(Json::as_object_mut) {
+        for d in drop {
+            cols.remove(d);
+        }
+        for (o, n) in rename {
+            if let Some(v) = cols.remove(o) {
+                cols.insert(n.clone(), v);
+            }
+        }
+        for (name, _) in &added_fields {
+            cols.insert(name.clone(), json!({"description": null, "unit": null}));
+        }
+    }
+    crate::metadata::schema_docs(&mut schema, &info);
+
+    let now = now_ms();
+    let obj = meta.as_object_mut().ok_or("metadata is not an object")?;
+    obj.get_mut("schemas")
+        .and_then(Json::as_array_mut)
+        .ok_or("schemas")?
+        .push(schema);
+    obj.insert("current-schema-id".into(), json!(new_sid));
+    obj.insert("last-column-id".into(), json!(last_id));
+    let props = obj
+        .entry("properties")
+        .or_insert(json!({}))
+        .as_object_mut()
+        .ok_or("properties")?;
+    props.insert(MANIFEST_KEY.into(), json!(manifest.to_string()));
+    props.insert(crate::metadata::INFO_KEY.into(), json!(info.to_string()));
+    props.insert("geosquare.read-by-field-id".into(), json!("true"));
+    let prev_ts = obj.get("last-updated-ms").cloned().unwrap_or(json!(now));
+    obj.insert("last-updated-ms".into(), json!(now));
+    obj.entry("metadata-log")
+        .or_insert(json!([]))
+        .as_array_mut()
+        .ok_or("metadata-log")?
+        .push(json!({"metadata-file": metadata, "timestamp-ms": prev_ts}));
+    let version = max_metadata_version(&lease, &root)?.map_or(0, |v| v + 1);
+    let stem = format!("{version:05}-{}", uuid4());
+    let meta_rel = format!("metadata/{stem}.metadata.json");
+    store.put(&join(&root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
+    store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
+    let n = manifest["value_fields"].as_array().map_or(0, Vec::len);
+    Ok(vec![vec![
+        Some(root.clone()),
+        Some(join(&root, &meta_rel)),
+        Some(n.to_string()),
     ]])
 }
 

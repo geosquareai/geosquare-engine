@@ -10,7 +10,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 | insert new cells | rewrite: old + new, `mode := 'overwrite'` | `mode := 'append'` (refuses cells already in the table) |
 | update / upsert cells | rewrite: merged rows, `mode := 'overwrite'` | `mode := 'upsert'`: only the touched partitions are rewritten |
 | delete cells | rewrite without them, `mode := 'overwrite'` | rows to keep, `mode := 'overwrite'` |
-| add / drop / retype a column | `mode := 'overwrite'` | `mode := 'overwrite'` (new schema id; old snapshots readable) |
+| add / drop / retype a column | `mode := 'overwrite'` | `alter_cell_dataset` (rename, drop, add: no data rewrite) or `mode := 'overwrite'` |
 | overview at a coarser level | `rollup_level := L` | `rollup_level := L` |
 | merge files / repartition, keep metadata | `compact_cell_dataset(path [, partition_level])` | same |
 | drop old snapshots and their files | - | `expire_snapshots(path, retain_last := N)` |
@@ -161,6 +161,18 @@ SELECT * FROM write_cell_dataset(
 -- the history: one row per snapshot
 LOAD iceberg;
 SELECT sequence_number, snapshot_id FROM iceberg_snapshots('/data/w_ice') ORDER BY sequence_number;
+```
+
+Iceberg tables can also rename, drop or add columns without rewriting any data file:
+`alter_cell_dataset` writes a new schema with the same field ids, and the files are read by
+field id (an added column reads 0 until the data is rewritten). Units, rules and
+descriptions follow the renamed column.
+
+```sql
+SELECT * FROM alter_cell_dataset('/data/w_ice',
+  rename_columns := '{"non_workers": "dependents"}', add_columns := '{"score": "DOUBLE"}');
+SELECT * FROM alter_cell_dataset('/data/w_ice', drop_columns := 'score');
+SELECT "column", unit FROM cell_dataset_columns('/data/w_ice');
 ```
 
 ## Change the partition level

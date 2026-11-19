@@ -266,6 +266,11 @@ Remote reads stream through an internal connection with a 256 MB read-ahead buff
 (`GEOSQUARE_V2_STREAM_BUFFER`, e.g. `1GB`); DuckDB's ~1 MB default made S3 scans nearly
 sequential.
 
+`alter_cell_dataset(path, rename_columns := ..., drop_columns := ..., add_columns := ...)` changes
+an Iceberg table's columns without rewriting data. `list_cell_datasets(prefix)`,
+`validate_cell_dataset(path)` and `cell_dataset_stats(path [, exact := true])` inspect datasets;
+`mode := 'upsert'` rewrites only the partitions an update touches.
+
 `compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset with one file per
 partition and keeps its metadata.
 

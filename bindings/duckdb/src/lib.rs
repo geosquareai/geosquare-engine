@@ -248,6 +248,20 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 named.extend(s3_named());
                 sql::register(con, name, vec![Text], named, plan, pool.clone())?;
             }
+            let mut al = vec![
+                ("drop_columns", Text),
+                ("rename_columns", Text),
+                ("add_columns", Text),
+            ];
+            al.extend(s3_named());
+            sql::register(
+                con,
+                "alter_cell_dataset",
+                vec![Text],
+                al,
+                writer::plan_alter,
+                pool.clone(),
+            )?;
             let mut cp = vec![("partition_level", Int)];
             cp.extend(s3_named());
             sql::register(
