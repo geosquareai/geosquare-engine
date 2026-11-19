@@ -2,7 +2,7 @@
 
 Python binding for the GeoSquare V2 core. It has the same code as `core/` in Rust, wrapped with PyO3.
 
-Status: codec, packing, topology, and detector are done. Every spec 2.0 vector that does not need CRS passes in Python.
+Status: codec, packing, topology, detector, and cell-to-WGS84 polygon operations are done. Every spec 2.0 vector passes in Python.
 
 ## Install
 
@@ -31,14 +31,19 @@ packed = gs.pack(1, gid)               # Int64, domain ID 1
 gs.unpack(packed)                      # (1, "H2X545M5X4E2")
 gs.k_ring(gid, 1)                      # 8 neighbours, not including the cell itself
 gs.distance_m(gid, gs.k_ring(gid, 1)[0])
+ring = gs.cell_polygon_wgs84(1, gid, 1000.0)  # closed WGS84 (lon, lat) ring
 ```
+
+`cell_polygon_wgs84` needs the numeric domain ID because a bare GID does not
+contain a domain. Its segment-length argument is in metres. Candidate CRS domains
+also require `allow_candidate_crs=True` explicitly.
 
 ## Rules
 
 - Invalid input always raises an error. Nothing is repaired silently.
 - `detect_table` accepts `str`, `int`, and `None`. A float or bool raises `TypeError`. Turn NaN into `None` first.
 - An `int64` column value outside the Int64 range raises `OverflowError`.
-- Results must match `vectors/spec-2.0`. The tests are in `tests/test_vectors.py`.
+- Results must match `vectors/spec-2.0`. The tests are in `tests/test_vectors.py` and `tests/test_geo.py`.
 
 ## Real file tests
 
@@ -55,7 +60,7 @@ The folder must contain `geosquare-risk/`, `pandaigadai/`, and `dukcapil/`. With
 
 Binding Python untuk core GeoSquare V2. Isinya sama dengan `core/` di Rust, dibungkus PyO3.
 
-Status: codec, packing, topologi, dan detector sudah ada. Semua vector spec 2.0 yang tidak butuh CRS lulus di Python.
+Status: codec, packing, topologi, detector, dan operasi polygon sel ke WGS84 sudah ada. Semua vector spec 2.0 lulus di Python.
 
 ## Pasang untuk pengembangan
 
