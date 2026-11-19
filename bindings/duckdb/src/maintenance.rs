@@ -123,6 +123,8 @@ fn expire(
     let dataset::Layout::Iceberg { metadata } = &src.layout else {
         return Err("expire_snapshots is for Iceberg tables".into());
     };
+    let hint_path = join(&root, "metadata/version-hint.text");
+    let hint_tag = store.version_tag(&hint_path)?;
     let meta = dataset::metadata_json(&lease, metadata)?;
     let loc = meta
         .get("location")
@@ -270,10 +272,7 @@ fn expire(
             return Err(format!("{root} changed during expire_snapshots; retry").into());
         }
         store.put(&new_meta, serde_json::to_vec_pretty(&next)?)?;
-        store.put(
-            &join(&root, "metadata/version-hint.text"),
-            stem.into_bytes(),
-        )?;
+        store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
         // Data and manifests first, metadata files last.
         let (meta_files, rest): (Vec<String>, Vec<String>) = delete
             .iter()

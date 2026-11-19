@@ -28,7 +28,10 @@ Rules of thumb:
   never a mix, and older snapshots stay readable by their metadata file. Flat/partitioned
   `overwrite` deletes the old files first, so readers can see a partial folder meanwhile;
   write to a new path and switch readers over if that matters.
-- Iceberg has no lock between writers: run one writer per table at a time.
+- Iceberg has no catalog lock: a commit is refused ("changed during the write; retry") when
+  another writer committed first. On S3 the version hint is replaced with a conditional
+  PUT (If-Match), so of two writers committing at the same moment only one succeeds.
+  A refused write leaves unreferenced data files; `expire_snapshots` removes them later.
 - `append` and `overwrite` keep the dataset's metadata (per column by name: unit, semantics,
   aggregation rule, description; and source, coverage, notes, title, period, version).
   Values passed to the write replace them; new columns start without metadata.

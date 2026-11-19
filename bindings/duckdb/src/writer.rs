@@ -1373,6 +1373,9 @@ fn write_iceberg(
     store: &Storage,
 ) -> Result<Vec<Vec<Option<String>>>, E> {
     let stage = stage_table();
+    // Version of the hint the commit must still find (conditional write at the end).
+    let hint_path = join(root, "metadata/version-hint.text");
+    let hint_tag = store.version_tag(&hint_path)?;
     let existing = dataset::latest_iceberg_metadata(lease, root).ok();
     if existing.is_some() && o.mode == "create" {
         return Err(format!(
@@ -1984,7 +1987,7 @@ fn write_iceberg(
     let stem = format!("{version:05}-{}", uuid4());
     let meta_rel = format!("metadata/{stem}.metadata.json");
     store.put(&join(root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
-    store.put(&join(root, "metadata/version-hint.text"), stem.into_bytes())?;
+    store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
     Ok(vec![vec![
         Some(if overwrite {
             "iceberg (overwrite)".into()
@@ -2030,6 +2033,8 @@ fn update_metadata(
     let src = dataset::open(&lease, &root)?;
     match &src.layout {
         dataset::Layout::Iceberg { metadata } => {
+            let hint_path = join(&root, "metadata/version-hint.text");
+            let hint_tag = store.version_tag(&hint_path)?;
             let mut meta = dataset::metadata_json(&lease, metadata)?;
             let prop = |m: &Json, k: &str| -> Option<Json> {
                 m.pointer(&format!("/properties/{}", k.replace('/', "~1")))
@@ -2097,10 +2102,7 @@ fn update_metadata(
             let stem = format!("{version:05}-{}", uuid4());
             let meta_rel = format!("metadata/{stem}.metadata.json");
             store.put(&join(&root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
-            store.put(
-                &join(&root, "metadata/version-hint.text"),
-                stem.into_bytes(),
-            )?;
+            store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
             let n = manifest["value_fields"].as_array().map_or(0, Vec::len);
             Ok(vec![vec![
                 Some(root.clone()),

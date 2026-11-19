@@ -165,6 +165,53 @@ impl Storage {
         Err("no S3 client".into())
     }
 
+    /// A tag of the object's current version (ETag on S3), None when it does not exist.
+    pub fn version_tag(&self, path: &str) -> Result<Option<String>, E> {
+        if is_local(path) {
+            return Ok(std::fs::metadata(local(path)).ok().map(|m| {
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}-{t}", m.len())
+            }));
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.version_tag(path);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Write only if the object is still at version `expected` (None: it must not exist), so
+    /// two writers committing at once cannot both succeed. On S3 this is a conditional PUT
+    /// (If-Match / If-None-Match); locally a check right before the write.
+    pub fn put_if(&self, path: &str, bytes: Vec<u8>, expected: Option<&str>) -> Result<(), E> {
+        let conflict = || -> E { format!("{path} was changed by another writer; retry").into() };
+        if is_local(path) {
+            if self.version_tag(path)?.as_deref() != expected {
+                return Err(conflict());
+            }
+            return self.put(path, bytes);
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.put_if(path, bytes, expected).map_err(|e| {
+                if e.to_string().contains("precondition")
+                    || e.to_string().contains("already exists")
+                {
+                    conflict()
+                } else {
+                    e
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
     /// Every object below `prefix` (recursive): (path, size, last modified ms since epoch).
     pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64, i64)>, E> {
         if is_local(prefix) {
@@ -435,6 +482,39 @@ mod s3 {
             runtime()?.block_on(async move {
                 store
                     .put(&ObjPath::from(key), PutPayload::from(bytes))
+                    .await
+            })?;
+            Ok(())
+        }
+
+        pub fn version_tag(&self, path: &str) -> Result<Option<String>, E> {
+            let (bucket, key) = split_s3(path)?;
+            let store = self.store(&bucket)?;
+            match runtime()?.block_on(async move { store.head(&ObjPath::from(key)).await }) {
+                Ok(m) => Ok(Some(m.e_tag.unwrap_or_default())),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        }
+
+        pub fn put_if(&self, path: &str, bytes: Vec<u8>, expected: Option<&str>) -> Result<(), E> {
+            use object_store::{PutMode, PutOptions, UpdateVersion};
+            let (bucket, key) = split_s3(path)?;
+            let store = self.store(&bucket)?;
+            let mode = match expected {
+                Some(tag) => PutMode::Update(UpdateVersion {
+                    e_tag: Some(tag.to_string()),
+                    version: None,
+                }),
+                None => PutMode::Create,
+            };
+            let opts = PutOptions {
+                mode,
+                ..Default::default()
+            };
+            runtime()?.block_on(async move {
+                store
+                    .put_opts(&ObjPath::from(key), PutPayload::from(bytes), opts)
                     .await
             })?;
             Ok(())
