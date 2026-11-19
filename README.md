@@ -10,6 +10,7 @@ Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. Al
 | CRS: point to cell, cell to polygon | Phase 3 E8. Explicit datum operations for all 11 domains; VN provisional | `core/src/projection.rs`, `core/src/domain.rs`, `core/src/geo.rs` |
 | `points.json` and `projected.json` vectors | Pass. Released domains work by default; candidate domains require explicit opt-in | `vectors/spec-2.0/` |
 | DuckDB extension (C API, DuckDB 1.4 to 2.0): grid functions, polyfill, cell datasets (flat, partitioned, Iceberg) | Done | `bindings/duckdb/` |
+| `gsq` command-line tool: detect, rollup, join, and geometry export | Done | `cli/` |
 | Signed registry verification | Done. Checks SHA-256, Ed25519 signature, and trusted key | `bindings/duckdb/README.md` |
 | Postgres, BigQuery bindings | Planned | - |
 
