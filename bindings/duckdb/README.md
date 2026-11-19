@@ -103,6 +103,9 @@ Writing is meant for the backend.
 | `line_to_cells(domain_code, wkt, level, source_crs := ..., max_candidate_limit := ...)` | table: same cell columns + `length_ratio` (share of the whole line inside the cell, as in v2) |
 | `packed_to_gid(packed_id)` | `VARCHAR` gid of a packed id |
 | `detect_table(query, domain_code := ..., level := ..., max_rows := 100000)` | table: `column, kind, status, reason, valid_ratio, domain_codes, domain_ids, levels, invalid_examples` (spec 2.0 section 14; x_idx/y_idx as one pair; `max_rows` rows are read, 0 = all) |
+| `v1_gid_to_cell(domain_code, gid_v1, level)` | the v2 cell holding the centre of a GeoSquare v1 cell, same `STRUCT` as `point_to_cell` |
+| `v1_gid_center(gid_v1)` / `v1_gid_to_geometry(gid_v1 [, format])` | `STRUCT(lon, lat)` / the v1 cell box in lon/lat as WKT or GeoJSON |
+| `lonlat_to_v1_gid(longitude, latitude, level_v1)` | `VARCHAR` v1 gid (v1 level 12 = 50 m, 9 = 1 km), identical to `@geosquare/grid` `lonLatToGid` |
 
 `polygon_to_cells` / `polyfill` take `source_crs := 'EPSG:4326' | 'grid'`,
 `coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0` and

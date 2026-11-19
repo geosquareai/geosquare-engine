@@ -285,6 +285,33 @@ FROM read_cell_dataset('/data/pop_flat') AS a
 JOIN read_cell_dataset('/data/pop_ice') AS b USING (packed_id);
 ```
 
+## GeoSquare v1 gids
+
+Data keyed by v1 gids (the degree grid of GeoSquare Horizon v1, `@geosquare/grid`) moves to
+the v2 grid through the centre of each v1 cell. `v1_gid_to_cell` gives the v2 cell holding
+it; several v1 50 m cells can fall into one v2 50 m cell, so aggregate per v2 cell. A v1
+cell larger than the target level covers many v2 cells: use its outline with
+`polygon_to_cells`.
+
+```sql
+-- v1 gid of a point, its centre and box
+SELECT lonlat_to_v1_gid(106.8272, -6.1754, 12) AS gid_v1,
+       v1_gid_center(lonlat_to_v1_gid(106.8272, -6.1754, 12)) AS centre,
+       v1_gid_to_geometry(lonlat_to_v1_gid(106.8272, -6.1754, 12)) AS box;
+
+-- rows keyed by v1 50 m gids onto v2 50 m cells (summed per v2 cell)
+CREATE TABLE outlets_v1 AS
+SELECT lonlat_to_v1_gid(106.80 + i * 0.0007, -6.20 + i * 0.0005, 12) AS gid_v1, 10.0 * i AS sales
+FROM range(1, 30) t(i);
+SELECT v1_gid_to_cell('ID', gid_v1, 12).packed_id AS packed_id, sum(sales) AS sales
+FROM outlets_v1 GROUP BY 1 ORDER BY 1;
+
+-- the v2 50 m cells under one v1 1 km cell, with their share of it
+SELECT gid, coverage_ratio
+FROM polygon_to_cells('ID', v1_gid_to_geometry(lonlat_to_v1_gid(106.8272, -6.1754, 9)), 12)
+LIMIT 5;
+```
+
 ## Writing
 
 The full guide (insert, update/upsert, delete, schema and partition changes) is

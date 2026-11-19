@@ -18,6 +18,7 @@ mod polyfill;
 mod sql;
 mod storage;
 mod tables;
+mod v1;
 mod valid;
 mod writer;
 
