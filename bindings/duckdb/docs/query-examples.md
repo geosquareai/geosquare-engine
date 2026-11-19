@@ -338,7 +338,7 @@ CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION 'ap-southeast-3');
 SELECT count(*) AS cells,
        sum(people_counts * coverage_ratio) AS people,
        sum(people_millenials_female_night * coverage_ratio) AS millenial_women_at_night
-FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=50m_people_v2023',
+FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=people_v2023',
   geometry := 'POLYGON ((106.8227 -6.1799, 106.8317 -6.1799, 106.8317 -6.1709, 106.8227 -6.1709, 106.8227 -6.1799))');
 
 -- not run in tests: 1 km roll-up of a few columns of the people table
@@ -346,7 +346,7 @@ SELECT left(gid, 9) AS gid_1km,
        sum(people_counts * coverage_ratio) AS people,
        sum(people_gen_z * coverage_ratio) AS gen_z,
        sum(people_gen_z_night * coverage_ratio) AS gen_z_night
-FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=50m_people_v2023',
+FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=people_v2023',
   bbox := [106.80, -6.20, 106.84, -6.16])
 GROUP BY 1 ORDER BY 1;
 
