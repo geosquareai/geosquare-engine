@@ -159,8 +159,28 @@ cells are computed.
 
 ## Aggregates and roll-ups
 
-A level-L ancestor's gid is the first L characters of the gid, so roll-ups are a
-`GROUP BY left(gid, L)`: level 9 = 1 km, 7 = 10 km, 6 = 50 km, 5 = 100 km.
+A level-L ancestor's gid is the first L characters of the gid: level 9 = 1 km, 7 = 10 km,
+6 = 50 km, 5 = 100 km. `rollup_level := L` returns one row per level-L cell directly. Each
+value column is aggregated by its `aggregation_rule` from the cell manifest (`sum`: sum
+weighted by `coverage_ratio`, `mean`: weighted mean, `min`, `max`; without a rule COUNT
+columns are summed and the others averaged). The result has `gid` and `packed_id` of the
+level-L cell, the value columns, `cell_count` (dataset cells in it) and, for an area, the
+level-L cell's own `coverage_ratio` (its share inside the area). `rollup_rule` overrides the
+rule: one word for every column or `{"column or pattern*": "sum" | "mean" | "min" | "max"}`.
+
+```sql
+-- 1 km overview of an area, with the 1 km outlines
+SELECT gid, population, workers, cell_count, coverage_ratio, cell_geometry
+FROM query_cell_dataset('/data/pop_ice',
+  geometry := 'POLYGON ((106.80 -6.20, 106.84 -6.20, 106.84 -6.16, 106.80 -6.16, 106.80 -6.20))',
+  rollup_level := 9, with_geometry := 'geojson');
+
+-- 10 km overview of the whole dataset, highest 50 m value per 10 km cell
+SELECT gid, population, cell_count
+FROM read_cell_dataset('/data/pop_part', rollup_level := 7, rollup_rule := 'max');
+```
+
+The same by hand is a `GROUP BY left(gid, L)` (pick the aggregate per column yourself):
 
 ```sql
 -- 1 km totals inside an area, with the 1 km cell outline as GeoJSON (lon/lat)

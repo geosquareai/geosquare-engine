@@ -417,8 +417,8 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
     let lease = sql::lease()?;
     let src = open(&lease, &path)?;
-    let code = if src.manifest.is_some() || p.text("domain_code").is_some() {
-        Some(identity(&src, p)?.0.code) // also validates the manifest against the engine
+    let id = if src.manifest.is_some() || p.text("domain_code").is_some() {
+        Some(identity(&src, p)?) // also validates the manifest against the engine
     } else {
         None
     };
@@ -426,7 +426,146 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
         "SELECT * FROM {}",
         from_clause(&lease, &src, None)?
     ));
-    add_geometry(plan, p, code)
+    let plan = match id {
+        Some((d, level)) => add_rollup(
+            plan,
+            p,
+            &QueryCtx {
+                code: d.code,
+                level,
+                manifest: src.manifest.clone(),
+                weight: None,
+            },
+        )?,
+        None if p.int("rollup_level").is_some() => {
+            return Err(
+                "rollup_level needs the domain and level: the dataset has no cell manifest".into(),
+            )
+        }
+        None => plan,
+    };
+    add_geometry(plan, p, id.map(|(d, _)| d.code))
+}
+
+/// What a query plan knows about its dataset, for the roll-up and the geometry.
+pub struct QueryCtx {
+    pub code: &'static str,
+    pub level: u8,
+    pub manifest: Option<Json>,
+    /// Column with the share of each cell inside the query area (`coverage_ratio` or
+    /// `length_ratio`); None when every cell counts fully (read_cell_dataset) or for points.
+    pub weight: Option<&'static str>,
+}
+
+/// SQL aggregate of value column `c` by rule, each cell weighted by `w`.
+fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
+    let c = format!("r.{}", sql::ident(name));
+    Ok(match rule.to_ascii_lowercase().as_str() {
+        "sum" | "count" => format!("CAST(sum({c} * {w}) AS DOUBLE)"),
+        "mean" | "avg" | "average" | "weighted_mean" => format!(
+            "CAST(sum({c} * {w}) / nullif(sum(CASE WHEN {c} IS NOT NULL THEN {w} END), 0) AS DOUBLE)"
+        ),
+        "min" => format!("min({c})"),
+        "max" => format!("max({c})"),
+        other => {
+            return Err(format!(
+                "column {name} has aggregation_rule {other:?}, which rollup_level cannot apply; \
+                 pass rollup_rule := '{{\"{name}\": \"sum\" | \"mean\" | \"min\" | \"max\"}}'"
+            )
+            .into())
+        }
+    })
+}
+
+/// `rollup_level := R`: one row per level-R ancestor cell instead of one per dataset cell.
+/// Each value column is aggregated by its `aggregation_rule` from the cell manifest (sum:
+/// weighted sum, mean: weighted mean, min, max; without a rule COUNT columns are summed and
+/// the others averaged), weighted by the share of each cell inside the query area.
+/// `rollup_rule` overrides the rule: one word for every column or `{column or pattern: rule}`.
+/// Adds `cell_count` (dataset cells in the group) and, for areas, the ancestor's
+/// `coverage_ratio` (its share inside the area).
+fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
+    let Some(r) = p.int("rollup_level") else {
+        if p.text("rollup_rule").is_some() {
+            return Err("rollup_rule needs rollup_level".into());
+        }
+        return Ok(plan);
+    };
+    if r < 0 || r > ctx.level as i64 {
+        return Err(format!(
+            "rollup_level must be between 0 and the dataset level {}; received {r}",
+            ctx.level
+        )
+        .into());
+    }
+    if ctx.weight.is_none() && p.text("geometry").is_some() && p.get("bbox").is_none() {
+        if let Some(g) = p.text("geometry") {
+            if matches!(geom::parse_geometry(&g)?, geom::Geometry::Points(_)) {
+                return Err(
+                    "rollup_level works with a polygon, a line or bbox, not with points".into(),
+                );
+            }
+        }
+    }
+    let fields = ctx
+        .manifest
+        .as_ref()
+        .and_then(|m| m.get("value_fields"))
+        .and_then(Json::as_array)
+        .filter(|f| !f.is_empty())
+        .ok_or("rollup_level needs the value columns of the cell manifest (value_fields)")?;
+    let over = crate::metadata::PerColumn::parse(p.text("rollup_rule"), "rollup_rule")?;
+    let w = ctx
+        .weight
+        .map(|w| format!("r.{w}"))
+        .unwrap_or_else(|| "1.0".into());
+    let mut aggs = Vec::new();
+    for f in fields {
+        let name = f.get("name").and_then(Json::as_str).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let rule = over
+            .get(name)
+            .map(str::to_string)
+            .or_else(|| {
+                f.get("aggregation_rule")
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                if f.get("semantics").and_then(Json::as_str) == Some("COUNT") {
+                    "sum".into()
+                } else {
+                    "mean".into()
+                }
+            });
+        aggs.push(format!(
+            "{} AS {}",
+            rollup_expr(name, &rule, &w)?,
+            sql::ident(name)
+        ));
+    }
+    let r = r as u8;
+    let side = |l: u8| codec::side_cell_count(l).map(|n| n as f64);
+    let children = (side(ctx.level)? / side(r)?).powi(2);
+    let coverage = match ctx.weight {
+        Some(w) => format!(", CAST(sum(r.{w}) / {children:?} AS DOUBLE) AS {w}"),
+        None => String::new(),
+    };
+    let wrap = |inner: &str| {
+        format!(
+            "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {}, \
+             count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY 1 ORDER BY 2",
+            lit(ctx.code),
+            aggs.join(", ")
+        )
+    };
+    Ok(match plan {
+        Plan::Query(q) => Plan::Query(wrap(&q)),
+        Plan::Typed(q, probe) => Plan::Typed(wrap(&q), wrap(&probe)),
+        other => other,
+    })
 }
 
 /// Query polygon in the grid CRS and its source CRS for `polygon_to_cells`.
@@ -484,12 +623,13 @@ fn query_polygon(p: &Params, d: &Domain, level: u8) -> Result<(String, String, f
 /// `bbox` behaves like a polygon (every cell overlapping the projected envelope).
 pub fn plan_query(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
-    let (plan, code) = plan_query_cells(p, &path)?;
-    add_geometry(plan, p, Some(code))
+    let (plan, ctx) = plan_query_cells(p, &path)?;
+    let plan = add_rollup(plan, p, &ctx)?;
+    add_geometry(plan, p, Some(ctx.code))
 }
 
 /// The cells of the query area joined with the dataset, and the dataset's domain code.
-fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
+fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
     let path = path.to_string();
     let lease = sql::lease()?;
     let src = open(&lease, &path)?;
@@ -567,6 +707,12 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
             )
         }
     };
+    let ctx = QueryCtx {
+        code: d.code,
+        level,
+        manifest: src.manifest.clone(),
+        weight: (extra != "point_count").then_some(extra),
+    };
     let packed: Vec<i64> = cells
         .iter()
         .map(|c| packing::pack(d.id, *c))
@@ -590,7 +736,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
                             "SELECT {}, NULL::{extra_type} AS {extra} LIMIT 0",
                             t.empty_select()
                         )),
-                        d.code,
+                        ctx,
                     ));
                 }
                 let list: Vec<String> = sel.iter().map(|f| lit(f)).collect();
@@ -609,7 +755,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
                         list.join(", ")
                     ),
                     format!("SELECT {}, NULL::{extra_type} AS {extra}", t.empty_select()),
-                ), d.code));
+                ), ctx));
             }
         }
     }
@@ -642,7 +788,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
                 Plan::Query(format!(
                     "SELECT *, NULL::{extra_type} AS {extra} FROM {full} LIMIT 0"
                 )),
-                d.code,
+                ctx,
             ));
         }
         Some(f) => from_clause(&lease, &src, Some(f))?,
@@ -659,7 +805,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
     } else {
         return Err("dataset has neither a packed_id nor a gid column".into());
     };
-    Ok((Plan::Query(sql), d.code))
+    Ok((Plan::Query(sql), ctx))
 }
 
 // ---------------------------------------------------------------------------

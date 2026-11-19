@@ -72,7 +72,12 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
         }
         let identity = vec![("domain_code", Text), ("level", Int)];
         let mut read_params = identity.clone();
-        read_params.extend([("with_geometry", Text), ("geometry_crs", Text)]);
+        read_params.extend([
+            ("with_geometry", Text),
+            ("geometry_crs", Text),
+            ("rollup_level", Int),
+            ("rollup_rule", Text),
+        ]);
         let r = (|| -> Result<(), Box<dyn Error>> {
             sql::register(
                 con,
@@ -92,6 +97,8 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("max_candidate_limit", Int),
                 ("with_geometry", Text),
                 ("geometry_crs", Text),
+                ("rollup_level", Int),
+                ("rollup_rule", Text),
             ]);
             sql::register(
                 con,
