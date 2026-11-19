@@ -36,6 +36,8 @@ pub struct Source {
     pub root: String,
     pub layout: Layout,
     pub manifest: Option<Json>,
+    /// Iceberg snapshot to read instead of the current one (snapshot_id / as_of).
+    pub snapshot: Option<i64>,
 }
 
 pub fn join(root: &str, rest: &str) -> String {
@@ -202,6 +204,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root,
             layout: Layout::Iceberg { metadata: path },
             manifest,
+            snapshot: None,
         });
     }
     // An Iceberg table with a version hint: two small reads, no listing.
@@ -211,6 +214,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root: path,
             layout: Layout::Iceberg { metadata },
             manifest,
+            snapshot: None,
         });
     }
     // Read the manifest directly: globbing an exact S3 key returns it even when it is absent.
@@ -229,6 +233,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root: path,
             layout,
             manifest: Some(manifest),
+            snapshot: None,
         });
     }
     if is_http(&path) || !glob(lease, &join(&path, "metadata/*.metadata.json"))?.is_empty() {
@@ -238,6 +243,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root: path,
             layout: Layout::Iceberg { metadata },
             manifest,
+            snapshot: None,
         });
     }
     Err(format!("{path}: no {MANIFEST_FILE} and no Iceberg metadata found").into())
@@ -322,11 +328,18 @@ fn from_clause(lease: &Lease, src: &Source, files: Option<&[String]>) -> Result<
             // resolves its manifests and data files under the new folder.
             match metadata.rsplit_once("/metadata/") {
                 Some((dir, file)) => format!(
-                    "iceberg_scan({}, version = {}, allow_moved_paths = true)",
+                    "iceberg_scan({}, version = {}, allow_moved_paths = true{})",
                     lit(dir),
-                    lit(file.strip_suffix(".metadata.json").unwrap_or(file))
+                    lit(file.strip_suffix(".metadata.json").unwrap_or(file)),
+                    src.snapshot
+                        .map_or(String::new(), |id| format!(", snapshot_from_id = {id}"))
                 ),
-                None => format!("iceberg_scan({})", lit(metadata)),
+                None => format!(
+                    "iceberg_scan({}{})",
+                    lit(metadata),
+                    src.snapshot
+                        .map_or(String::new(), |id| format!(", snapshot_from_id = {id}"))
+                ),
             }
         }
     })
@@ -413,10 +426,85 @@ fn add_geometry(plan: Plan, p: &Params, domain_code: Option<&str>) -> Result<Pla
     })
 }
 
+/// Metadata as if snapshot `id` were the current one (its schema too).
+fn meta_at_snapshot(meta: &Json, id: i64) -> Json {
+    let mut m = meta.clone();
+    let schema = m
+        .get("snapshots")
+        .and_then(Json::as_array)
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("snapshot-id").and_then(Json::as_i64) == Some(id))
+        })
+        .and_then(|s| s.get("schema-id").cloned());
+    m["current-snapshot-id"] = Json::from(id);
+    if let Some(sid) = schema {
+        m["current-schema-id"] = sid;
+    }
+    m
+}
+
+/// `snapshot_id := id` or `as_of := timestamp | epoch ms`: read an older Iceberg snapshot
+/// (the newest one at or before `as_of`). Expired snapshots cannot be read.
+pub fn select_snapshot(lease: &Lease, src: &mut Source, p: &Params) -> Result<(), E> {
+    let id = p.int("snapshot_id");
+    let as_of = p.text("as_of");
+    if id.is_none() && as_of.is_none() {
+        return Ok(());
+    }
+    let Layout::Iceberg { metadata } = &src.layout else {
+        return Err("snapshot_id / as_of read older versions of Iceberg tables only".into());
+    };
+    let meta = metadata_json(lease, metadata)?;
+    let snaps: Vec<(i64, i64)> = meta
+        .get("snapshots")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            Some((
+                s.get("snapshot-id")?.as_i64()?,
+                s.get("timestamp-ms").and_then(Json::as_i64).unwrap_or(0),
+            ))
+        })
+        .collect();
+    let chosen = match (id, as_of) {
+        (Some(id), _) => snaps
+            .iter()
+            .find(|(s, _)| *s == id)
+            .map(|(s, _)| *s)
+            .ok_or_else(|| format!("snapshot {id} is not in the table (expired or wrong id)"))?,
+        (None, Some(text)) => {
+            let ts = match text.trim().parse::<i64>() {
+                Ok(ms) => ms,
+                Err(_) => sql::query_text_on(
+                    lease,
+                    &format!("SELECT epoch_ms(CAST({} AS TIMESTAMPTZ))", lit(&text)),
+                )?
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next().flatten())
+                .and_then(|v| v.parse().ok())
+                .ok_or("as_of must be a timestamp or epoch milliseconds")?,
+            };
+            snaps
+                .iter()
+                .filter(|(_, t)| *t <= ts)
+                .max_by_key(|(_, t)| *t)
+                .map(|(s, _)| *s)
+                .ok_or_else(|| format!("the table has no snapshot at or before {text}"))?
+        }
+        _ => unreachable!(),
+    };
+    src.snapshot = Some(chosen);
+    Ok(())
+}
+
 pub fn plan_read(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
     let lease = sql::lease()?;
-    let src = open(&lease, &path)?;
+    let mut src = open(&lease, &path)?;
+    select_snapshot(&lease, &mut src, p)?;
     let id = if src.manifest.is_some() || p.text("domain_code").is_some() {
         Some(identity(&src, p)?) // also validates the manifest against the engine
     } else {
@@ -436,6 +524,7 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
                 manifest: src.manifest.clone(),
                 weight: None,
                 extra: None,
+                present: None,
             },
         )?,
         None if p.int("rollup_level").is_some() => {
@@ -458,6 +547,8 @@ pub struct QueryCtx {
     pub weight: Option<&'static str>,
     /// The column the query adds per cell (`coverage_ratio`, `length_ratio`, `point_count`).
     pub extra: Option<&'static str>,
+    /// Columns the plan returns, when known (an older snapshot may lack newer columns).
+    pub present: Option<Vec<String>>,
 }
 
 /// SQL aggregate of value column `c` by rule, each cell weighted by `w`.
@@ -525,7 +616,12 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
     let mut aggs = Vec::new();
     for f in fields {
         let name = f.get("name").and_then(Json::as_str).unwrap_or("");
-        if name.is_empty() {
+        if name.is_empty()
+            || ctx
+                .present
+                .as_ref()
+                .is_some_and(|p| !p.iter().any(|c| c == name))
+        {
             continue;
         }
         let rule = over
@@ -580,6 +676,7 @@ fn value_columns(ctx: &QueryCtx) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|f| f.get("name").and_then(Json::as_str).map(str::to_string))
+        .filter(|n| ctx.present.as_ref().is_none_or(|p| p.contains(n)))
         .collect()
 }
 
@@ -658,8 +755,20 @@ pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
         format!("{} AS packed_id", coalesce("packed_id")),
         format!("{} AS gid", coalesce("gid")),
     ];
-    for (i, (path, _, _)) in parts.iter().enumerate() {
-        let alias = dataset_alias(path);
+    let names: Vec<String> = parts.iter().map(|(p, _, _)| dataset_alias(p)).collect();
+    let aliases: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if names.iter().filter(|b| *b == a).count() > 1 {
+                format!("{a}_{}", i + 1)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    for (i, _) in parts.iter().enumerate() {
+        let alias = &aliases[i];
         for c in &cols[i] {
             let out = if count[c.as_str()] > 1 {
                 format!("{alias}__{c}")
@@ -778,7 +887,8 @@ pub fn plan_query(p: &Params) -> Result<Plan, E> {
 fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
     let path = path.to_string();
     let lease = sql::lease()?;
-    let src = open(&lease, &path)?;
+    let mut src = open(&lease, &path)?;
+    select_snapshot(&lease, &mut src, p)?;
     let (d, level) = identity(&src, p)?;
     let limit = p.int("max_candidate_limit").unwrap_or(100_000);
     let (wkt, crs, min_cov) = query_polygon(p, d, level)?;
@@ -853,12 +963,13 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
             )
         }
     };
-    let ctx = QueryCtx {
+    let mut ctx = QueryCtx {
         code: d.code,
         level,
         manifest: src.manifest.clone(),
         weight: (extra != "point_count").then_some(extra),
         extra: Some(extra),
+        present: None,
     };
     let packed: Vec<i64> = cells
         .iter()
@@ -871,13 +982,20 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
 
     // Iceberg: choose data files from the cached manifests, read them with read_parquet.
     if let Layout::Iceberg { metadata } = &src.layout {
-        let meta = metadata_json(&lease, metadata)?;
-        if let Some(t) = crate::icefast::load(&lease, &src.root, metadata, &meta)? {
+        let (key, meta) = match src.snapshot {
+            Some(id) => (
+                format!("{metadata}#{id}"),
+                meta_at_snapshot(&metadata_json(&lease, metadata)?, id),
+            ),
+            None => (metadata.clone(), metadata_json(&lease, metadata)?),
+        };
+        if let Some(t) = crate::icefast::load(&lease, &src.root, &key, &meta)? {
             let mut sorted = packed.clone();
             sorted.sort_unstable();
             sorted.dedup();
             if let Some(sel) = t.files_for(&lease, &sorted)? {
                 if sel.is_empty() {
+                    ctx.present = Some(t.columns.iter().map(|(n, _)| n.clone()).collect());
                     return Ok((
                         Plan::Query(format!(
                             "SELECT {}, NULL::{extra_type} AS {extra} LIMIT 0",
@@ -886,6 +1004,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
                         ctx,
                     ));
                 }
+                ctx.present = Some(t.columns.iter().map(|(n, _)| n.clone()).collect());
                 let list: Vec<String> = sel.iter().map(|f| lit(f)).collect();
                 // Every column is cast to the type the probe declares: the proxy copies values
                 // by the declared type, so they must match exactly (e.g. point_count BIGINT).
@@ -942,6 +1061,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
         None => full,
     };
     let cols = columns(&lease, &from)?;
+    ctx.present = Some(cols.clone());
     let sql = if cols.iter().any(|c| c == "packed_id") {
         format!(
             "SELECT d.*, k.{extra} FROM {from} AS d JOIN {keys} AS k ON d.packed_id = k.packed_id \

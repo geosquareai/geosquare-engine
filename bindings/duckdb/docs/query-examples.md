@@ -376,9 +376,17 @@ options below.
 ## Iceberg snapshots and time travel
 
 Each write is a snapshot; the newest one is found through `metadata/version-hint.text`.
+`snapshot_id := <id>` or `as_of := <timestamp>` (the newest snapshot at or before it) reads
+an older snapshot in `read_cell_dataset`, `query_cell_dataset` and `query_cell_datasets`.
+Snapshots removed by `expire_snapshots` cannot be read any more.
 
 ```sql
 LOAD iceberg;
+SET VARIABLE first_id = (SELECT min_by(snapshot_id, sequence_number) FROM iceberg_snapshots('/data/pop_ice'));
+SELECT count(*), sum(population) FROM read_cell_dataset('/data/pop_ice', snapshot_id := getvariable('first_id'));
+SELECT count(*) FROM query_cell_dataset('/data/pop_ice', bbox := [106.82, -6.18, 106.83, -6.17],
+  as_of := now()::VARCHAR);
+
 SELECT sequence_number, snapshot_id, manifest_list FROM iceberg_snapshots('/data/pop_ice') ORDER BY sequence_number;
 
 -- read an older snapshot by its metadata file (table functions take constants, so pass
