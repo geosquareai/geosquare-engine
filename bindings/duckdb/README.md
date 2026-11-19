@@ -106,6 +106,23 @@ Writing is meant for the backend.
 
 The six released domains are `BN`, `ID`, `LA`, `MY`, `PH`, and `SG`. `point_to_cell` and WGS84 `cell_to_geometry` reject candidate domains by default. Pass `true` as the final `allow_candidate_crs` argument for technical candidate use. The candidate domains are `KH`, `MM`, `TH`, `TL`, and `VN`.
 
+### Candidate CRS use
+
+This call is blocked because `VN` is a candidate domain:
+
+```sql
+SELECT point_to_cell('VN', 107.868144, 15.981051, 5);
+```
+
+Use the final boolean only for technical work:
+
+```sql
+SELECT point_to_cell('VN', 107.868144, 15.981051, 5, true);
+SELECT cell_to_geometry('VN', 'H3T4T', 'EPSG:4326', 'wkt', true);
+```
+
+The final `true` does not make the domain production-ready. It only enables explicit candidate use. The same rule applies to WGS84 cell geometry.
+
 `polygon_to_cells` / `polyfill` take `source_crs := 'EPSG:4326' | 'grid'`,
 `coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0` and
 `max_candidate_limit := 100000`, and follow `geosquare_v2.polyfill_stream`: vertices are
