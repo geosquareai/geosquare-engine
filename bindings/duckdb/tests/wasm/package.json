@@ -1,0 +1,9 @@
+{
+  "name": "geosquare-v2-duckdb-wasm-test",
+  "private": true,
+  "description": "Loads the geosquare_v2 extension in DuckDB-Wasm (headless Chromium) and compares results with native DuckDB.",
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "1.33.1-dev118.0",
+    "playwright-core": "^1.56.0"
+  }
+}

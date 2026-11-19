@@ -1,0 +1,185 @@
+name: DuckDB extension release
+
+# Builds geosquare_v2 for every platform once, tests it on DuckDB 1.4+ and in DuckDB-Wasm,
+# then lays out an extension repository so users can run
+#   INSTALL geosquare_v2 FROM '<repository url>'; LOAD geosquare_v2;
+# One build per platform serves every DuckDB release (stable C API), so the same file is
+# copied under each version folder (scripts/make_repository.py).
+
+on:
+  push:
+    tags: ["duckdb-v*"]
+  workflow_dispatch:
+    inputs:
+      duckdb_versions:
+        description: "DuckDB versions: 'auto' (all releases >= 1.4.0 on PyPI) or a list like v1.4.0,v2.0.0"
+        default: auto
+      publish_s3:
+        description: "Sync the repository to s3://$EXTENSION_REPO_BUCKET/$EXTENSION_REPO_PREFIX"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  DUCKDB_VERSIONS: ${{ inputs.duckdb_versions || 'auto' }}
+
+jobs:
+  native:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux_amd64, os: ubuntu-22.04 }
+          - { platform: linux_arm64, os: ubuntu-22.04-arm }
+          - { platform: osx_arm64, os: macos-15 }
+          - { platform: osx_amd64, os: macos-15, target: x86_64-apple-darwin }
+          - { platform: windows_amd64, os: windows-2022 }
+    defaults:
+      run:
+        shell: bash
+        working-directory: bindings/duckdb
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: ${{ matrix.target || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/duckdb
+          key: ${{ matrix.platform }}
+
+      - name: NASM for aws-lc (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        env:
+          DUCKDB_PLATFORM: ${{ matrix.platform }}
+          CARGO_BUILD_TARGET: ${{ matrix.target || '' }}
+        run: |
+          ./build.sh
+          mkdir -p dist/${{ matrix.platform }}
+          cp build/${{ matrix.platform }}/geosquare_v2.duckdb_extension dist/${{ matrix.platform }}/
+
+      - name: Smoke test on the oldest and newest supported DuckDB
+        if: matrix.target == ''
+        run: |
+          for v in 1.4.0 2.0.0; do
+            python -m venv "../../.venv-$v" && "../../.venv-$v/$( [ "$RUNNER_OS" = Windows ] && echo Scripts || echo bin )/python" -m pip install -q "duckdb==$v"
+            "../../.venv-$v/$( [ "$RUNNER_OS" = Windows ] && echo Scripts || echo bin )/python" tests/test_vectors.py "dist/${{ matrix.platform }}/geosquare_v2.duckdb_extension"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-${{ matrix.platform }}
+          path: bindings/duckdb/dist/${{ matrix.platform }}
+
+  wasm:
+    name: Build wasm_eh
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: bindings/duckdb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: wasm32-unknown-emscripten
+      - uses: emscripten-core/setup-emsdk@v16
+        with:
+          version: 6.0.9
+      - name: Build
+        run: |
+          ./build_wasm.sh
+          mkdir -p dist/wasm_eh && cp build/wasm_eh/geosquare_v2.duckdb_extension.wasm dist/wasm_eh/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-wasm_eh
+          path: bindings/duckdb/dist/wasm_eh
+
+  test:
+    name: Test every DuckDB release and DuckDB-Wasm
+    needs: [native, wasm]
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: bindings/duckdb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ext-*
+          path: bindings/duckdb/dist
+      - name: Vectors and datasets on each DuckDB version
+        run: |
+          mkdir -p build/linux_amd64 build/wasm_eh
+          cp dist/ext-linux_amd64/geosquare_v2.duckdb_extension build/linux_amd64/
+          cp dist/ext-wasm_eh/geosquare_v2.duckdb_extension.wasm build/wasm_eh/
+          if [ "$DUCKDB_VERSIONS" = auto ]; then
+            VERSIONS=$(python -c "import json,urllib.request;d=json.load(urllib.request.urlopen('https://pypi.org/pypi/duckdb/json'));k=lambda v:tuple(map(int,v.split('.')));print(' '.join(v for v in sorted((v for v,f in d['releases'].items() if f and all(p.isdigit() for p in v.split('.'))),key=k) if k(v)>=(1,4,0)))")
+          else
+            VERSIONS=$(echo "$DUCKDB_VERSIONS" | tr ',' ' ' | sed 's/v//g')
+          fi
+          DUCKDB_VERSIONS="$VERSIONS" TESTS="tests/test_vectors.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py" tests/run_versions.sh
+      - name: DuckDB-Wasm in headless Chromium
+        run: |
+          python -m pip install -q duckdb==2.0.0
+          (cd tests/wasm && npm install --silent && npx playwright-core install chromium)
+          tests/wasm/run.sh
+
+  repository:
+    name: Extension repository
+    needs: [test]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ext-*
+          path: artifacts
+      - name: Lay out the repository
+        run: |
+          mkdir -p dist
+          for d in artifacts/ext-*; do mv "$d" "dist/${d#artifacts/ext-}"; done
+          python3 bindings/duckdb/scripts/make_repository.py --artifacts dist --out repo --versions "$DUCKDB_VERSIONS"
+          tar -czf geosquare_v2-duckdb-repository.tar.gz -C repo .
+      - name: Check INSTALL from the repository
+        run: |
+          python3 -m pip install -q duckdb==1.4.0
+          (cd repo && python3 -m http.server 8811 --bind 127.0.0.1 >/dev/null 2>&1 &) && sleep 2
+          python3 -c "import duckdb;c=duckdb.connect(config={'allow_unsigned_extensions':'true'});c.execute(\"INSTALL geosquare_v2 FROM 'http://127.0.0.1:8811'\");c.execute('LOAD geosquare_v2');print(c.execute('SELECT geosquare_engine_version()').fetchone()[0])"
+      - name: GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/duckdb-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            geosquare_v2-duckdb-repository.tar.gz
+            dist/*/geosquare_v2.duckdb_extension*
+      - name: Publish to S3 (repository URL for INSTALL ... FROM)
+        if: inputs.publish_s3 || startsWith(github.ref, 'refs/tags/duckdb-v')
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.EXTENSION_REPO_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.EXTENSION_REPO_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.EXTENSION_REPO_REGION }}
+          BUCKET: ${{ vars.EXTENSION_REPO_BUCKET }}
+          PREFIX: ${{ vars.EXTENSION_REPO_PREFIX }}
+        run: |
+          if [ -z "$BUCKET" ]; then echo "EXTENSION_REPO_BUCKET is not set; skipping"; exit 0; fi
+          aws s3 sync repo "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/octet-stream --exclude index.json
+          aws s3 cp repo/index.json "s3://$BUCKET/${PREFIX:+$PREFIX/}index.json" --content-type application/json

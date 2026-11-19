@@ -1,0 +1,21 @@
+# Convenience targets. CI uses the same scripts (.github/workflows/duckdb*.yml).
+.PHONY: release wasm_eh test test_versions test_wasm repository
+
+release:            ## native extension for this machine -> build/<platform>/
+	./build.sh
+
+wasm_eh:            ## DuckDB-Wasm extension (needs emcc on PATH) -> build/wasm_eh/
+	./build_wasm.sh
+
+test:               ## Rust unit tests + spec vectors on the installed duckdb package
+	cargo test --release
+	python3 tests/test_vectors.py build/$${DUCKDB_PLATFORM:-linux_amd64}/geosquare_v2.duckdb_extension
+
+test_versions:      ## vectors + datasets on DuckDB 1.4.0 ... 2.0.0 (venvs cached in .venvs)
+	TESTS="tests/test_vectors.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py" tests/run_versions.sh
+
+test_wasm:          ## DuckDB-Wasm in headless Chromium vs native
+	tests/wasm/run.sh
+
+repository:         ## extension repository from dist/<platform>/ for all DuckDB releases
+	python3 scripts/make_repository.py --artifacts dist --out repo --versions auto
