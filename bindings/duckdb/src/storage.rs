@@ -235,6 +235,25 @@ impl Storage {
         Err("no S3 client".into())
     }
 
+    /// Bytes `start .. start + len` of an object.
+    pub fn get_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, E> {
+        if is_local(path) {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f =
+                std::fs::File::open(local(path)).map_err(|e| format!("cannot open {path}: {e}"))?;
+            f.seek(SeekFrom::Start(start))?;
+            let mut buf = Vec::with_capacity(len as usize);
+            f.take(len).read_to_end(&mut buf)?;
+            return Ok(buf);
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.get_range(path, start, len);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
     /// Immediate sub-folders of `prefix` (full paths, no trailing slash).
     pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, E> {
         if is_local(prefix) {
@@ -634,6 +653,17 @@ mod s3 {
                     )
                 })
                 .collect())
+        }
+
+        pub fn get_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, E> {
+            let (bucket, key) = split_s3(path)?;
+            let store = self.store(&bucket)?;
+            let bytes = runtime()?.block_on(async move {
+                store
+                    .get_range(&ObjPath::from(key), start..start + len)
+                    .await
+            })?;
+            Ok(bytes.to_vec())
         }
 
         pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, E> {

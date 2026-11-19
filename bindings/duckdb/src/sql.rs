@@ -121,7 +121,7 @@ pub fn par_map<T: Send, R: Send>(
 }
 
 /// Run `f` with `pool` as this thread's current pool (restoring the previous one).
-fn with_pool<R>(pool: &Arc<Pool>, f: impl FnOnce() -> R) -> R {
+pub fn with_pool<R>(pool: &Arc<Pool>, f: impl FnOnce() -> R) -> R {
     let prev = CURRENT.with(|c| c.replace(Some(pool.clone())));
     let out = f();
     CURRENT.with(|c| *c.borrow_mut() = prev);

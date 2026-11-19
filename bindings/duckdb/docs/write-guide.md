@@ -228,6 +228,29 @@ SELECT * FROM expire_snapshots('/data/w_ice', retain_last := 2);
 SELECT count(*) FROM iceberg_snapshots('/data/w_ice');
 ```
 
+## From a raster (GeoTIFF / COG)
+
+`read_raster(path, bbox := [min_lon, min_lat, max_lon, max_lat])` returns the valid pixels of
+a tiled single-band GeoTIFF in EPSG:4326 inside the box (`lon`, `lat` of the pixel centre,
+`value`; nodata skipped). Only the tiles the box touches are read, with range requests on
+S3, so a multi-GB COG is sampled by area. The mean of the pixels whose centre lies in a cell
+is the method the hazard tables use:
+
+```sql
+-- not run in tests: needs a COG on S3
+SELECT * FROM write_cell_dataset(
+  'SELECT point_to_cell(''ID'', lon, lat, 12).packed_id AS packed_id, avg(value) AS hazard_flood
+   FROM read_raster(''s3://geosquare-data/apps-data/raster/hazard/hazard_flood_cog.tif'',
+                    bbox := [106.6, -6.4, 107.1, -6.0])
+   GROUP BY 1',
+  's3://bucket/prefix/flood_jakarta', layout := 'iceberg', aggregation_rule := 'mean');
+```
+
+For a whole country, loop over boxes (e.g. per 1 degree) and `append` each, or use
+`mode := 'upsert'`. Supported: classic TIFF and BigTIFF, tiled, uncompressed or Deflate,
+predictor 1/2/3, 8-64 bit integers and 32/64 bit floats; `max_pixels` (default 200 million)
+guards against huge boxes.
+
 ## Check what was written
 
 ```sql

@@ -17,6 +17,7 @@ mod lines;
 mod maintenance;
 mod metadata;
 mod polyfill;
+mod raster;
 mod sql;
 mod storage;
 mod tables;
@@ -60,7 +61,8 @@ unsafe fn init(
         con.register_table_function::<tables::PolygonToCells>("polygon_to_cells")?;
         con.register_table_function::<tables::Polyfill>("polyfill")?;
         con.register_table_function::<tables::LineToCells>("line_to_cells")?;
-        register_dataset_functions(db)?;
+        let pool = register_dataset_functions(db)?;
+        con.register_table_function_with_extra_info::<raster::ReadRaster, _>("read_raster", &pool)?;
         Ok(true)
     }
 }
@@ -78,7 +80,9 @@ fn s3_named() -> Vec<(&'static str, sql::Kind)> {
     ]
 }
 
-unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box<dyn Error>> {
+unsafe fn register_dataset_functions(
+    db: ffi::duckdb_database,
+) -> Result<std::sync::Arc<sql::Pool>, Box<dyn Error>> {
     use sql::Kind::*;
     unsafe {
         let pool = sql::init_pool(db, pool_size())?;
@@ -291,7 +295,7 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
             Ok(())
         })();
         ffi::duckdb_disconnect(&mut con);
-        r
+        r.map(|_| pool)
     }
 }
 
