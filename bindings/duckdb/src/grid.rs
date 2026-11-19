@@ -760,23 +760,39 @@ impl VScalar for ParseUri {
 pub struct CellToGeometry;
 
 /// Outline of a cell as WKT or GeoJSON, in the grid CRS or in lon/lat.
-fn cell_geometry(d: &'static domain::Domain, c: Cell, crs: &str, fmt: &str) -> Result<String, Box<dyn Error>> {
+fn cell_geometry(
+    d: &'static domain::Domain,
+    c: Cell,
+    crs: &str,
+    fmt: &str,
+) -> Result<String, Box<dyn Error>> {
     let ring: Vec<(f64, f64)> = match crs.trim().to_ascii_uppercase().as_str() {
         "GRID" | "PROJECTED" => {
             let b = geo::cell_bounds(d, c)?;
-            vec![(b.min_x, b.min_y), (b.max_x, b.min_y), (b.max_x, b.max_y), (b.min_x, b.max_y)]
+            vec![
+                (b.min_x, b.min_y),
+                (b.max_x, b.min_y),
+                (b.max_x, b.max_y),
+                (b.min_x, b.max_y),
+            ]
         }
         "WGS84" | "EPSG:4326" | "OGC:CRS84" => {
             let mut r = geo::cell_polygon_wgs84(d, c, 25_000.0)?;
             r.pop();
             r
         }
-        other => return Err(format!("output_crs must be 'grid' or 'EPSG:4326'; received {other:?}").into()),
+        other => {
+            return Err(
+                format!("output_crs must be 'grid' or 'EPSG:4326'; received {other:?}").into(),
+            )
+        }
     };
     match fmt.trim().to_ascii_lowercase().as_str() {
         "wkt" => Ok(geom::to_wkt(&[ring])),
         "geojson" => Ok(geom::to_geojson(&[ring])),
-        other => Err(format!("geometry_format must be 'wkt' or 'geojson'; received {other:?}").into()),
+        other => {
+            Err(format!("geometry_format must be 'wkt' or 'geojson'; received {other:?}").into())
+        }
     }
 }
 

@@ -64,7 +64,10 @@ impl Table {
         let (lo, hi) = (packed[0], packed[packed.len() - 1]);
         let mut by_width: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut parts = |w: i64| -> Vec<i64> {
-            by_width.entry(w).or_insert_with(|| partition_values(packed, w)).clone()
+            by_width
+                .entry(w)
+                .or_insert_with(|| partition_values(packed, w))
+                .clone()
         };
         let mut out = Vec::new();
         for m in &self.manifests {
@@ -202,20 +205,37 @@ pub fn load(
 }
 
 fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
-    let location = meta.get("location").and_then(Json::as_str).unwrap_or(root).to_string();
-    let sid = meta.get("current-schema-id").and_then(Json::as_i64).unwrap_or(0);
+    let location = meta
+        .get("location")
+        .and_then(Json::as_str)
+        .unwrap_or(root)
+        .to_string();
+    let sid = meta
+        .get("current-schema-id")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
     let schema = meta
         .get("schemas")
         .and_then(Json::as_array)
-        .and_then(|a| a.iter().find(|s| s.get("schema-id").and_then(Json::as_i64) == Some(sid)))
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("schema-id").and_then(Json::as_i64) == Some(sid))
+        })
         .or_else(|| meta.get("schema"));
-    let Some(fields) = schema.and_then(|s| s.get("fields")).and_then(Json::as_array) else {
+    let Some(fields) = schema
+        .and_then(|s| s.get("fields"))
+        .and_then(Json::as_array)
+    else {
         return Ok(None);
     };
     let mut columns = Vec::new();
     let mut pk_id = None;
     for f in fields {
-        let name = f.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+        let name = f
+            .get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
         let Some(ty) = f.get("type").and_then(duck_type) else {
             return Ok(None);
         };
@@ -229,9 +249,18 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
     };
     // spec id -> (partition field name, W) for specs that are exactly truncate(W, packed_id).
     let mut specs: HashMap<i64, (String, i64)> = HashMap::new();
-    for s in meta.get("partition-specs").and_then(Json::as_array).into_iter().flatten() {
+    for s in meta
+        .get("partition-specs")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+    {
         let id = s.get("spec-id").and_then(Json::as_i64).unwrap_or(0);
-        let f = s.get("fields").and_then(Json::as_array).cloned().unwrap_or_default();
+        let f = s
+            .get("fields")
+            .and_then(Json::as_array)
+            .cloned()
+            .unwrap_or_default();
         if let [one] = f.as_slice() {
             let tr = one.get("transform").and_then(Json::as_str).unwrap_or("");
             let w = tr
@@ -240,18 +269,34 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
                 .and_then(|n| n.parse::<i64>().ok());
             if let (Some(w), Some(src)) = (w, one.get("source-id").and_then(Json::as_i64)) {
                 if src == pk_id && w > 0 {
-                    let name = one.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+                    let name = one
+                        .get("name")
+                        .and_then(Json::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     specs.insert(id, (name, w));
                 }
             }
         }
     }
-    let mut table = Table { columns, pk_id, location, root: root.to_string(), manifests: Vec::new() };
-    let snap_id = meta.get("current-snapshot-id").and_then(Json::as_i64).unwrap_or(-1);
+    let mut table = Table {
+        columns,
+        pk_id,
+        location,
+        root: root.to_string(),
+        manifests: Vec::new(),
+    };
+    let snap_id = meta
+        .get("current-snapshot-id")
+        .and_then(Json::as_i64)
+        .unwrap_or(-1);
     let snap = meta
         .get("snapshots")
         .and_then(Json::as_array)
-        .and_then(|a| a.iter().find(|s| s.get("snapshot-id").and_then(Json::as_i64) == Some(snap_id)));
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("snapshot-id").and_then(Json::as_i64) == Some(snap_id))
+        });
     let Some(snap) = snap else {
         return Ok(Some(table)); // empty table
     };
@@ -272,7 +317,11 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
             (Some(_), Some([(_, lo, hi)])) => le(lo).zip(le(hi)),
             _ => None,
         };
-        table.manifests.push(Manifest { path: table.relocate(&m.path), spec, range });
+        table.manifests.push(Manifest {
+            path: table.relocate(&m.path),
+            spec,
+            range,
+        });
     }
     Ok(Some(table))
 }
@@ -290,7 +339,10 @@ fn manifest_files(lease: &Lease, t: &Table, m: &Manifest) -> Result<Option<Arc<V
         return Ok(hit.clone());
     }
     let parsed = parse_manifest(lease, t, m)?.map(Arc::new);
-    manifests().lock().unwrap().insert(m.path.clone(), parsed.clone());
+    manifests()
+        .lock()
+        .unwrap()
+        .insert(m.path.clone(), parsed.clone());
     Ok(parsed)
 }
 
@@ -301,7 +353,9 @@ fn parse_manifest(lease: &Lease, t: &Table, m: &Manifest) -> Result<Option<Vec<D
         if e.get("status").and_then(D::long) == Some(2) {
             continue; // deleted entry
         }
-        let Some(df) = e.get("data_file") else { continue };
+        let Some(df) = e.get("data_file") else {
+            continue;
+        };
         if df.get("content").and_then(D::long).unwrap_or(0) != 0 {
             return Ok(None);
         }
@@ -314,13 +368,17 @@ fn parse_manifest(lease: &Lease, t: &Table, m: &Manifest) -> Result<Option<Vec<D
             .as_ref()
             .and_then(|(name, w)| df.get("partition")?.get(name)?.long().map(|v| (v, *w)));
         let bound = |n: &str| -> Option<i64> {
-            let D::Arr(items) = df.get(n)? else { return None };
+            let D::Arr(items) = df.get(n)? else {
+                return None;
+            };
             items.iter().find_map(|kv| {
                 if kv.get("key")?.long()? != t.pk_id {
                     return None;
                 }
                 match kv.get("value")? {
-                    D::Bytes(b) if b.len() == 8 => Some(i64::from_le_bytes(b[..8].try_into().ok()?)),
+                    D::Bytes(b) if b.len() == 8 => {
+                        Some(i64::from_le_bytes(b[..8].try_into().ok()?))
+                    }
                     _ => None,
                 }
             })
@@ -329,7 +387,11 @@ fn parse_manifest(lease: &Lease, t: &Table, m: &Manifest) -> Result<Option<Vec<D
         if partition.is_none() && bounds.is_none() {
             return Ok(None); // nothing to prune on
         }
-        files.push(DataFile { path, partition, bounds });
+        files.push(DataFile {
+            path,
+            partition,
+            bounds,
+        });
     }
     Ok(Some(files))
 }

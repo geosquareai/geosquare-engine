@@ -23,17 +23,29 @@ pub struct PerColumn {
 
 impl PerColumn {
     fn parse(text: Option<String>, what: &str) -> Result<Self, E> {
-        let Some(t) = text else { return Ok(Self::default()) };
+        let Some(t) = text else {
+            return Ok(Self::default());
+        };
         let t = t.trim().to_string();
         if !t.starts_with('{') {
-            return Ok(Self { all: Some(t), map: Vec::new() });
+            return Ok(Self {
+                all: Some(t),
+                map: Vec::new(),
+            });
         }
         match serde_json::from_str::<Json>(&t) {
             Ok(Json::Object(m)) => Ok(Self {
                 all: None,
                 map: m
                     .into_iter()
-                    .map(|(k, v)| (k, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            v.as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| v.to_string()),
+                        )
+                    })
                     .collect(),
             }),
             _ => Err(format!("{what} must be text or a JSON object {{column: text}}").into()),
@@ -127,7 +139,11 @@ impl Extra {
 }
 
 /// Merge `given` into the manifest section `name`; only keys of the contract are allowed.
-fn merge_section(manifest: &mut Json, name: &str, given: &Option<Map<String, Json>>) -> Result<(), E> {
+fn merge_section(
+    manifest: &mut Json,
+    name: &str,
+    given: &Option<Map<String, Json>>,
+) -> Result<(), E> {
     let Some(given) = given else { return Ok(()) };
     let section = manifest
         .get_mut(name)
@@ -136,7 +152,10 @@ fn merge_section(manifest: &mut Json, name: &str, given: &Option<Map<String, Jso
     for (k, v) in given {
         if !section.contains_key(k) {
             let allowed: Vec<&String> = section.keys().collect();
-            return Err(format!("{name}.{k} is not a field of the cell manifest; allowed: {allowed:?}").into());
+            return Err(format!(
+                "{name}.{k} is not a field of the cell manifest; allowed: {allowed:?}"
+            )
+            .into());
         }
         section.insert(k.clone(), v.clone());
     }
@@ -145,9 +164,16 @@ fn merge_section(manifest: &mut Json, name: &str, given: &Option<Map<String, Jso
 
 /// Apply the contract fields of `e` to a cell manifest.
 pub fn apply(manifest: &mut Json, e: &Extra) -> Result<(), E> {
-    if let Some(fields) = manifest.get_mut("value_fields").and_then(Json::as_array_mut) {
+    if let Some(fields) = manifest
+        .get_mut("value_fields")
+        .and_then(Json::as_array_mut)
+    {
         for f in fields {
-            let name = f.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+            let name = f
+                .get("name")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_string();
             if let Some(unit) = e.units.get(&name) {
                 f["unit"] = json!(unit);
             }
@@ -163,7 +189,10 @@ pub fn apply(manifest: &mut Json, e: &Extra) -> Result<(), E> {
 
 /// The dataset_info document: `prev` updated with `e`, units mirrored from the manifest.
 pub fn info(prev: Option<&Json>, manifest: &Json, e: &Extra) -> Json {
-    let mut out = prev.cloned().filter(Json::is_object).unwrap_or_else(|| json!({}));
+    let mut out = prev
+        .cloned()
+        .filter(Json::is_object)
+        .unwrap_or_else(|| json!({}));
     for (k, v) in [
         ("title", &e.title),
         ("description", &e.description),
@@ -176,10 +205,21 @@ pub fn info(prev: Option<&Json>, manifest: &Json, e: &Extra) -> Json {
             out[k] = Json::Null;
         }
     }
-    let mut columns = out.get("columns").and_then(Json::as_object).cloned().unwrap_or_default();
-    for f in manifest.get("value_fields").and_then(Json::as_array).into_iter().flatten() {
+    let mut columns = out
+        .get("columns")
+        .and_then(Json::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for f in manifest
+        .get("value_fields")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+    {
         let name = f.get("name").and_then(Json::as_str).unwrap_or("");
-        let entry = columns.entry(name.to_string()).or_insert_with(|| json!({"description": null}));
+        let entry = columns
+            .entry(name.to_string())
+            .or_insert_with(|| json!({"description": null}));
         if let Some(d) = e.descriptions.get(name) {
             entry["description"] = json!(d);
         }
@@ -192,9 +232,22 @@ pub fn info(prev: Option<&Json>, manifest: &Json, e: &Extra) -> Json {
 /// Set each field's `doc` in an Iceberg schema from the dataset_info column descriptions.
 pub fn schema_docs(schema: &mut Json, info: &Json) {
     let cols = info.get("columns").and_then(Json::as_object);
-    for f in schema.get_mut("fields").and_then(Json::as_array_mut).into_iter().flatten() {
-        let name = f.get("name").and_then(Json::as_str).unwrap_or("").to_string();
-        match cols.and_then(|c| c.get(&name)).and_then(|c| c.get("description")).and_then(Json::as_str) {
+    for f in schema
+        .get_mut("fields")
+        .and_then(Json::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let name = f
+            .get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
+        match cols
+            .and_then(|c| c.get(&name))
+            .and_then(|c| c.get("description"))
+            .and_then(Json::as_str)
+        {
             Some(d) => {
                 f["doc"] = json!(d);
             }

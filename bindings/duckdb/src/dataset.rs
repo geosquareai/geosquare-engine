@@ -168,12 +168,15 @@ pub fn metadata_json(lease: &Lease, path: &str) -> Result<Json, E> {
 fn hinted_metadata(lease: &Lease, root: &str) -> Option<(String, Json)> {
     let hint = read_text(lease, &join(root, "metadata/version-hint.text")).ok()?;
     let hint = hint.trim();
-    [format!("metadata/{hint}.metadata.json"), format!("metadata/v{hint}.metadata.json")]
-        .iter()
-        .find_map(|cand| {
-            let f = join(root, cand);
-            metadata_json(lease, &f).ok().map(|j| (f, j))
-        })
+    [
+        format!("metadata/{hint}.metadata.json"),
+        format!("metadata/v{hint}.metadata.json"),
+    ]
+    .iter()
+    .find_map(|cand| {
+        let f = join(root, cand);
+        metadata_json(lease, &f).ok().map(|j| (f, j))
+    })
 }
 
 fn partition_level(manifest: &Json) -> Option<usize> {
@@ -386,13 +389,22 @@ fn add_geometry(plan: Plan, p: &Params, domain_code: Option<&str>) -> Result<Pla
     };
     let format = format.to_ascii_lowercase();
     if !matches!(format.as_str(), "wkt" | "geojson") {
-        return Err(format!("with_geometry must be 'wkt' or 'geojson'; received {format:?}").into());
+        return Err(
+            format!("with_geometry must be 'wkt' or 'geojson'; received {format:?}").into(),
+        );
     }
     let crs = p.text("geometry_crs").unwrap_or_else(|| "EPSG:4326".into());
     let code = domain_code.ok_or("with_geometry needs the domain: pass domain_code := '<code>' (the dataset has no cell manifest)")?;
-    let expr = format!("cell_to_geometry({}, gid, {}, {})", lit(code), lit(&crs), lit(&format));
+    let expr = format!(
+        "cell_to_geometry({}, gid, {}, {})",
+        lit(code),
+        lit(&crs),
+        lit(&format)
+    );
     Ok(match plan {
-        Plan::Query(sql) => Plan::Query(format!("SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g")),
+        Plan::Query(sql) => Plan::Query(format!(
+            "SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g"
+        )),
         Plan::Typed(sql, probe) => Plan::Typed(
             format!("SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g"),
             format!("SELECT *, NULL::VARCHAR AS cell_geometry FROM ({probe}) AS gs_p"),
@@ -573,10 +585,13 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
             sorted.dedup();
             if let Some(sel) = t.files_for(&lease, &sorted)? {
                 if sel.is_empty() {
-                    return Ok((Plan::Query(format!(
-                        "SELECT {}, NULL::{extra_type} AS {extra} LIMIT 0",
-                        t.empty_select()
-                    )), d.code));
+                    return Ok((
+                        Plan::Query(format!(
+                            "SELECT {}, NULL::{extra_type} AS {extra} LIMIT 0",
+                            t.empty_select()
+                        )),
+                        d.code,
+                    ));
                 }
                 let list: Vec<String> = sel.iter().map(|f| lit(f)).collect();
                 // Every column is cast to the type the probe declares: the proxy copies values
@@ -623,9 +638,12 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
     let from = match &files {
         Some(f) if f.is_empty() => {
             // No partition intersects the area: same columns, no rows.
-            return Ok((Plan::Query(format!(
-                "SELECT *, NULL::{extra_type} AS {extra} FROM {full} LIMIT 0"
-            )), d.code));
+            return Ok((
+                Plan::Query(format!(
+                    "SELECT *, NULL::{extra_type} AS {extra} FROM {full} LIMIT 0"
+                )),
+                d.code,
+            ));
         }
         Some(f) => from_clause(&lease, &src, Some(f))?,
         None => full,
@@ -644,7 +662,6 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
     Ok((Plan::Query(sql), d.code))
 }
 
-
 // ---------------------------------------------------------------------------
 // cell_dataset_info / cell_dataset_columns: the metadata of a dataset as rows
 // ---------------------------------------------------------------------------
@@ -657,7 +674,10 @@ fn describe_dataset(p: &Params) -> Result<(Source, Json, Json), E> {
     let manifest = src.manifest.clone().unwrap_or(Json::Null);
     let info: Json = match &src.layout {
         Layout::Iceberg { metadata } => metadata_json(&lease, metadata)?
-            .pointer(&format!("/properties/{}", crate::metadata::INFO_KEY.replace('/', "~1")))
+            .pointer(&format!(
+                "/properties/{}",
+                crate::metadata::INFO_KEY.replace('/', "~1")
+            ))
             .and_then(Json::as_str)
             .and_then(|t| serde_json::from_str(t).ok()),
         _ => read_text(&lease, &join(&src.root, crate::metadata::INFO_FILE))
@@ -687,7 +707,10 @@ pub fn plan_info(p: &Params) -> Result<Plan, E> {
         Layout::Partitioned(_) => "partitioned",
         Layout::Iceberg { .. } => "iceberg",
     };
-    let int = |v: Option<&Json>| v.and_then(Json::as_i64).map_or("NULL::BIGINT".into(), |n| format!("{n}::BIGINT"));
+    let int = |v: Option<&Json>| {
+        v.and_then(Json::as_i64)
+            .map_or("NULL::BIGINT".into(), |n| format!("{n}::BIGINT"))
+    };
     Ok(Plan::Query(format!(
         "SELECT {} AS path, {} AS layout, {} AS domain_code, {} AS level, {} AS row_count, \
          {} AS title, {} AS description, {} AS data_period, {} AS data_version, \
@@ -712,7 +735,11 @@ pub fn plan_info(p: &Params) -> Result<Plan, E> {
 /// cell_dataset_columns(path): one row per value column of the cell manifest.
 pub fn plan_columns(p: &Params) -> Result<Plan, E> {
     let (_, m, info) = describe_dataset(p)?;
-    let fields = m.get("value_fields").and_then(Json::as_array).cloned().unwrap_or_default();
+    let fields = m
+        .get("value_fields")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
     if fields.is_empty() {
         return Ok(Plan::Query("SELECT NULL::VARCHAR AS \"column\", NULL::VARCHAR AS parquet_type, NULL::VARCHAR AS semantics, \
             NULL::VARCHAR AS aggregation_rule, NULL::VARCHAR AS unit, NULL::VARCHAR AS description, NULL::BOOLEAN AS nullable LIMIT 0".into()));
@@ -728,8 +755,15 @@ pub fn plan_columns(p: &Params) -> Result<Plan, E> {
                 slit(f.get("semantics")),
                 slit(f.get("aggregation_rule")),
                 slit(f.get("unit")),
-                slit(info.pointer(&format!("/columns/{}/description", name.replace('~', "~0").replace('/', "~1")))),
-                if f.get("nullable").and_then(Json::as_bool).unwrap_or(true) { "true" } else { "false" },
+                slit(info.pointer(&format!(
+                    "/columns/{}/description",
+                    name.replace('~', "~0").replace('/', "~1")
+                ))),
+                if f.get("nullable").and_then(Json::as_bool).unwrap_or(true) {
+                    "true"
+                } else {
+                    "false"
+                },
             )
         })
         .collect();

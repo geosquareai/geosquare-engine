@@ -39,7 +39,13 @@ fn dtype(duck: &str) -> DType {
 fn list<T: ToString>(items: &[T], quote: bool, ty: &str) -> String {
     let v: Vec<String> = items
         .iter()
-        .map(|x| if quote { lit(&x.to_string()) } else { x.to_string() })
+        .map(|x| {
+            if quote {
+                lit(&x.to_string())
+            } else {
+                x.to_string()
+            }
+        })
         .collect();
     format!("[{}]::{ty}[]", v.join(", "))
 }
@@ -54,11 +60,26 @@ pub fn plan(p: &Params) -> Result<Plan, E> {
     };
     let max_rows = p.int("max_rows").unwrap_or(100_000);
     let lease = sql::lease()?;
-    let src = format!("(SELECT * FROM ({query}) AS gs_q{})", if max_rows > 0 { format!(" LIMIT {max_rows}") } else { String::new() });
-    let described = sql::query_text_on(&lease, &format!("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {src})"))?;
+    let src = format!(
+        "(SELECT * FROM ({query}) AS gs_q{})",
+        if max_rows > 0 {
+            format!(" LIMIT {max_rows}")
+        } else {
+            String::new()
+        }
+    );
+    let described = sql::query_text_on(
+        &lease,
+        &format!("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM {src})"),
+    )?;
     let cols: Vec<(String, DType)> = described
         .into_iter()
-        .map(|r| (r[0].clone().unwrap_or_default(), dtype(r[1].as_deref().unwrap_or(""))))
+        .map(|r| {
+            (
+                r[0].clone().unwrap_or_default(),
+                dtype(r[1].as_deref().unwrap_or("")),
+            )
+        })
         .collect();
     let select: Vec<String> = cols
         .iter()
@@ -77,20 +98,27 @@ pub fn plan(p: &Params) -> Result<Plan, E> {
                 (None, _) => Value::Null,
                 (Some(_), DType::Other) => Value::Str(String::new()), // only null-ness is read
                 (Some(s), DType::Str) => Value::Str(s.clone()),
-                (Some(s), DType::Int64) => Value::Int(s.parse::<i64>().map_err(|_| {
-                    format!("column {name:?}: value {s} does not fit in int64")
-                })?),
+                (Some(s), DType::Int64) => Value::Int(
+                    s.parse::<i64>()
+                        .map_err(|_| format!("column {name:?}: value {s} does not fit in int64"))?,
+                ),
             });
         }
-        table.push(Column { name: name.clone(), dtype: *dt, values });
+        table.push(Column {
+            name: name.clone(),
+            dtype: *dt,
+            values,
+        });
     }
     let results = detect::detect_table(&table, domain.as_deref(), level);
     if results.is_empty() {
-        return Ok(Plan::Query(format!(
+        return Ok(Plan::Query(
+
             "SELECT * FROM (SELECT NULL::VARCHAR AS \"column\", NULL::VARCHAR AS kind, NULL::VARCHAR AS status, \
              NULL::VARCHAR AS reason, NULL::DOUBLE AS valid_ratio, NULL::VARCHAR[] AS domain_codes, \
              NULL::USMALLINT[] AS domain_ids, NULL::UTINYINT[] AS levels, NULL::VARCHAR[] AS invalid_examples) LIMIT 0"
-        )));
+            .into(),
+        ));
     }
     let values: Vec<String> = results
         .iter()

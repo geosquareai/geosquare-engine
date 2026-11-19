@@ -126,7 +126,11 @@ impl Storage {
     }
 
     /// Upload local files to their remote paths, `concurrency` requests at a time.
-    pub fn upload_files(&self, files: &[(String, std::path::PathBuf)], concurrency: usize) -> Result<(), E> {
+    pub fn upload_files(
+        &self,
+        files: &[(String, std::path::PathBuf)],
+        concurrency: usize,
+    ) -> Result<(), E> {
         #[cfg(feature = "native-s3")]
         {
             return self.conf()?.upload_files(files, concurrency);
@@ -387,7 +391,11 @@ mod s3 {
             Ok(meta.size as i64)
         }
 
-        pub fn upload_files(&self, files: &[(String, std::path::PathBuf)], concurrency: usize) -> Result<(), E> {
+        pub fn upload_files(
+            &self,
+            files: &[(String, std::path::PathBuf)],
+            concurrency: usize,
+        ) -> Result<(), E> {
             use futures::StreamExt;
             let mut stores: std::collections::HashMap<String, Arc<AmazonS3>> = Default::default();
             let mut jobs = Vec::with_capacity(files.len());

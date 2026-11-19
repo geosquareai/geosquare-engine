@@ -13,10 +13,10 @@
 
 use duckdb::ffi::*;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     error::Error,
     ffi::{c_void, CStr, CString},
-    cell::RefCell,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -94,7 +94,9 @@ pub fn par_map<T: Send, R: Send>(
                         }
                     };
                     while !stop.load(Ordering::Acquire) {
-                        let Some((i, item)) = queue.lock().unwrap().next() else { break };
+                        let Some((i, item)) = queue.lock().unwrap().next() else {
+                            break;
+                        };
                         match f(&lease, item) {
                             Ok(r) => results.lock().unwrap()[i] = Some(r),
                             Err(e) => {
@@ -110,7 +112,12 @@ pub fn par_map<T: Send, R: Send>(
     if let Some(e) = failed.into_inner().unwrap() {
         return Err(e.into());
     }
-    Ok(results.into_inner().unwrap().into_iter().map(|r| r.expect("every item ran")).collect())
+    Ok(results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.expect("every item ran"))
+        .collect())
 }
 
 /// Run `f` with `pool` as this thread's current pool (restoring the previous one).
@@ -140,15 +147,18 @@ impl Drop for Lease {
 }
 
 pub fn lease() -> Result<Lease, E> {
-    let pool = CURRENT
-        .with(|c| c.borrow().clone())
-        .ok_or("geosquare_v2: no internal connections for this database (was the extension loaded?)")?;
+    let pool = CURRENT.with(|c| c.borrow().clone()).ok_or(
+        "geosquare_v2: no internal connections for this database (was the extension loaded?)",
+    )?;
     for (i, (_, busy)) in pool.conns.iter().enumerate() {
         if busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return Ok(Lease { pool: pool.clone(), idx: i });
+            return Ok(Lease {
+                pool: pool.clone(),
+                idx: i,
+            });
         }
     }
     Err(format!(
@@ -513,44 +523,51 @@ unsafe extern "C" fn proxy_bind(info: duckdb_bind_info) {
             );
         }
         let params = Params { positional, named };
-        let result: Result<BoundKind, E> = with_pool(&spec.pool, || match (spec.planner)(&params)? {
-            plan @ (Plan::Query(_) | Plan::Typed(..)) => {
-                let lease = lease()?;
-                let (sql, cols) = match plan {
-                    Plan::Typed(sql, probe) => {
-                        let cols = schema(&lease, &probe)?;
-                        if cols.iter().all(|(_, t)| supported(*t)) {
-                            (sql, cols)
-                        } else {
-                            for (_, mut t) in cols {
-                                duckdb_destroy_logical_type(&mut t);
+        let result: Result<BoundKind, E> =
+            with_pool(&spec.pool, || match (spec.planner)(&params)? {
+                plan @ (Plan::Query(_) | Plan::Typed(..)) => {
+                    let lease = lease()?;
+                    let (sql, cols) = match plan {
+                        Plan::Typed(sql, probe) => {
+                            let cols = schema(&lease, &probe)?;
+                            if cols.iter().all(|(_, t)| supported(*t)) {
+                                (sql, cols)
+                            } else {
+                                for (_, mut t) in cols {
+                                    duckdb_destroy_logical_type(&mut t);
+                                }
+                                finalize(&lease, sql)?
                             }
-                            finalize(&lease, sql)?
                         }
+                        Plan::Query(sql) => finalize(&lease, sql)?,
+                        Plan::Action(..) => unreachable!(),
+                    };
+                    let mut names = Vec::with_capacity(cols.len());
+                    for (name, mut t) in cols {
+                        let c = CString::new(name.as_str()).unwrap_or_default();
+                        duckdb_bind_add_result_column(info, c.as_ptr(), t);
+                        duckdb_destroy_logical_type(&mut t);
+                        names.push(name);
                     }
-                    Plan::Query(sql) => finalize(&lease, sql)?,
-                    Plan::Action(..) => unreachable!(),
-                };
-                let mut names = Vec::with_capacity(cols.len());
-                for (name, mut t) in cols {
-                    let c = CString::new(name.as_str()).unwrap_or_default();
-                    duckdb_bind_add_result_column(info, c.as_ptr(), t);
-                    duckdb_destroy_logical_type(&mut t);
-                    names.push(name);
+                    Ok(BoundKind::Query(sql, names))
                 }
-                Ok(BoundKind::Query(sql, names))
-            }
-            Plan::Action(f, columns) => {
-                for name in &columns {
-                    let c = CString::new(name.as_str()).unwrap_or_default();
-                    let mut t = duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
-                    duckdb_bind_add_result_column(info, c.as_ptr(), t);
-                    duckdb_destroy_logical_type(&mut t);
+                Plan::Action(f, columns) => {
+                    for name in &columns {
+                        let c = CString::new(name.as_str()).unwrap_or_default();
+                        let mut t = duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+                        duckdb_bind_add_result_column(info, c.as_ptr(), t);
+                        duckdb_destroy_logical_type(&mut t);
+                    }
+                    Ok(BoundKind::Action(
+                        std::sync::Mutex::new(Some(f)),
+                        columns.len(),
+                    ))
                 }
-                Ok(BoundKind::Action(std::sync::Mutex::new(Some(f)), columns.len()))
-            }
-        });
-        match result.map(|kind| Bound { pool: spec.pool.clone(), kind }) {
+            });
+        match result.map(|kind| Bound {
+            pool: spec.pool.clone(),
+            kind,
+        }) {
             Ok(b) => duckdb_bind_set_bind_data(
                 info,
                 Box::into_raw(Box::new(b)) as *mut c_void,
@@ -718,7 +735,11 @@ unsafe fn copy_list(
         let src_valid = duckdb_vector_get_validity(src);
         if !src_valid.is_null() {
             duckdb_vector_ensure_validity_writable(dst);
-            std::ptr::copy_nonoverlapping(src_valid, duckdb_vector_get_validity(dst), n.div_ceil(64));
+            std::ptr::copy_nonoverlapping(
+                src_valid,
+                duckdb_vector_get_validity(dst),
+                n.div_ceil(64),
+            );
         }
         let entries = duckdb_vector_get_data(src) as *const duckdb_list_entry;
         let total = duckdb_list_vector_get_size(src);
@@ -727,7 +748,11 @@ unsafe fn copy_list(
         {
             return Err("cannot size a list column".into());
         }
-        std::ptr::copy_nonoverlapping(entries, duckdb_vector_get_data(dst) as *mut duckdb_list_entry, n);
+        std::ptr::copy_nonoverlapping(
+            entries,
+            duckdb_vector_get_data(dst) as *mut duckdb_list_entry,
+            n,
+        );
         let mut child = duckdb_list_type_child_type(t);
         let r = copy_vector(
             duckdb_list_vector_get_child(src),

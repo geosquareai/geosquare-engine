@@ -9,9 +9,9 @@ mod dataset;
 mod detect_fn;
 mod equal_area;
 mod geom;
-mod icefast;
 mod grid;
 mod iceberg;
+mod icefast;
 mod lines;
 mod metadata;
 mod polyfill;
@@ -130,16 +130,49 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("s3_secret_access_key", Text),
                 ("s3_session_token", Text),
             ]);
-            sql::register(con, "cell_dataset_info", vec![Text], identity.clone(), dataset::plan_info, pool.clone())?;
-            sql::register(con, "cell_dataset_columns", vec![Text], identity.clone(), dataset::plan_columns, pool.clone())?;
+            sql::register(
+                con,
+                "cell_dataset_info",
+                vec![Text],
+                identity.clone(),
+                dataset::plan_info,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "cell_dataset_columns",
+                vec![Text],
+                identity.clone(),
+                dataset::plan_columns,
+                pool.clone(),
+            )?;
             let mut u = vec![
-                ("units", Text), ("column_descriptions", Text), ("title", Text), ("description", Text),
-                ("data_period", Text), ("data_version", Text), ("source", Text), ("coverage", Text), ("notes", Text),
-                ("s3_region", Text), ("s3_endpoint", Text), ("s3_url_style", Text), ("s3_use_ssl", Text),
-                ("s3_access_key_id", Text), ("s3_secret_access_key", Text), ("s3_session_token", Text),
+                ("units", Text),
+                ("column_descriptions", Text),
+                ("title", Text),
+                ("description", Text),
+                ("data_period", Text),
+                ("data_version", Text),
+                ("source", Text),
+                ("coverage", Text),
+                ("notes", Text),
+                ("s3_region", Text),
+                ("s3_endpoint", Text),
+                ("s3_url_style", Text),
+                ("s3_use_ssl", Text),
+                ("s3_access_key_id", Text),
+                ("s3_secret_access_key", Text),
+                ("s3_session_token", Text),
             ];
             u.shrink_to_fit();
-            sql::register(con, "update_cell_metadata", vec![Text], u, writer::plan_update, pool.clone())?;
+            sql::register(
+                con,
+                "update_cell_metadata",
+                vec![Text],
+                u,
+                writer::plan_update,
+                pool.clone(),
+            )?;
             sql::register(
                 con,
                 "detect_table",

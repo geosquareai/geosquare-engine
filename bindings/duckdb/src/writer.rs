@@ -131,7 +131,7 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
             .text("identity")
             .unwrap_or_else(|| "query".into())
             .to_ascii_lowercase(),
-        fill_nulls: p.int("fill_nulls").map_or(true, |v| v != 0),
+        fill_nulls: p.int("fill_nulls").is_none_or(|v| v != 0),
         column_metrics: p
             .text("column_metrics")
             .unwrap_or_else(|| "auto".into())
@@ -249,7 +249,10 @@ struct Staging {
 impl Staging {
     fn new(root: &str) -> Result<Self, E> {
         if !crate::storage::is_s3(root) || cfg!(not(feature = "native-s3")) {
-            return Ok(Staging { dir: None, files: Vec::new() });
+            return Ok(Staging {
+                dir: None,
+                files: Vec::new(),
+            });
         }
         let base = std::env::var_os("GEOSQUARE_V2_STAGING_DIR")
             .map(std::path::PathBuf::from)
@@ -257,7 +260,10 @@ impl Staging {
         let dir = base.join(format!("geosquare_v2_upload_{}", uuid4()));
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create staging folder {}: {e}", dir.display()))?;
-        Ok(Staging { dir: Some(dir), files: Vec::new() })
+        Ok(Staging {
+            dir: Some(dir),
+            files: Vec::new(),
+        })
     }
 
     /// Where DuckDB writes the file that ends up at `remote` (`rel` below the table root).
@@ -436,7 +442,10 @@ impl Staged {
 /// Stage the query sorted by packed_id and run the identity checks.
 fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
     let stage = stage_table();
-    sql::exec_on(lease, &format!("ATTACH IF NOT EXISTS ':memory:' AS {STAGE_DB}"))?;
+    sql::exec_on(
+        lease,
+        &format!("ATTACH IF NOT EXISTS ':memory:' AS {STAGE_DB}"),
+    )?;
     let src = format!("SELECT * FROM ({query}) AS gs_src");
     let cols = describe(lease, &src)?;
     let has = |n: &str| cols.iter().any(|(c, _)| c == n);
@@ -710,8 +719,18 @@ fn is_numeric_type(ty: &str) -> bool {
     let t = ty.to_ascii_uppercase();
     matches!(
         t.as_str(),
-        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT"
-            | "UINTEGER" | "UBIGINT" | "UHUGEINT" | "FLOAT" | "DOUBLE"
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "UHUGEINT"
+            | "FLOAT"
+            | "DOUBLE"
     ) || t.starts_with("DECIMAL")
 }
 
@@ -846,7 +865,11 @@ fn write_flat(
         ),
     )?;
     write_manifest(lease, root, &m)?;
-    write_json(lease, &join(root, crate::metadata::INFO_FILE), &crate::metadata::info(None, &m, &o.extra))?;
+    write_json(
+        lease,
+        &join(root, crate::metadata::INFO_FILE),
+        &crate::metadata::info(None, &m, &o.extra),
+    )?;
     Ok(vec![vec![
         Some("flat".into()),
         Some(root.to_string()),
@@ -914,7 +937,11 @@ fn write_partitioned(
     })?;
     staging.upload(store)?;
     write_manifest(lease, root, &m)?;
-    write_json(lease, &join(root, crate::metadata::INFO_FILE), &crate::metadata::info(None, &m, &o.extra))?;
+    write_json(
+        lease,
+        &join(root, crate::metadata::INFO_FILE),
+        &crate::metadata::info(None, &m, &o.extra),
+    )?;
     // Partition index for readers that cannot list folders (plain HTTP).
     let list = serde_json::to_string(&prefixes)?;
     sql::exec_on(
@@ -1249,7 +1276,10 @@ fn write_iceberg(
             None => format!("iceberg_scan({})", lit(meta_path)),
         };
         // Only the staged packed_id range can collide, so the scan prunes files outside it.
-        let r = one_row(lease, &format!("SELECT min(packed_id), max(packed_id) FROM {stage}"))?;
+        let r = one_row(
+            lease,
+            &format!("SELECT min(packed_id), max(packed_id) FROM {stage}"),
+        )?;
         let (lo, hi) = (num(&r[0]), num(&r[1]));
         let dup = num(&one_row(
             lease,
@@ -1266,14 +1296,19 @@ fn write_iceberg(
     let by_name = |n: &str| fields.iter().find(|f| f.name == n);
     let metric_fields: Vec<&Field> = match o.column_metrics.as_str() {
         "all" => fields.iter().collect(),
-        "key" => fields.iter().filter(|f| KEY_COLUMNS.contains(&f.name.as_str())).collect(),
+        "key" => fields
+            .iter()
+            .filter(|f| KEY_COLUMNS.contains(&f.name.as_str()))
+            .collect(),
         "auto" => fields
             .iter()
             .enumerate()
             .filter(|(i, f)| *i < 100 || KEY_COLUMNS.contains(&f.name.as_str()))
             .map(|(_, f)| f)
             .collect(),
-        m => return Err(format!("column_metrics must be 'auto', 'key' or 'all', got '{m}'").into()),
+        m => {
+            return Err(format!("column_metrics must be 'auto', 'key' or 'all', got '{m}'").into())
+        }
     };
     let select: Vec<String> = fields
         .iter()
@@ -1392,7 +1427,12 @@ fn write_iceberg(
     // Manifest and manifest list.
     let prev_info: Option<Json> = prev
         .as_ref()
-        .and_then(|(_, m)| m.pointer(&format!("/properties/{}", crate::metadata::INFO_KEY.replace('/', "~1"))))
+        .and_then(|(_, m)| {
+            m.pointer(&format!(
+                "/properties/{}",
+                crate::metadata::INFO_KEY.replace('/', "~1")
+            ))
+        })
         .and_then(Json::as_str)
         .and_then(|t| serde_json::from_str(t).ok());
     let table_info = crate::metadata::info(prev_info.as_ref(), &cell_manifest, &o.extra);
@@ -1588,7 +1628,10 @@ fn write_iceberg(
     } else {
         props.remove(MANIFEST_KEY);
     }
-    props.insert(crate::metadata::INFO_KEY.into(), json!(table_info.to_string()));
+    props.insert(
+        crate::metadata::INFO_KEY.into(),
+        json!(table_info.to_string()),
+    );
     if let Some(d) = table_info.get("description").and_then(Json::as_str) {
         props.insert("comment".into(), json!(d));
     }
@@ -1631,7 +1674,6 @@ fn write_iceberg(
     ]])
 }
 
-
 // ---------------------------------------------------------------------------
 // update_cell_metadata: change descriptive metadata without rewriting data
 // ---------------------------------------------------------------------------
@@ -1653,7 +1695,11 @@ pub fn plan_update(p: &Params) -> Result<Plan, E> {
     ))
 }
 
-fn update_metadata(path: &str, extra: &crate::metadata::Extra, s3: &S3Params) -> Result<Vec<Vec<Option<String>>>, E> {
+fn update_metadata(
+    path: &str,
+    extra: &crate::metadata::Extra,
+    s3: &S3Params,
+) -> Result<Vec<Vec<Option<String>>>, E> {
     use crate::metadata::{self as md, INFO_FILE, INFO_KEY};
     let lease = sql::lease()?;
     let root = path.trim_end_matches('/').to_string();
@@ -1667,25 +1713,48 @@ fn update_metadata(path: &str, extra: &crate::metadata::Extra, s3: &S3Params) ->
                     .and_then(Json::as_str)
                     .and_then(|t| serde_json::from_str(t).ok())
             };
-            let mut manifest = prop(&meta, MANIFEST_KEY).ok_or("the table has no cell manifest (geosquare.manifest)")?;
+            let mut manifest = prop(&meta, MANIFEST_KEY)
+                .ok_or("the table has no cell manifest (geosquare.manifest)")?;
             md::apply(&mut manifest, extra)?;
             let info = md::info(prop(&meta, INFO_KEY).as_ref(), &manifest, extra);
             let now = now_ms();
             let obj = meta.as_object_mut().ok_or("metadata is not an object")?;
             // column docs: a new schema version with the same field ids when they change
-            let cur = obj.get("current-schema-id").and_then(Json::as_i64).unwrap_or(0);
-            let schemas = obj.get("schemas").and_then(Json::as_array).cloned().unwrap_or_default();
-            if let Some(current) = schemas.iter().find(|s| s.get("schema-id").and_then(Json::as_i64) == Some(cur)) {
+            let cur = obj
+                .get("current-schema-id")
+                .and_then(Json::as_i64)
+                .unwrap_or(0);
+            let schemas = obj
+                .get("schemas")
+                .and_then(Json::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(current) = schemas
+                .iter()
+                .find(|s| s.get("schema-id").and_then(Json::as_i64) == Some(cur))
+            {
                 let mut next = current.clone();
                 md::schema_docs(&mut next, &info);
                 if &next != current {
-                    let id = schemas.iter().filter_map(|s| s.get("schema-id").and_then(Json::as_i64)).max().unwrap_or(0) + 1;
+                    let id = schemas
+                        .iter()
+                        .filter_map(|s| s.get("schema-id").and_then(Json::as_i64))
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
                     next["schema-id"] = json!(id);
-                    obj.get_mut("schemas").and_then(Json::as_array_mut).ok_or("schemas")?.push(next);
+                    obj.get_mut("schemas")
+                        .and_then(Json::as_array_mut)
+                        .ok_or("schemas")?
+                        .push(next);
                     obj.insert("current-schema-id".into(), json!(id));
                 }
             }
-            let props = obj.entry("properties").or_insert(json!({})).as_object_mut().ok_or("properties")?;
+            let props = obj
+                .entry("properties")
+                .or_insert(json!({}))
+                .as_object_mut()
+                .ok_or("properties")?;
             props.insert(MANIFEST_KEY.into(), json!(manifest.to_string()));
             props.insert(INFO_KEY.into(), json!(info.to_string()));
             if let Some(d) = info.get("description").and_then(Json::as_str) {
@@ -1705,23 +1774,43 @@ fn update_metadata(path: &str, extra: &crate::metadata::Extra, s3: &S3Params) ->
             let stem = format!("{version:05}-{}", uuid4());
             let meta_rel = format!("metadata/{stem}.metadata.json");
             store.put(&join(&root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
-            store.put(&join(&root, "metadata/version-hint.text"), stem.into_bytes())?;
+            store.put(
+                &join(&root, "metadata/version-hint.text"),
+                stem.into_bytes(),
+            )?;
             let n = manifest["value_fields"].as_array().map_or(0, Vec::len);
-            Ok(vec![vec![Some(root.clone()), Some(join(&root, &meta_rel)), Some(n.to_string())]])
+            Ok(vec![vec![
+                Some(root.clone()),
+                Some(join(&root, &meta_rel)),
+                Some(n.to_string()),
+            ]])
         }
         _ => {
-            let mut manifest = src.manifest.clone().ok_or("the dataset has no manifest.json")?;
+            let mut manifest = src
+                .manifest
+                .clone()
+                .ok_or("the dataset has no manifest.json")?;
             md::apply(&mut manifest, extra)?;
-            let prev: Option<Json> = sql::query_text_on(&lease, &format!("SELECT content FROM read_text({})", lit(&join(&root, INFO_FILE))))
-                .ok()
-                .and_then(|r| r.into_iter().next())
-                .and_then(|r| r.into_iter().next().flatten())
-                .and_then(|t| serde_json::from_str(&t).ok());
+            let prev: Option<Json> = sql::query_text_on(
+                &lease,
+                &format!(
+                    "SELECT content FROM read_text({})",
+                    lit(&join(&root, INFO_FILE))
+                ),
+            )
+            .ok()
+            .and_then(|r| r.into_iter().next())
+            .and_then(|r| r.into_iter().next().flatten())
+            .and_then(|t| serde_json::from_str(&t).ok());
             let info = md::info(prev.as_ref(), &manifest, extra);
             write_manifest(&lease, &root, &manifest)?;
             write_json(&lease, &join(&root, INFO_FILE), &info)?;
             let n = manifest["value_fields"].as_array().map_or(0, Vec::len);
-            Ok(vec![vec![Some(root.clone()), Some(join(&root, MANIFEST_FILE)), Some(n.to_string())]])
+            Ok(vec![vec![
+                Some(root.clone()),
+                Some(join(&root, MANIFEST_FILE)),
+                Some(n.to_string()),
+            ]])
         }
     }
 }
