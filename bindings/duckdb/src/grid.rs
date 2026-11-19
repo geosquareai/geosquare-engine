@@ -771,7 +771,23 @@ fn cell_geometry(
     crs: &str,
     fmt: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let ring: Vec<(f64, f64)> = match crs.trim().to_ascii_uppercase().as_str() {
+    let ring = cell_ring(d, c, crs)?;
+    match fmt.trim().to_ascii_lowercase().as_str() {
+        "wkt" => Ok(geom::to_wkt(&[ring])),
+        "geojson" => Ok(geom::to_geojson(&[ring])),
+        other => {
+            Err(format!("geometry_format must be 'wkt' or 'geojson'; received {other:?}").into())
+        }
+    }
+}
+
+/// Outline of a cell (open ring) in the grid CRS or in lon/lat.
+fn cell_ring(
+    d: &'static domain::Domain,
+    c: Cell,
+    crs: &str,
+) -> Result<Vec<(f64, f64)>, Box<dyn Error>> {
+    Ok(match crs.trim().to_ascii_uppercase().as_str() {
         "GRID" | "PROJECTED" => {
             let b = geo::cell_bounds(d, c)?;
             vec![
@@ -791,13 +807,79 @@ fn cell_geometry(
                 format!("output_crs must be 'grid' or 'EPSG:4326'; received {other:?}").into(),
             )
         }
-    };
-    match fmt.trim().to_ascii_lowercase().as_str() {
-        "wkt" => Ok(geom::to_wkt(&[ring])),
-        "geojson" => Ok(geom::to_geojson(&[ring])),
-        other => {
-            Err(format!("geometry_format must be 'wkt' or 'geojson'; received {other:?}").into())
+    })
+}
+
+/// A closed one-ring polygon as little-endian WKB (ISO, 2D).
+pub fn polygon_wkb(ring: &[(f64, f64)]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(13 + 16 * (ring.len() + 1));
+    b.push(1u8);
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    let closed = ring.first() != ring.last();
+    b.extend_from_slice(&((ring.len() + closed as usize) as u32).to_le_bytes());
+    for (x, y) in ring.iter().chain(ring.first().filter(|_| closed)) {
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+    }
+    b
+}
+
+/// cell_to_wkb(packed_id [, output_crs]) / cell_to_wkb(domain_code, gid [, output_crs]) -> BLOB
+/// (lon/lat by default). DuckDB spatial: ST_GeomFromWKB(cell_to_wkb(...)).
+pub struct CellToWkb;
+impl VScalar for CellToWkb {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let ncols = input.num_columns();
+        let by_packed = col_type(input, 0) == LogicalTypeId::Bigint;
+        let crs_col = if by_packed { 1 } else { 2 };
+        let crs = if ncols > crs_col {
+            strings(input, crs_col, n)
+        } else {
+            vec![Some("EPSG:4326".into()); n]
+        };
+        let cells: Vec<Option<(&'static domain::Domain, Cell)>> = if by_packed {
+            prims::<i64>(input, 0, n)
+                .into_iter()
+                .map(|p| {
+                    p.map(|p| {
+                        let (id, c) = packing::unpack(p)?;
+                        Ok::<_, Box<dyn Error>>((crate::grid::domain_by_id(id as i32)?, c))
+                    })
+                    .transpose()
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            let (d, g) = (domains(input, 0, n)?, strings(input, 1, n));
+            d.into_iter()
+                .zip(g)
+                .map(|(d, g)| match (d, g) {
+                    (Some(d), Some(g)) => Ok(Some((d, codec::decode(&g)?))),
+                    _ => Ok::<_, Box<dyn Error>>(None),
+                })
+                .collect::<Result<_, _>>()?
+        };
+        let mut v = out.flat_vector();
+        for i in 0..n {
+            match (cells[i], &crs[i]) {
+                (Some((d, c)), Some(crs)) => {
+                    let wkb = polygon_wkb(&cell_ring(d, c, crs)?);
+                    v.insert(i, wkb.as_slice());
+                }
+                _ => v.set_null(i),
+            }
         }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Bigint], type_id(LogicalTypeId::Blob)),
+            sig(&[Bigint, Varchar], type_id(LogicalTypeId::Blob)),
+            sig(&[Varchar, Varchar], type_id(LogicalTypeId::Blob)),
+            sig(&[Varchar, Varchar, Varchar], type_id(LogicalTypeId::Blob)),
+        ]
     }
 }
 
@@ -1041,6 +1123,7 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<DescendantRange>("descendant_range")?;
     con.register_scalar_function::<ParseUri>("parse_uri")?;
     con.register_scalar_function::<CellToGeometry>("cell_to_geometry")?;
+    con.register_scalar_function::<CellToWkb>("cell_to_wkb")?;
     con.register_scalar_function::<EngineVersion>("geosquare_engine_version")?;
     con.register_scalar_function::<V1GidToCell>("v1_gid_to_cell")?;
     con.register_scalar_function::<V1GidCenter>("v1_gid_center")?;

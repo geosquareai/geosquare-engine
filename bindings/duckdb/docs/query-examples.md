@@ -157,6 +157,43 @@ ORDER BY gid;
 Self-intersecting polygons are repaired (even-odd, like `shapely.make_valid`) before the
 cells are computed.
 
+## Radius, WKB and vector tiles
+
+`radius_m` turns a `POINT` into a circle of that radius (true distance on the Earth, 64
+vertices), then behaves like a polygon: `coverage_ratio`, `rollup_level`, several datasets.
+
+```sql
+-- people within 1 km of an outlet, and per 1 km cell
+SELECT sum(population * coverage_ratio) AS population
+FROM query_cell_dataset('/data/pop_ice', geometry := 'POINT (106.8272 -6.1754)', radius_m := 1000);
+SELECT gid, population, coverage_ratio
+FROM query_cell_dataset('/data/pop_ice', geometry := 'POINT (106.8272 -6.1754)', radius_m := 1000, rollup_level := 9);
+```
+
+`with_geometry := 'wkb'` returns the cell outline as WKB (`BLOB`, lon/lat), and
+`cell_to_wkb(packed_id [, output_crs])` / `cell_to_wkb(domain_code, gid [, output_crs])` does
+the same per cell, for DuckDB spatial (`ST_GeomFromWKB`) or GeoParquet/GeoArrow consumers.
+
+```sql
+SELECT gid, population, octet_length(cell_geometry) AS wkb_bytes
+FROM query_cell_dataset('/data/pop_ice', bbox := [106.82, -6.18, 106.83, -6.17], with_geometry := 'wkb')
+LIMIT 3;
+SELECT octet_length(cell_to_wkb(packed_id)) FROM read_cell_dataset('/data/pop_ice') LIMIT 1;
+```
+
+Vector tiles (MVT) for a web map come from DuckDB spatial on top of the WKB output:
+
+```sql
+-- not run in tests: needs INSTALL spatial (network)
+INSTALL spatial; LOAD spatial;
+SET VARIABLE tile_wkt = (SELECT ST_AsText(ST_Transform(ST_TileEnvelope(14, 13054, 8473),
+                                          'EPSG:3857', 'EPSG:4326', always_xy := true)));
+SELECT ST_AsMVT({'geometry': ST_AsMVTGeom(ST_Transform(ST_GeomFromWKB(cell_geometry), 'EPSG:4326', 'EPSG:3857', always_xy := true),
+                                          ST_Extent(ST_TileEnvelope(14, 13054, 8473))),
+                 'gid': gid, 'population': population}, 'cells') AS tile
+FROM query_cell_dataset('/data/pop_ice', geometry := getvariable('tile_wkt'), with_geometry := 'wkb');
+```
+
 ## Aggregates and roll-ups
 
 A level-L ancestor's gid is the first L characters of the gid: level 9 = 1 km, 7 = 10 km,

@@ -109,6 +109,7 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("snapshot_id", Int),
                 ("as_of", Text),
                 ("geometry", Text),
+                ("radius_m", Float),
                 ("bbox", FloatList),
                 ("min_coverage", Float),
                 ("source_crs", Text),

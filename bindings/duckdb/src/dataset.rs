@@ -401,26 +401,32 @@ fn add_geometry(plan: Plan, p: &Params, domain_code: Option<&str>) -> Result<Pla
         return Ok(plan);
     };
     let format = format.to_ascii_lowercase();
-    if !matches!(format.as_str(), "wkt" | "geojson") {
-        return Err(
-            format!("with_geometry must be 'wkt' or 'geojson'; received {format:?}").into(),
-        );
+    if !matches!(format.as_str(), "wkt" | "geojson" | "wkb") {
+        return Err(format!(
+            "with_geometry must be 'wkt', 'geojson' or 'wkb'; received {format:?}"
+        )
+        .into());
     }
     let crs = p.text("geometry_crs").unwrap_or_else(|| "EPSG:4326".into());
     let code = domain_code.ok_or("with_geometry needs the domain: pass domain_code := '<code>' (the dataset has no cell manifest)")?;
-    let expr = format!(
-        "cell_to_geometry({}, gid, {}, {})",
-        lit(code),
-        lit(&crs),
-        lit(&format)
-    );
+    let expr = if format == "wkb" {
+        format!("cell_to_wkb({}, gid, {})", lit(code), lit(&crs))
+    } else {
+        format!(
+            "cell_to_geometry({}, gid, {}, {})",
+            lit(code),
+            lit(&crs),
+            lit(&format)
+        )
+    };
+    let null_type = if format == "wkb" { "BLOB" } else { "VARCHAR" };
     Ok(match plan {
         Plan::Query(sql) => Plan::Query(format!(
             "SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g"
         )),
         Plan::Typed(sql, probe) => Plan::Typed(
             format!("SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g"),
-            format!("SELECT *, NULL::VARCHAR AS cell_geometry FROM ({probe}) AS gs_p"),
+            format!("SELECT *, NULL::{null_type} AS cell_geometry FROM ({probe}) AS gs_p"),
         ),
         other => other,
     })
@@ -823,9 +829,46 @@ pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
     add_geometry(plan, p, Some(code))
 }
 
+/// Polygon of `n` vertices around (lon, lat) at `r` metres on the sphere (destination-point
+/// formula, mean Earth radius), counter-clockwise, as WKT.
+pub fn circle_wkt(lon: f64, lat: f64, r: f64, n: usize) -> String {
+    let (phi1, lam1, d) = (lat.to_radians(), lon.to_radians(), r / 6_371_008.8);
+    let pts: Vec<String> = (0..=n)
+        .map(|i| {
+            let brg = 2.0 * std::f64::consts::PI * ((n - i % n) % n) as f64 / n as f64;
+            let phi2 = (phi1.sin() * d.cos() + phi1.cos() * d.sin() * brg.cos()).asin();
+            let lam2 =
+                lam1 + (brg.sin() * d.sin() * phi1.cos()).atan2(d.cos() - phi1.sin() * phi2.sin());
+            format!("{} {}", lam2.to_degrees(), phi2.to_degrees())
+        })
+        .collect();
+    format!("POLYGON (({}))", pts.join(", "))
+}
+
 /// Query polygon in the grid CRS and its source CRS for `polygon_to_cells`.
 fn query_polygon(p: &Params, d: &Domain, level: u8) -> Result<(String, String, f64), E> {
     let min_cov = p.float("min_coverage").unwrap_or(0.0);
+    if let Some(r) = p.float("radius_m") {
+        // A circle around one lon/lat point, built on the sphere (true distance): 64 vertices.
+        let wkt = p
+            .text("geometry")
+            .ok_or("radius_m needs geometry := 'POINT (lon lat)'")?;
+        let crs = p.text("source_crs").unwrap_or_else(|| "EPSG:4326".into());
+        if !matches!(
+            crs.to_ascii_uppercase().as_str(),
+            "EPSG:4326" | "OGC:CRS84" | "WGS84"
+        ) {
+            return Err("radius_m needs a lon/lat point (source_crs EPSG:4326)".into());
+        }
+        let (lon, lat) = match geom::parse_geometry(&wkt)? {
+            geom::Geometry::Points(pts) if pts.len() == 1 => (pts[0].0, pts[0].1),
+            _ => return Err("radius_m needs exactly one POINT".into()),
+        };
+        if !(r > 0.0 && r <= 1_000_000.0) {
+            return Err("radius_m must be in (0, 1000000]".into());
+        }
+        return Ok((circle_wkt(lon, lat, r, 64), "EPSG:4326".into(), min_cov));
+    }
     if let Some(wkt) = p.text("geometry") {
         // Any WKT geometry; plan_query dispatches on its type.
         let crs = p.text("source_crs").unwrap_or_else(|| "EPSG:4326".into());

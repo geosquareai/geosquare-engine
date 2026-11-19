@@ -256,6 +256,9 @@ Lines follow `geosquare_v2.line_to_cells` (identical on test lines); a segment l
 an internal cell edge goes to the cell on its high side (spec 2.0 half-open rule), so the
 ratios of a line always sum to 1, whereas the Shapely oracle can count such a segment twice.
 
+`radius_m` with a `POINT` queries a circle (true distance); `with_geometry := 'wkb'` and
+`cell_to_wkb(...)` give WKB outlines for DuckDB spatial (vector tiles: see docs).
+
 `snapshot_id := <id>` / `as_of := <timestamp>` on `read_cell_dataset`, `query_cell_dataset` and
 `query_cell_datasets` read an older Iceberg snapshot.
 
