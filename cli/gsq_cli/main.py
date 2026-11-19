@@ -1,0 +1,400 @@
+"""The ``gsq`` command-line interface.
+
+All grid operations are delegated to the geosquare_v2 DuckDB extension.  This
+module only handles input/output formats, argument validation, and atomic file
+writes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+import tempfile
+from typing import Any, Iterable
+
+import duckdb
+
+from . import __version__
+
+
+CANDIDATE_DOMAINS = {"KH", "MM", "TH", "TL", "VN"}
+
+
+class CLIError(Exception):
+    """A user-facing data or validation error."""
+
+
+class UsageError(Exception):
+    """A user-facing usage error."""
+
+
+def sql_string(value: str) -> str:
+    """Return a safely quoted SQL string literal."""
+
+    return "'" + value.replace("'", "''") + "'"
+
+
+def sql_identifier(value: str) -> str:
+    """Return a safely quoted SQL identifier."""
+
+    return '"' + value.replace('"', '""') + '"'
+
+
+def input_relation(path: str, *, allow_dataset: bool = True) -> str:
+    """Build a DuckDB relation expression for a local input path."""
+
+    p = pathlib.Path(path)
+    if p.is_dir():
+        if not allow_dataset:
+            raise UsageError(f"input must be a CSV or Parquet file: {path}")
+        return f"read_cell_dataset({sql_string(path)})"
+    suffix = p.suffix.lower()
+    if suffix == ".parquet":
+        return f"read_parquet({sql_string(path)})"
+    if suffix in {".csv", ".tsv", ".txt"}:
+        return f"read_csv_auto({sql_string(path)})"
+    raise UsageError(f"unsupported input format: {path} (expected CSV, Parquet, or a cell dataset folder)")
+
+
+def output_format(path: str) -> str:
+    suffix = pathlib.Path(path).suffix.lower()
+    if suffix == ".csv":
+        return "csv"
+    if suffix == ".parquet":
+        return "parquet"
+    raise UsageError(f"unsupported output format: {path} (expected .csv or .parquet)")
+
+
+def connect(extension: str | None) -> duckdb.DuckDBPyConnection:
+    extension = extension or os.environ.get("GSQ_EXTENSION")
+    if not extension:
+        raise UsageError("no DuckDB extension path; pass --extension PATH or set GSQ_EXTENSION")
+    if not pathlib.Path(extension).exists():
+        raise CLIError(f"DuckDB extension not found: {extension}")
+    try:
+        con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+        con.execute(f"LOAD {sql_string(extension)}")
+        return con
+    except Exception as exc:
+        raise CLIError(f"could not load DuckDB extension {extension}: {exc}") from exc
+
+
+def create_input_table(con: duckdb.DuckDBPyConnection, path: str, name: str = "gsq_input") -> list[str]:
+    relation = input_relation(path)
+    try:
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {sql_identifier(name)} AS SELECT * FROM {relation}")
+        return [row[0] for row in con.execute(f"DESCRIBE {sql_identifier(name)}").fetchall()]
+    except Exception as exc:
+        raise CLIError(f"could not read input {path}: {exc}") from exc
+
+
+def detector_options(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    if args.domain:
+        parts.append(f"domain_code := {sql_string(args.domain.upper())}")
+    if args.level is not None:
+        parts.append(f"level := {args.level}")
+    if args.max_rows is not None:
+        parts.append(f"max_rows := {args.max_rows}")
+    return (", " + ", ".join(parts)) if parts else ""
+
+
+def detect_rows(con: duckdb.DuckDBPyConnection, query: str, args: argparse.Namespace) -> list[tuple[Any, ...]]:
+    options = detector_options(args)
+    sql = f"SELECT * FROM detect_table(?{options})"
+    try:
+        return con.execute(sql, [query]).fetchall()
+    except Exception as exc:
+        raise CLIError(f"detection failed: {exc}") from exc
+
+
+def json_value(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return [json_value(v) for v in value]
+    if isinstance(value, list):
+        return [json_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): json_value(v) for k, v in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def result_records(cursor: Any) -> list[dict[str, Any]]:
+    columns = [item[0] for item in cursor.description]
+    return [{name: json_value(value) for name, value in zip(columns, row)} for row in cursor.fetchall()]
+
+
+def print_table(cursor: Any) -> None:
+    columns = [item[0] for item in cursor.description]
+    rows = [[format_value(value) for value in row] for row in cursor.fetchall()]
+    widths = [len(str(name)) for name in columns]
+    for row in rows:
+        widths = [max(width, len(value)) for width, value in zip(widths, row)]
+    print("  ".join(str(name).ljust(width) for name, width in zip(columns, widths)))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)))
+
+
+def format_value(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, (list, tuple, dict)):
+        return json.dumps(json_value(value), separators=(",", ":"))
+    return str(value)
+
+
+def temp_output(path: str) -> tuple[str, pathlib.Path]:
+    destination = pathlib.Path(path)
+    parent = destination.parent
+    if not parent.exists():
+        raise CLIError(f"output directory does not exist: {parent}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=parent)
+    os.close(fd)
+    return temporary, destination
+
+
+def copy_atomic(con: duckdb.DuckDBPyConnection, query: str, out: str) -> None:
+    fmt = output_format(out)
+    temporary, destination = temp_output(out)
+    try:
+        options = "(FORMAT CSV, HEADER TRUE)" if fmt == "csv" else "(FORMAT PARQUET)"
+        con.execute(f"COPY ({query}) TO {sql_string(temporary)} {options}")
+        os.replace(temporary, destination)
+    except Exception as exc:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise CLIError(f"could not write {out}: {exc}") from exc
+
+
+def require_columns(columns: Iterable[str], requested: Iterable[str]) -> None:
+    available = set(columns)
+    missing = [name for name in requested if name not in available]
+    if missing:
+        raise CLIError(f"unknown column(s): {', '.join(missing)}")
+
+
+def detector_for_query(con: duckdb.DuckDBPyConnection, query: str, column: str) -> tuple[str, float, list[Any]]:
+    detection_query = f"SELECT {sql_identifier(column)} FROM ({query}) AS gsq_detect_input"
+    try:
+        row = con.execute("SELECT * FROM detect_table(?)", [detection_query]).fetchone()
+    except Exception as exc:
+        raise CLIError(f"could not validate {column}: {exc}") from exc
+    if row is None:
+        raise CLIError(f"could not validate {column}")
+    # column, kind, status, reason, valid_ratio, domain_codes, domain_ids, levels, invalid_examples
+    valid_ratio = float(row[4] or 0.0)
+    levels = list(row[7] or [])
+    status = str(row[2])
+    if valid_ratio < 1.0 or status == "rejected":
+        raise CLIError(f"invalid {column} values: {row[3]}")
+    if len(levels) != 1:
+        raise CLIError(f"{column} must contain exactly one grid level; detected levels: {levels}")
+    return status, valid_ratio, levels
+
+
+def run_detect(args: argparse.Namespace) -> int:
+    con = connect(args.extension)
+    try:
+        relation = input_relation(args.input, allow_dataset=False)
+        query = f"SELECT * FROM {relation}"
+        rows = detect_rows(con, query, args)
+        columns = [
+            "column", "kind", "status", "reason", "valid_ratio",
+            "domain_codes", "domain_ids", "levels", "invalid_examples",
+        ]
+        if args.format == "json":
+            print(json.dumps([dict(zip(columns, (json_value(v) for v in row))) for row in rows], separators=(",", ":")))
+        else:
+            class Cursor:
+                description = [(name,) for name in columns]
+                def fetchall(self) -> list[tuple[Any, ...]]:
+                    return rows
+            print_table(Cursor())
+        return 0
+    finally:
+        con.close()
+
+
+def run_rollup(args: argparse.Namespace) -> int:
+    con = connect(args.extension)
+    try:
+        columns = create_input_table(con, args.input)
+        require_columns(columns, ["gid", *args.sum])
+        _, _, levels = detector_for_query(con, input_relation(args.input), "gid")
+        input_level = int(levels[0])
+        if args.level > input_level:
+            raise CLIError(f"rollup level {args.level} is greater than input level {input_level}")
+        sums = ", ".join(
+            f"sum({sql_identifier(name)}) AS {sql_identifier(name)}" for name in args.sum
+        )
+        select = f"left({sql_identifier('gid')}, {args.level}) AS parent_gid, count(*) AS cells"
+        if sums:
+            select += ", " + sums
+        query = f"SELECT {select} FROM gsq_input GROUP BY 1 ORDER BY 1"
+        copy_atomic(con, query, args.out)
+        return 0
+    finally:
+        con.close()
+
+
+def run_join(args: argparse.Namespace) -> int:
+    con = connect(args.extension)
+    try:
+        left_columns = create_input_table(con, args.left, "gsq_left")
+        right_columns = create_input_table(con, args.right, "gsq_right")
+        require_columns(left_columns, [args.on])
+        require_columns(right_columns, [args.on])
+        _, _, left_levels = detector_for_query(con, input_relation(args.left), args.on)
+        _, _, right_levels = detector_for_query(con, input_relation(args.right), args.on)
+        if left_levels != right_levels:
+            raise CLIError(f"input levels differ: left={left_levels}, right={right_levels}")
+        join_type = args.how.upper()
+        right_select = f"r.* EXCLUDE ({sql_identifier(args.on)})"
+        query = (
+            f"SELECT l.*, {right_select} FROM gsq_left l {join_type} JOIN gsq_right r "
+            f"ON l.{sql_identifier(args.on)} = r.{sql_identifier(args.on)}"
+        )
+        copy_atomic(con, query, args.out)
+        return 0
+    finally:
+        con.close()
+
+
+def rows_for_geojson(
+    con: duckdb.DuckDBPyConnection,
+    domain: str,
+    gid_column: str,
+    crs: str,
+    allow_candidate: bool,
+) -> tuple[list[str], list[tuple[Any, ...]]]:
+    columns = [row[0] for row in con.execute("DESCRIBE gsq_input").fetchall()]
+    require_columns(columns, [gid_column])
+    args = "true" if allow_candidate else "false"
+    selected = ", ".join(sql_identifier(name) for name in columns)
+    query = (
+        f"SELECT {selected}, cell_to_geometry({sql_string(domain)}, {sql_identifier(gid_column)}, "
+        f"{sql_string(crs)}, 'geojson', {args}) AS __gsq_geometry FROM gsq_input"
+    )
+    try:
+        cursor = con.execute(query)
+        return [item[0] for item in cursor.description], cursor.fetchall()
+    except Exception as exc:
+        raise CLIError(f"geometry conversion failed: {exc}") from exc
+
+
+def run_to_geo(args: argparse.Namespace) -> int:
+    domain = args.domain.upper()
+    con = connect(args.extension)
+    if domain in CANDIDATE_DOMAINS and not args.allow_candidate_crs:
+        con.close()
+        raise CLIError(f"domain {domain} is a candidate CRS; pass --allow-candidate-crs for technical use")
+    try:
+        create_input_table(con, args.input)
+        columns = [row[0] for row in con.execute("DESCRIBE gsq_input").fetchall()]
+        require_columns(columns, [args.gid_column])
+        if pathlib.Path(args.out).suffix.lower() == ".geojson":
+            temporary, destination = temp_output(args.out)
+            try:
+                names, rows = rows_for_geojson(
+                    con, domain, args.gid_column, args.crs, args.allow_candidate_crs
+                )
+                geometry_index = names.index("__gsq_geometry")
+                features = []
+                for row in rows:
+                    geometry = json.loads(row[geometry_index]) if row[geometry_index] else None
+                    properties = {name: json_value(row[i]) for i, name in enumerate(names) if i != geometry_index}
+                    features.append({"type": "Feature", "geometry": geometry, "properties": properties})
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    json.dump({"type": "FeatureCollection", "features": features}, handle, separators=(",", ":"))
+                os.replace(temporary, destination)
+            except Exception as exc:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                if isinstance(exc, CLIError):
+                    raise
+                raise CLIError(f"could not write {args.out}: {exc}") from exc
+        else:
+            selected = ", ".join(sql_identifier(name) for name in columns)
+            query = (
+                f"SELECT {selected}, cell_to_geometry({sql_string(domain)}, {sql_identifier(args.gid_column)}, "
+                f"{sql_string(args.crs)}, 'wkt', {'true' if args.allow_candidate_crs else 'false'}) AS wkt FROM gsq_input"
+            )
+            copy_atomic(con, query, args.out)
+        return 0
+    finally:
+        con.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="gsq", description="GeoSquare engine command-line tool")
+    parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--extension", help="path to the geosquare_v2 DuckDB extension")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    detect = sub.add_parser("detect", help="detect GeoSquare columns")
+    detect.add_argument("input")
+    detect.add_argument("--extension", dest="command_extension")
+    detect.add_argument("--domain")
+    detect.add_argument("--level", type=int)
+    detect.add_argument("--max-rows", type=int)
+    detect.add_argument("--format", choices=("table", "json"), default="table")
+    detect.set_defaults(func=run_detect)
+
+    rollup = sub.add_parser("rollup", help="roll cells up to an ancestor level")
+    rollup.add_argument("input")
+    rollup.add_argument("--extension", dest="command_extension")
+    rollup.add_argument("--level", type=int, required=True)
+    rollup.add_argument("--out", required=True)
+    rollup.add_argument("--sum", action="append", default=[])
+    rollup.set_defaults(func=run_rollup)
+
+    join = sub.add_parser("join", help="join two cell tables")
+    join.add_argument("left")
+    join.add_argument("right")
+    join.add_argument("--extension", dest="command_extension")
+    join.add_argument("--on", choices=("gid", "packed_id"), required=True)
+    join.add_argument("--how", choices=("inner", "left"), default="inner")
+    join.add_argument("--out", required=True)
+    join.set_defaults(func=run_join)
+
+    geo = sub.add_parser("to-geo", help="convert cells to geometry")
+    geo.add_argument("input")
+    geo.add_argument("--extension", dest="command_extension")
+    geo.add_argument("--domain", required=True)
+    geo.add_argument("--out", required=True)
+    geo.add_argument("--gid-column", default="gid")
+    geo.add_argument("--crs", choices=("EPSG:4326", "grid"), default="EPSG:4326")
+    geo.add_argument("--allow-candidate-crs", action="store_true")
+    geo.set_defaults(func=run_to_geo)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "command_extension", None):
+        args.extension = args.command_extension
+    try:
+        return args.func(args)
+    except UsageError as exc:
+        print(f"gsq: {exc}", file=sys.stderr)
+        return 2
+    except CLIError as exc:
+        print(f"gsq: {exc}", file=sys.stderr)
+        return 1
+    except (duckdb.Error, OSError, ValueError) as exc:
+        print(f"gsq: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
