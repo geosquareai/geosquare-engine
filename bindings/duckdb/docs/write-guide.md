@@ -171,8 +171,9 @@ descriptions follow the renamed column.
 ```sql
 SELECT * FROM alter_cell_dataset('/data/w_ice',
   rename_columns := '{"non_workers": "dependents"}', add_columns := '{"score": "DOUBLE"}');
-SELECT * FROM alter_cell_dataset('/data/w_ice', drop_columns := 'score');
 SELECT "column", unit FROM cell_dataset_columns('/data/w_ice');
+SELECT * FROM alter_cell_dataset('/data/w_ice',
+  drop_columns := 'score', rename_columns := '{"dependents": "non_workers"}');
 ```
 
 ## Change the partition level
