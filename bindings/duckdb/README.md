@@ -22,8 +22,12 @@ LOAD geosquare_v2;
 DuckDB-Wasm: open the database with `allowUnsignedExtensions: true`, then the same `INSTALL`
 and `LOAD` (or `GeosquareCellsWasm.open({ extension: '<that url>' })` from `examples/`).
 
-DuckDB 1.4.5 cannot `INSTALL` from this HTTPS S3 endpoint (every other release can, and 1.4.5
-installs from other HTTPS hosts and over plain HTTP). On 1.4.5 download and load the file:
+DuckDB 1.4.5 cannot `INSTALL` from any `https://` repository: a regression in that release, it
+also fails for `https://extensions.duckdb.org` and `https://community-extensions.duckdb.org`, and
+makes no network request at all (1.4.4 and 1.5.0 work). Its default repositories use plain
+`http://`, which still works, and so does `INSTALL geosquare_v2 FROM 'http://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2'`
+(but this build is unsigned, so plain HTTP can be tampered with on the way). Safer on 1.4.5:
+download over HTTPS and load the file, or upgrade DuckDB:
 
 ```sh
 curl -sO https://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2/v1.4.5/linux_amd64/geosquare_v2.duckdb_extension.gz
