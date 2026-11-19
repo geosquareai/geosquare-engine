@@ -80,6 +80,13 @@ jobs:
         with:
           targets: wasm32-unknown-emscripten
 
+      - name: Install Rust nightly with rust-src (Wasm builds rebuild std)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-18
+          targets: wasm32-unknown-emscripten
+          components: rust-src
+
       - name: Set up Emscripten 6.0.9
         uses: emscripten-core/setup-emsdk@v16
         with:
@@ -98,7 +105,7 @@ jobs:
         working-directory: bindings/duckdb
         run: |
           ./build.sh
-          ./build_wasm.sh
+          WASM_TOOLCHAIN=nightly-2026-11-18 PLATFORM=all ./build_wasm.sh
 
       - name: Browser test
         working-directory: bindings/duckdb

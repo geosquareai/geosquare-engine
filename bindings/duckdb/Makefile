@@ -1,10 +1,13 @@
 # Convenience targets. CI uses the same scripts (.github/workflows/duckdb*.yml).
-.PHONY: release wasm_eh test test_versions test_wasm repository
+.PHONY: release wasm wasm_eh test test_versions test_wasm repository
 
 release:            ## native extension for this machine -> build/<platform>/
 	./build.sh
 
-wasm_eh:            ## DuckDB-Wasm extension (needs emcc on PATH) -> build/wasm_eh/
+wasm:               ## DuckDB-Wasm extensions wasm_eh, wasm_mvp, wasm_threads (emcc, Rust nightly + rust-src)
+	PLATFORM=all ./build_wasm.sh
+
+wasm_eh:            ## DuckDB-Wasm extension for the eh/base bundle only -> build/wasm_eh/
 	./build_wasm.sh
 
 test:               ## Rust unit tests + spec vectors on the installed duckdb package

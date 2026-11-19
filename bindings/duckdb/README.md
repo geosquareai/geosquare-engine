@@ -2,8 +2,8 @@
 
 A loadable DuckDB extension for the GeoSquare V2 grid (spec 2.0). It wraps the Rust core in
 `core/` through the DuckDB C extension API, so **one binary loads in DuckDB 1.4 to 2.0**
-(tested on 1.4.0, 1.4.5, 1.5.0, 1.5.6 and 2.0.0). The same code builds for DuckDB-Wasm
-(`wasm_eh`) for use in the browser.
+(tested on 1.4.0, 1.4.5, 1.5.0, 1.5.6 and 2.0.0). The same code builds for the three
+DuckDB-Wasm bundles (`wasm_eh`, `wasm_mvp`, `wasm_threads`) for use in the browser.
 
 SQL names follow `geosquare-v2` and the engine bindings. It is not related to the V1
 extension `geosquare_grid_duckdb`.
@@ -11,7 +11,8 @@ extension `geosquare_grid_duckdb`.
 ## Install
 
 Published repository (public, CORS enabled) with builds for every DuckDB release from 1.4.0
-to 2.0.0: `linux_amd64` and `linux_arm64` (glibc 2.28+), `wasm_eh` (DuckDB-Wasm):
+to 2.0.0: `linux_amd64` and `linux_arm64` (glibc 2.28+), and for DuckDB-Wasm `wasm_eh`,
+`wasm_mvp` and `wasm_threads`:
 
 ```sql
 SET allow_unsigned_extensions = true;   -- the build is not signed by DuckDB
@@ -59,9 +60,25 @@ SELECT geosquare_engine_version();
 
 ```zsh
 source <emsdk>/emsdk_env.sh      # Emscripten 6.0.9, as in DuckDB's extension CI
-rustup target add wasm32-unknown-emscripten
-./build_wasm.sh                  # -> build/wasm_eh/geosquare_v2.duckdb_extension.wasm
+rustup toolchain install nightly --component rust-src --target wasm32-unknown-emscripten
+PLATFORM=all ./build_wasm.sh     # -> build/{wasm_eh,wasm_mvp,wasm_threads}/geosquare_v2.duckdb_extension.wasm
 ```
+
+One build per DuckDB-Wasm bundle; DuckDB picks the file of its bundle's platform
+(`PRAGMA platform`):
+
+| DuckDB-Wasm bundle | platform | notes |
+|---|---|---|
+| `eh` (1.4/1.5 packages), `base` (2.0) | `wasm_eh` | current browsers |
+| `mvp` (1.4/1.5 packages) | `wasm_mvp` | browsers without Wasm exception handling |
+| `coi` (1.4/1.5), `threads` (2.0) | `wasm_threads` | cross-origin isolated pages (COOP/COEP) |
+
+Rust std is rebuilt with `panic=abort` (no unwinding imports, so the module also links into
+the `mvp` bundle), and with atomics for `wasm_threads` (shared memory); local files and
+threads are left out of every Wasm build (the browser reads over HTTP). In the threads
+bundles DuckDB's own `parquet` extension currently fails to load from extensions.duckdb.org
+(it is not built with shared memory), so datasets cannot be read there yet; the grid
+functions work.
 
 ```js
 const db = new duckdb.AsyncDuckDB(logger, worker);   // @duckdb/duckdb-wasm, "base" bundle
@@ -72,9 +89,11 @@ await c.query("LOAD 'https://<host>/geosquare_v2.duckdb_extension.wasm'");
 await c.query("SELECT count(*) FROM query_cell_dataset('https://<host>/population', bbox := [106.8, -6.3, 106.9, -6.2])");
 ```
 
-Tested with DuckDB-Wasm `1.33.1-dev118.0` (DuckDB v2.0.0, platform `wasm_eh`) in Node and
-in headless Chromium 154: grid functions, polyfill, and reading flat, partitioned and
-Iceberg datasets over HTTP give the same results as native DuckDB (`tests/wasm/run.sh`).
+Tested in headless Chromium (`tests/wasm/run.sh`) with DuckDB-Wasm `1.33.1-dev118.0`
+(DuckDB v2.0.0: `base`, `threads`) and `1.32.0` (DuckDB v1.4.3: `mvp`, `eh`, `coi`): grid
+functions, polyfill, roll-ups, radius, several datasets, and flat, partitioned and Iceberg
+datasets over HTTP give the same results as native DuckDB (datasets: not in the threads
+bundles, see above).
 Over plain HTTP, folders cannot be listed, so the reader uses `manifest.json`,
 `data/part-00000.parquet`, the partition index `gid_prefixes.json` (written by
 `write_cell_dataset`) and `metadata/version-hint.text`. Iceberg tables are scanned with

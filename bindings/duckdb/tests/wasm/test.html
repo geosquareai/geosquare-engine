@@ -5,19 +5,46 @@
   "tslib": "/node_modules/tslib/tslib.es6.mjs"
 }}</script>
 <script type="module">
-import * as duckdb from "/node_modules/@duckdb/duckdb-wasm/dist/duckdb-browser.mjs";
+// ?pkg=<dev|x.y.z>&bundle=<base|threads|mvp|eh|coi>&ext=<wasm_eh|wasm_mvp|wasm_threads>
+const q = new URLSearchParams(location.search);
+const pkg = q.get("pkg") || "dev";
+const bundleName = q.get("bundle") || "base";
+const ext = q.get("ext") || "wasm_eh";
+const dist = pkg === "dev"
+  ? location.origin + "/node_modules/@duckdb/duckdb-wasm/dist/"
+  : `${location.origin}/pkgs/${pkg}/package/dist/`;
+const duckdb = await import(dist + "duckdb-browser.mjs");
+const bundles = {
+  base: { mainModule: "duckdb-base.wasm", mainWorker: "duckdb-browser-base.worker.js" },
+  threads: { mainModule: "duckdb-threads.wasm", mainWorker: "duckdb-browser-threads.worker.js", pthreadWorker: "duckdb-browser-threads.pthread.worker.js" },
+  mvp: { mainModule: "duckdb-mvp.wasm", mainWorker: "duckdb-browser-mvp.worker.js" },
+  eh: { mainModule: "duckdb-eh.wasm", mainWorker: "duckdb-browser-eh.worker.js" },
+  coi: { mainModule: "duckdb-coi.wasm", mainWorker: "duckdb-browser-coi.worker.js", pthreadWorker: "duckdb-browser-coi.pthread.worker.js" },
+};
 const results = {};
 try {
-  const dist = location.origin + "/node_modules/@duckdb/duckdb-wasm/dist/";
-  const bundle = await duckdb.selectBundle({ base: { mainModule: dist + "duckdb-base.wasm", mainWorker: dist + "duckdb-browser-base.worker.js" } });
-  const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), new Worker(bundle.mainWorker));
-  await db.instantiate(bundle.mainModule);
+  const b = bundles[bundleName];
+  const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), new Worker(dist + b.mainWorker));
+  await db.instantiate(dist + b.mainModule, b.pthreadWorker ? dist + b.pthreadWorker : undefined);
   await db.open({ allowUnsignedExtensions: true });
   const c = await db.connect();
   const one = async (s) => Object.values((await c.query(s)).toArray()[0].toJSON()).map((v) => (v === null ? null : String(v)));
   results.duckdb = (await one("SELECT version()"))[0];
-  await c.query(`LOAD '${location.origin}/geosquare_v2.duckdb_extension.wasm'`);
+  results.platform = (await one("SELECT platform FROM pragma_platform()"))[0];
+  await c.query(`LOAD '${location.origin}/build/${ext}/geosquare_v2.duckdb_extension.wasm'`);
   results.point_to_cell = (await one("SELECT point_to_cell('ID', 106.894082, -6.26109, 12).gid"))[0];
+  results.v1_gid = await one("SELECT v1_gid_to_cell('ID', lonlat_to_v1_gid(106.8272, -6.1754, 12), 12).gid, octet_length(cell_to_wkb('ID', point_to_cell('ID', 106.8, -6.2, 12).gid))");
+  results.cells = await one("SELECT count(*), round(sum(coverage_ratio), 6)::VARCHAR FROM polygon_to_cells('ID', 'POLYGON ((106.80 -6.25, 106.90 -6.25, 106.90 -6.15, 106.80 -6.15, 106.80 -6.25))', 12)");
+  // Datasets need DuckDB's own parquet extension; in the threads bundles it does not load
+  // (extensions.duckdb.org serves a non-shared-memory build), so those checks are skipped.
+  if (bundleName === "threads" || bundleName === "coi") {
+    try {
+      await Promise.race([c.query("LOAD parquet"), new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 60000))]);
+    } catch (e) {
+      results.parquet_unavailable = String((e && e.message) || e).split("\n")[0].slice(0, 200);
+      throw "__skip__";
+    }
+  }
   const wkt = await (await fetch("/www/query.wkt")).text();
   for (const layout of ["flat", "partitioned", "iceberg"]) {
     const p = `${location.origin}/www/${layout}`;
@@ -25,7 +52,10 @@ try {
     results[`${layout}_query`] = await one(`SELECT count(*), sum(population) FROM query_cell_dataset('${p}', geometry := '${wkt}', min_coverage := 0.5)`);
     results[`${layout}_line`] = await one(`SELECT count(*), sum(population), round(sum(length_ratio), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := 'LINESTRING (106.82 -6.22, 106.86 -6.18)')`);
     results[`${layout}_points`] = await one(`SELECT count(*), sum(point_count) FROM query_cell_dataset('${p}', geometry := 'MULTIPOINT ((106.85 -6.2), (106.85 -6.2), (106.81 -6.24))')`);
+    results[`${layout}_rollup`] = await one(`SELECT count(*), round(sum(population), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := '${wkt}', rollup_level := 9)`);
+    results[`${layout}_radius`] = await one(`SELECT count(*), round(sum(population * coverage_ratio), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := 'POINT (106.85 -6.2)', radius_m := 800)`);
   }
-} catch (e) { results.error = String((e && e.message) || e); }
+  results.multi = await one(`SELECT count(*), round(sum(flat__population + iceberg__population), 6)::VARCHAR FROM query_cell_datasets(['${location.origin}/www/flat', '${location.origin}/www/iceberg'], geometry := '${wkt}', rollup_level := 9)`);
+} catch (e) { if (e !== "__skip__") results.error = String((e && e.message) || e); }
 window.__results = results;
 </script>

@@ -72,8 +72,15 @@ pub fn par_map<T: Send, R: Send>(
     let pool = current_pool().ok_or("geosquare_v2: no internal connections for this database")?;
     let n = items.len();
     let threads = threads.clamp(1, n.max(1));
-    if threads == 1 || cfg!(target_family = "wasm") {
-        // No threads in DuckDB-Wasm: run in order on this thread.
+    // No threads in DuckDB-Wasm: run in order on this thread (and link no thread code).
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (pool, n, threads);
+        let l = lease()?;
+        return items.into_iter().map(|item| f(&l, item)).collect();
+    }
+    #[cfg(not(target_family = "wasm"))]
+    if threads == 1 {
         let l = lease()?;
         return items.into_iter().map(|item| f(&l, item)).collect();
     }

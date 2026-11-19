@@ -274,16 +274,21 @@ impl Staging {
                 files: Vec::new(),
             });
         }
-        let base = std::env::var_os("GEOSQUARE_V2_STAGING_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("geosquare_v2_upload_{}", uuid4()));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create staging folder {}: {e}", dir.display()))?;
-        Ok(Staging {
-            dir: Some(dir),
-            files: Vec::new(),
-        })
+        #[cfg(target_family = "wasm")]
+        return Err("writing to S3 is not available in DuckDB-Wasm".into());
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let base = std::env::var_os("GEOSQUARE_V2_STAGING_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join(format!("geosquare_v2_upload_{}", uuid4()));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create staging folder {}: {e}", dir.display()))?;
+            Ok(Staging {
+                dir: Some(dir),
+                files: Vec::new(),
+            })
+        }
     }
 
     /// Where DuckDB writes the file that ends up at `remote` (`rel` below the table root).
@@ -292,6 +297,7 @@ impl Staging {
             return Ok(remote.to_string());
         };
         let p = dir.join(rel);
+        #[cfg(not(target_family = "wasm"))]
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -315,6 +321,7 @@ impl Staging {
 
 impl Drop for Staging {
     fn drop(&mut self) {
+        #[cfg(not(target_family = "wasm"))]
         if let Some(d) = &self.dir {
             let _ = std::fs::remove_dir_all(d);
         }
@@ -322,9 +329,12 @@ impl Drop for Staging {
 }
 
 fn ensure_dir(path: &str) -> Result<(), E> {
+    #[cfg(not(target_family = "wasm"))]
     if is_local(path) {
         std::fs::create_dir_all(local(path)).map_err(|e| format!("cannot create {path}: {e}"))?;
     }
+    #[cfg(target_family = "wasm")]
+    let _ = path;
     Ok(())
 }
 

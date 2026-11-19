@@ -4,7 +4,7 @@
 #   scripts/publish_local.sh [s3://bucket/prefix]
 # Needs: rust targets x86_64/aarch64-unknown-linux-gnu, cargo-zigbuild + zig (Linux builds
 # against glibc 2.28, so they load on RHEL 8 / Debian 10 / Ubuntu 18.10 and newer), emcc
-# (wasm_eh), the AWS CLI with write access to the bucket. macOS and Windows come from
+# and Rust nightly with rust-src (wasm_eh, wasm_mvp, wasm_threads), the AWS CLI with write access to the bucket. macOS and Windows come from
 # .github/workflows/duckdb-release.yml.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,8 +18,10 @@ for pair in "x86_64-unknown-linux-gnu.2.28 linux_amd64" "aarch64-unknown-linux-g
   python3 scripts/append_extension_metadata.py -l "target/${1%.2.28}/release/libgeosquare_v2.so" \
     -n geosquare_v2 -p "$2" -dv v1.2.0 -ev "v$VERSION" -o "dist/$2/geosquare_v2.duckdb_extension" >/dev/null
 done
-./build_wasm.sh
-mkdir -p dist/wasm_eh && cp build/wasm_eh/geosquare_v2.duckdb_extension.wasm dist/wasm_eh/
+PLATFORM=all ./build_wasm.sh
+for p in wasm_eh wasm_mvp wasm_threads; do
+  mkdir -p "dist/$p" && cp "build/$p/geosquare_v2.duckdb_extension.wasm" "dist/$p/"
+done
 python3 scripts/make_repository.py --artifacts dist --out repo --versions auto
 aws s3 sync repo "$DEST/" --exclude "*" --include "*.duckdb_extension.gz" --content-type application/octet-stream
 aws s3 sync repo "$DEST/" --exclude "*" --include "*.wasm" --content-type application/wasm
