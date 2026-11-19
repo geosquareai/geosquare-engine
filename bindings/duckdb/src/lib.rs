@@ -90,6 +90,7 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("source_crs", Text),
                 ("coverage_mode", Text),
                 ("max_candidate_limit", Int),
+                ("allow_candidate_crs", Bool),
                 ("with_geometry", Text),
                 ("geometry_crs", Text),
             ]);

@@ -124,8 +124,21 @@ SELECT cell_to_geometry('VN', 'H3T4T', 'EPSG:4326', 'wkt', true);
 The final `true` does not make the domain production-ready. It only enables explicit candidate use. The same rule applies to WGS84 cell geometry.
 
 `polygon_to_cells` / `polyfill` take `source_crs := 'EPSG:4326' | 'grid'`,
-`coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0` and
-`max_candidate_limit := 100000`, and follow `geosquare_v2.polyfill_stream`: vertices are
+`coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0`,
+`max_candidate_limit := 100000`, and `allow_candidate_crs := false`.
+Candidate domains reject WGS84 input by default. Pass `allow_candidate_crs := true` only for
+technical candidate use:
+
+```sql
+SELECT * FROM polyfill(
+  'VN',
+  'POLYGON ((107.8 15.9, 107.9 15.9, 107.9 16.0, 107.8 16.0, 107.8 15.9))',
+  12,
+  allow_candidate_crs := true
+);
+```
+
+These functions follow `geosquare_v2.polyfill_stream`: vertices are
 projected without densification, the intersection is taken in the grid plane, cells come in
 row-major order, and a cell is kept when `ratio > 0 and ratio >= min_coverage`.
 `EQUAL_AREA` measures both areas in Equal Earth (EPSG:8857), the profiles' equal-area CRS.
@@ -275,6 +288,8 @@ ratios of a line always sum to 1, whereas the Shapely oracle can count such a se
 `read_cell_dataset` / `query_cell_dataset` take `with_geometry := 'wkt' | 'geojson'` (and
 `geometry_crs := 'EPSG:4326'` (default) `| 'grid'`) to add each cell's outline as a
 `cell_geometry` column; the domain comes from the dataset, so no `domain_code` is needed.
+For polygon queries, `allow_candidate_crs := false` is the default. Pass `true` only for
+technical candidate CRS use.
 
 `read_cell_dataset` / `query_cell_dataset` accept `domain_code` and `level` for tables
 without a cell manifest. `query_cell_dataset` reads only the `gid_prefix` folders that the

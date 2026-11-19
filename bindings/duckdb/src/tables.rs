@@ -37,6 +37,9 @@ pub fn options(bind: &BindInfo) -> PolyfillOptions {
     if let Some(v) = named(bind, "max_candidate_limit") {
         o.max_candidate_limit = v.to_int64();
     }
+    if let Some(v) = named(bind, "allow_candidate_crs") {
+        o.allow_candidate_crs = v.to_string().eq_ignore_ascii_case("true");
+    }
     o
 }
 
@@ -46,6 +49,7 @@ pub fn option_parameters() -> Vec<(String, LogicalTypeHandle)> {
         ("coverage_mode".into(), LogicalTypeId::Varchar.into()),
         ("min_coverage".into(), LogicalTypeId::Double.into()),
         ("max_candidate_limit".into(), LogicalTypeId::Bigint.into()),
+        ("allow_candidate_crs".into(), LogicalTypeId::Boolean.into()),
     ]
 }
 

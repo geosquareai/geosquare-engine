@@ -129,6 +129,17 @@ def test_polygon(con):
     half = rows(con, "SELECT count(*) FROM polyfill('ID', ?, 12, source_crs := 'grid', min_coverage := 0.6)", [wkt])[0][0]
     check(half == 4, f"min_coverage filter: {half}")
     check(raises(con, "SELECT * FROM polygon_to_cells('ID', ?, 12, source_crs := 'grid', max_candidate_limit := 3)", [wkt]), "candidate limit")
+    candidate_wkt = "POLYGON ((107.86 15.97, 107.87 15.97, 107.87 15.98, 107.86 15.98, 107.86 15.97))"
+    check(
+        raises(con, "SELECT * FROM polygon_to_cells('VN', ?, 12)", [candidate_wkt]),
+        "candidate polygon CRS accepted",
+    )
+    candidate_cells = rows(
+        con,
+        "SELECT * FROM polygon_to_cells('VN', ?, 12, allow_candidate_crs := true)",
+        [candidate_wkt],
+    )
+    check(candidate_cells, "candidate polygon opt-in returned no cells")
     check(raises(con, "SELECT * FROM polygon_to_cells('ID', 'POINT (1 2)', 12)"), "non-polygon rejected")
     geom = rows(con, "SELECT cell_to_geometry('ID', 'H2X545P49342'), cell_to_geometry('ID', 'H2X545P49342', 'EPSG:4326', 'geojson')")[0]
     check(geom[0].startswith("POLYGON ((") and '"Polygon"' in geom[1], f"cell_to_geometry: {geom}")
