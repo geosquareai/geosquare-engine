@@ -32,13 +32,18 @@ impl Domain {
         ROOT_SIDE_M
     }
 
-    /// True when the profile's explicit datum operation is available in this engine.
+    /// True when the profile has passed the production CRS gate and its operation is available.
     pub fn crs_released(&self) -> bool {
+        self.production_ready && self.crs_available()
+    }
+
+    /// True when the engine has an explicit technical operation for the profile.
+    pub fn crs_available(&self) -> bool {
         !CRS_DOMAINS_BLOCKED.contains(&self.code)
     }
 }
 
-/// No domains are blocked in this technical candidate. VN remains non-production.
+/// No technical operations are blocked in this engine. Candidate domains still require opt-in.
 pub const CRS_DOMAINS_BLOCKED: [&str; 0] = [];
 
 /// Look up a domain by its code, such as `"ID"`.

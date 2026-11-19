@@ -85,7 +85,7 @@ Writing is meant for the backend.
 
 | Function | Returns |
 |---|---|
-| `point_to_cell(domain_code, longitude, latitude, level)` | `STRUCT(domain_code, level, x_idx, y_idx, gid, uri, packed_id)` |
+| `point_to_cell(domain_code, longitude, latitude, level [, allow_candidate_crs])` | `STRUCT(domain_code, level, x_idx, y_idx, gid, uri, packed_id)` |
 | `pack(domain, gid)` (domain = code or id) | `BIGINT` packed id |
 | `pack_int64(domain_id, level, x_idx, y_idx)` | `BIGINT` |
 | `unpack_int64(packed_id)` | `STRUCT(domain_id, level, x_idx, y_idx)` |
@@ -97,12 +97,14 @@ Writing is meant for the backend.
 | `cell_side_m(level)` | `DOUBLE` |
 | `descendant_range(domain, parent_gid, child_level)` | `STRUCT(lo, hi)` packed range (spec 8.1) |
 | `parse_uri(uri)` | `STRUCT(domain_code, gid)` |
-| `cell_to_geometry(domain_code, gid [, output_crs [, format]])`, `cell_to_geometry(packed_id [, output_crs [, format]])` (domain from the packed id) | WKT or GeoJSON; `output_crs` `'grid'` (default, as in v2) or `'EPSG:4326'` |
+| `cell_to_geometry(domain_code, gid [, output_crs [, format [, allow_candidate_crs]]])`, `cell_to_geometry(packed_id, ...)` (domain from packed id) | WKT or GeoJSON; `output_crs` `'grid'` (default, as in v2) or `'EPSG:4326'` |
 | `polygon_to_cells(domain_code, wkt, level, ...)` | table: `domain_code, level, x_idx, y_idx, gid, uri, packed_id, coverage_ratio` |
 | `polyfill(domain_code, wkt, level, ...)` | table: `gid, coverage_ratio` |
 | `line_to_cells(domain_code, wkt, level, source_crs := ..., max_candidate_limit := ...)` | table: same cell columns + `length_ratio` (share of the whole line inside the cell, as in v2) |
 | `packed_to_gid(packed_id)` | `VARCHAR` gid of a packed id |
 | `detect_table(query, domain_code := ..., level := ..., max_rows := 100000)` | table: `column, kind, status, reason, valid_ratio, domain_codes, domain_ids, levels, invalid_examples` (spec 2.0 section 14; x_idx/y_idx as one pair; `max_rows` rows are read, 0 = all) |
+
+The six released domains are `BN`, `ID`, `LA`, `MY`, `PH`, and `SG`. `point_to_cell` and WGS84 `cell_to_geometry` reject candidate domains by default. Pass `true` as the final `allow_candidate_crs` argument for technical candidate use. The candidate domains are `KH`, `MM`, `TH`, `TL`, and `VN`.
 
 `polygon_to_cells` / `polyfill` take `source_crs := 'EPSG:4326' | 'grid'`,
 `coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0` and

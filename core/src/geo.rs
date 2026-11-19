@@ -18,7 +18,7 @@ pub enum GeoError {
         lon: f64,
         lat: f64,
     },
-    /// The domain's explicit datum operation is not released for lon/lat work.
+    /// The domain is not released for lon/lat work without candidate opt-in.
     CrsNotReleased {
         code: &'static str,
     },
@@ -52,7 +52,7 @@ impl fmt::Display for GeoError {
             GeoError::CrsNotReleased { code } => {
                 write!(
                     f,
-                    "domain {code} is not released for lon/lat: its explicit datum operation is blocked"
+                    "domain {code} is not released for lon/lat: pass the explicit candidate opt-in for technical use"
                 )
             }
             GeoError::ForwardUndefined { lon, lat } => {
@@ -148,8 +148,19 @@ pub fn cell_from_projected(
 
 /// Index a longitude and latitude in degrees at `level`.
 pub fn point_to_cell(domain: &Domain, lon: f64, lat: f64, level: u8) -> Result<Cell, GeoError> {
+    point_to_cell_with_options(domain, lon, lat, level, false)
+}
+
+/// Index a longitude and latitude, optionally allowing a candidate CRS.
+pub fn point_to_cell_with_options(
+    domain: &Domain,
+    lon: f64,
+    lat: f64,
+    level: u8,
+    allow_candidate_crs: bool,
+) -> Result<Cell, GeoError> {
     check_lon_lat(lon, lat)?;
-    released(domain)?;
+    released(domain, allow_candidate_crs)?;
     let (x_m, y_m) = domain
         .grid_crs
         .forward(lon, lat)
@@ -157,9 +168,9 @@ pub fn point_to_cell(domain: &Domain, lon: f64, lat: f64, level: u8) -> Result<C
     cell_from_projected(domain, x_m, y_m, level)
 }
 
-/// Refuse lon/lat work for a domain whose CRS is not verified against pyproj.
-fn released(domain: &Domain) -> Result<(), GeoError> {
-    if domain.crs_released() {
+/// Refuse lon/lat work unless the domain passed the CRS gate.
+fn released(domain: &Domain, allow_candidate_crs: bool) -> Result<(), GeoError> {
+    if domain.crs_released() || (allow_candidate_crs && domain.crs_available()) {
         Ok(())
     } else {
         Err(GeoError::CrsNotReleased { code: domain.code })
@@ -190,7 +201,17 @@ pub fn cell_polygon_wgs84(
     cell: Cell,
     max_segment_length_m: f64,
 ) -> Result<Vec<(f64, f64)>, GeoError> {
-    released(domain)?;
+    cell_polygon_wgs84_with_options(domain, cell, max_segment_length_m, false)
+}
+
+/// Build a cell polygon, optionally allowing a candidate CRS.
+pub fn cell_polygon_wgs84_with_options(
+    domain: &Domain,
+    cell: Cell,
+    max_segment_length_m: f64,
+    allow_candidate_crs: bool,
+) -> Result<Vec<(f64, f64)>, GeoError> {
+    released(domain, allow_candidate_crs)?;
     if !(max_segment_length_m > 0.0 && max_segment_length_m.is_finite()) {
         return Err(GeoError::InvalidSegmentLength(max_segment_length_m));
     }
@@ -346,10 +367,14 @@ mod tests {
     }
 
     #[test]
-    fn provisional_vn_operation_is_available() {
+    fn provisional_vn_operation_requires_explicit_opt_in() {
         let d = domain::by_code("VN").unwrap();
-        assert!(d.crs_released());
-        assert!(point_to_cell(d, 107.868144, 15.981051, 5).is_ok());
+        assert!(!d.crs_released());
+        assert_eq!(
+            point_to_cell(d, 107.868144, 15.981051, 5),
+            Err(GeoError::CrsNotReleased { code: "VN" })
+        );
+        assert!(point_to_cell_with_options(d, 107.868144, 15.981051, 5, true).is_ok());
         assert!(cell_polygon_wgs84(
             d,
             Cell {
@@ -358,6 +383,17 @@ mod tests {
                 y_idx: 0
             },
             1_000.0
+        )
+        .is_err());
+        assert!(cell_polygon_wgs84_with_options(
+            d,
+            Cell {
+                level: 3,
+                x_idx: 0,
+                y_idx: 0
+            },
+            1_000.0,
+            true
         )
         .is_ok());
     }

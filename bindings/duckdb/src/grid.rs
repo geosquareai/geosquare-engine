@@ -222,7 +222,7 @@ fn sig(params: &[LogicalTypeId], ret: LogicalTypeHandle) -> ScalarFunctionSignat
     ScalarFunctionSignature::exact(params.iter().map(|t| type_id(*t)).collect(), ret)
 }
 
-use LogicalTypeId::{Bigint, Double, Integer, Varchar};
+use LogicalTypeId::{Bigint, Boolean, Double, Integer, Varchar};
 
 const CELL_FIELDS: &[(&str, LogicalTypeId)] = &[
     ("domain_code", Varchar),
@@ -281,7 +281,10 @@ fn finish_cells(
 
 // ---------- functions ----------
 
-/// point_to_cell(domain_code, longitude, latitude, level) -> STRUCT(domain_code, level, x_idx, y_idx, gid, uri, packed_id)
+/// point_to_cell(domain_code, longitude, latitude, level [, allow_candidate_crs])
+/// -> STRUCT(domain_code, level, x_idx, y_idx, gid, uri, packed_id)
+///
+/// Candidate CRS use is refused unless the fifth argument is true.
 pub struct PointToCell;
 impl VScalar for PointToCell {
     type State = ();
@@ -293,22 +296,34 @@ impl VScalar for PointToCell {
             prims::<f64>(input, 2, n),
             prims::<i32>(input, 3, n),
         );
+        let allow_candidate = if input.num_columns() > 4 {
+            prims::<bool>(input, 4, n)
+        } else {
+            vec![Some(false); n]
+        };
         let mut rows = Vec::with_capacity(n);
         for i in 0..n {
-            rows.push(match (d[i], lon[i], lat[i], lvl[i]) {
-                (Some(d), Some(lo), Some(la), Some(l)) => {
-                    Some((d, geo::point_to_cell(d, lo, la, level_u8(l)?)?))
-                }
+            rows.push(match (d[i], lon[i], lat[i], lvl[i], allow_candidate[i]) {
+                (Some(d), Some(lo), Some(la), Some(l), Some(allow_candidate)) => Some((
+                    d,
+                    geo::point_to_cell_with_options(d, lo, la, level_u8(l)?, allow_candidate)?,
+                )),
                 _ => None,
             });
         }
         finish_cells(out, rows)
     }
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![sig(
-            &[Varchar, Double, Double, Integer],
-            struct_type(CELL_FIELDS),
-        )]
+        vec![
+            sig(
+                &[Varchar, Double, Double, Integer],
+                struct_type(CELL_FIELDS),
+            ),
+            sig(
+                &[Varchar, Double, Double, Integer, Boolean],
+                struct_type(CELL_FIELDS),
+            ),
+        ]
     }
 }
 
@@ -754,9 +769,11 @@ impl VScalar for ParseUri {
     }
 }
 
-/// cell_to_geometry(domain_code, gid [, output_crs [, geometry_format]]) -> VARCHAR
-/// output_crs: 'grid' (default, as in v2) or 'EPSG:4326'; geometry_format: 'wkt' (default) or 'geojson'.
-/// WGS84 output densifies each edge to at most 25 km, the v2 default.
+/// cell_to_geometry(domain_code, gid [, output_crs [, geometry_format [, allow_candidate_crs]]]) -> VARCHAR
+/// `cell_to_geometry(packed_id, ...)` also accepts the same optional arguments.
+/// `output_crs` is `grid` (default) or `EPSG:4326`.
+/// `geometry_format` is `wkt` (default) or `geojson`.
+/// Candidate CRS output requires the final boolean to be true.
 pub struct CellToGeometry;
 
 /// Outline of a cell as WKT or GeoJSON, in the grid CRS or in lon/lat.
@@ -765,6 +782,7 @@ fn cell_geometry(
     c: Cell,
     crs: &str,
     fmt: &str,
+    allow_candidate_crs: bool,
 ) -> Result<String, Box<dyn Error>> {
     let ring: Vec<(f64, f64)> = match crs.trim().to_ascii_uppercase().as_str() {
         "GRID" | "PROJECTED" => {
@@ -777,7 +795,7 @@ fn cell_geometry(
             ]
         }
         "WGS84" | "EPSG:4326" | "OGC:CRS84" => {
-            let mut r = geo::cell_polygon_wgs84(d, c, 25_000.0)?;
+            let mut r = geo::cell_polygon_wgs84_with_options(d, c, 25_000.0, allow_candidate_crs)?;
             r.pop();
             r
         }
@@ -801,15 +819,21 @@ impl VScalar for CellToGeometry {
     fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
         let n = input.len();
         let ncols = input.num_columns();
-        // cell_to_geometry(packed_id [, output_crs [, format]]): the domain is in the packed id.
+        // cell_to_geometry(packed_id [, output_crs [, format [, allow_candidate_crs]]]): the domain is in the packed id.
         let by_packed = col_type(input, 0) == LogicalTypeId::Bigint;
         let first_opt = if by_packed { 1 } else { 2 };
-        let crs = if ncols > first_opt {
+        let candidate_col =
+            (ncols > 0 && col_type(input, ncols - 1) == Boolean).then_some(ncols - 1);
+        let argument_cols = candidate_col.unwrap_or(ncols);
+        let allow_candidate = candidate_col
+            .map(|col| prims::<bool>(input, col, n))
+            .unwrap_or_else(|| vec![Some(false); n]);
+        let crs = if argument_cols > first_opt {
             strings(input, first_opt, n)
         } else {
             vec![Some("grid".into()); n]
         };
-        let fmt = if ncols > first_opt + 1 {
+        let fmt = if argument_cols > first_opt + 1 {
             strings(input, first_opt + 1, n)
         } else {
             vec![Some("wkt".into()); n]
@@ -837,8 +861,10 @@ impl VScalar for CellToGeometry {
         };
         let mut rows = Vec::with_capacity(n);
         for i in 0..n {
-            rows.push(match (cells[i], &crs[i], &fmt[i]) {
-                (Some((d, c)), Some(crs), Some(fmt)) => Some(cell_geometry(d, c, crs, fmt)?),
+            rows.push(match (cells[i], &crs[i], &fmt[i], allow_candidate[i]) {
+                (Some((d, c)), Some(crs), Some(fmt), Some(allow_candidate)) => {
+                    Some(cell_geometry(d, c, crs, fmt, allow_candidate)?)
+                }
                 _ => None,
             });
         }
@@ -850,9 +876,18 @@ impl VScalar for CellToGeometry {
             sig(&[Varchar, Varchar], type_id(Varchar)),
             sig(&[Varchar, Varchar, Varchar], type_id(Varchar)),
             sig(&[Varchar, Varchar, Varchar, Varchar], type_id(Varchar)),
+            sig(&[Varchar, Varchar, Boolean], type_id(Varchar)),
+            sig(&[Varchar, Varchar, Varchar, Boolean], type_id(Varchar)),
+            sig(
+                &[Varchar, Varchar, Varchar, Varchar, Boolean],
+                type_id(Varchar),
+            ),
             sig(&[Bigint], type_id(Varchar)),
             sig(&[Bigint, Varchar], type_id(Varchar)),
             sig(&[Bigint, Varchar, Varchar], type_id(Varchar)),
+            sig(&[Bigint, Boolean], type_id(Varchar)),
+            sig(&[Bigint, Varchar, Boolean], type_id(Varchar)),
+            sig(&[Bigint, Varchar, Varchar, Boolean], type_id(Varchar)),
         ]
     }
 }

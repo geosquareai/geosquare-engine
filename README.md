@@ -8,7 +8,7 @@ Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. Al
 | Python binding (PyO3) | Done | `bindings/python/` |
 | WebAssembly / npm binding | Done | `bindings/wasm/` |
 | CRS: point to cell, cell to polygon | Phase 3 E8. Explicit datum operations for all 11 domains; VN provisional | `core/src/projection.rs`, `core/src/domain.rs`, `core/src/geo.rs` |
-| `points.json` and `projected.json` vectors | Pass for released domains. Blocked domains must refuse lon/lat | `vectors/spec-2.0/` |
+| `points.json` and `projected.json` vectors | Pass. Released domains work by default; candidate domains require explicit opt-in | `vectors/spec-2.0/` |
 | DuckDB extension (C API, DuckDB 1.4 to 2.0): grid functions, polyfill, cell datasets (flat, partitioned, Iceberg) | Done | `bindings/duckdb/` |
 | Postgres, BigQuery bindings | Planned | - |
 
@@ -35,15 +35,18 @@ Mercator), `core/src/domain.rs` (the 11 domains from registry 2.0.0), and `core/
 
 Measured on 300 spread-out points inside each boundary. The explicit pipelines match pinned PROJ for ID, LA, and PH.
 
+Six domains are released under the GeoSquare support policy. Five domains remain candidate-only. Candidate CRS use must be explicit.
+
 | Domain | Written operation | Status |
 |---|---|---|
-| BN, KH, MM, MY, SG, TH, TL | None; explicit projection pipeline | Available |
-| ID | `INVERSE(EPSG:15912) + EPSG:9472` | Available |
-| LA | `INVERSE(EPSG:1065)` | Available |
-| PH | `INVERSE(EPSG:15708)` | Available |
-| VN | `INVERSE(EPSG:6960)` | Available for provisional technical use |
+| BN, MY, SG | None; explicit projection pipeline | Released |
+| ID | `INVERSE(EPSG:15912) + EPSG:9472` | Released |
+| LA | `INVERSE(EPSG:1065)` | Released |
+| PH | `INVERSE(EPSG:15708)` | Released |
+| KH, MM, TH, TL | None; explicit projection pipeline | Candidate; explicit opt-in |
+| VN | `INVERSE(EPSG:6960)` | Candidate; explicit opt-in |
 
-The Rust engine applies the profile-owned operation before projection. It does not query a CRS database. VN is provisional because EPSG offers competing operations. Independent control points are still needed before any production claim.
+The Rust engine applies each profile-owned operation before projection. It does not query a CRS database. Candidate domains require explicit opt-in in APIs that accept candidate CRS use. Production-ready means released under GeoSquare's support policy, not official national geodetic certification.
 
 ## Rules
 
@@ -71,7 +74,7 @@ For Python, see `bindings/python/README.md`.
 
 # Bahasa Indonesia
 
-Status: Fase 1 selesai. Bagian CRS Fase 3 sekarang memakai datum operation yang tertulis. Semua 11 domain punya operation di engine. VN masih provisional dan bukan produksi. Lihat bagian "CRS status" di atas.
+Status: Fase 1 selesai. Bagian CRS Fase 3 memakai datum operation yang tertulis. Enam domain sudah released. Lima domain masih candidate dan butuh opt-in jelas. Lihat bagian "CRS status" di atas.
 
 Tabel status ada di atas.
 
