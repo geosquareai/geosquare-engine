@@ -10,13 +10,29 @@ extension `geosquare_grid_duckdb`.
 
 ## Install
 
-From a repository built by `.github/workflows/duckdb-release.yml` (see `community/README.md`):
+Published repository (public, CORS enabled) with builds for every DuckDB release from 1.4.0
+to 2.0.0: `linux_amd64` and `linux_arm64` (glibc 2.28+), `wasm_eh` (DuckDB-Wasm):
 
 ```sql
-SET allow_unsigned_extensions = true;
-INSTALL geosquare_v2 FROM 'https://<host>/<prefix>';
+SET allow_unsigned_extensions = true;   -- the build is not signed by DuckDB
+INSTALL geosquare_v2 FROM 'https://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2';
 LOAD geosquare_v2;
 ```
+
+DuckDB-Wasm: open the database with `allowUnsignedExtensions: true`, then the same `INSTALL`
+and `LOAD` (or `GeosquareCellsWasm.open({ extension: '<that url>' })` from `examples/`).
+
+DuckDB 1.4.5 cannot `INSTALL` from this HTTPS S3 endpoint (every other release can, and 1.4.5
+installs from other HTTPS hosts and over plain HTTP). On 1.4.5 download and load the file:
+
+```sh
+curl -sO https://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2/v1.4.5/linux_amd64/geosquare_v2.duckdb_extension.gz
+gunzip geosquare_v2.duckdb_extension.gz   # then: INSTALL './geosquare_v2.duckdb_extension'; LOAD geosquare_v2;
+```
+
+macOS and Windows builds are not in the repository yet; `.github/workflows/duckdb-release.yml`
+builds them. `scripts/publish_local.sh` rebuilds and republishes what a Linux workstation can
+build. Other repositories: see `community/README.md`.
 
 ## Build and load
 
@@ -279,7 +295,9 @@ S3_TEST_ENDPOINT=127.0.0.1:5555 AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=
 
 ## Bahasa Indonesia
 
-Ekstensi DuckDB untuk grid GeoSquare V2. Satu binary bisa di-load di DuckDB 1.4 sampai 2.0,
+Ekstensi DuckDB untuk grid GeoSquare V2. Pasang dengan `INSTALL geosquare_v2 FROM
+'https://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2'` (Linux amd64/arm64 dan
+DuckDB-Wasm, DuckDB 1.4.0–2.0.0; untuk 1.4.5 unduh file dulu, lihat bagian Install). Satu binary bisa di-load di DuckDB 1.4 sampai 2.0,
 dan kode yang sama dibuild untuk DuckDB-Wasm (browser) lewat `build_wasm.sh`.
 Nama fungsi mengikuti `geosquare-v2`. Fungsi dataset bisa membaca dan menulis folder flat,
 folder berpartisi `gid_prefix`, dan tabel Iceberg (metadata terbaru dipakai otomatis).
