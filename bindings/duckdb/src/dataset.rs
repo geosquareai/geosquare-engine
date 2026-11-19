@@ -435,6 +435,7 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
                 level,
                 manifest: src.manifest.clone(),
                 weight: None,
+                extra: None,
             },
         )?,
         None if p.int("rollup_level").is_some() => {
@@ -455,6 +456,8 @@ pub struct QueryCtx {
     /// Column with the share of each cell inside the query area (`coverage_ratio` or
     /// `length_ratio`); None when every cell counts fully (read_cell_dataset) or for points.
     pub weight: Option<&'static str>,
+    /// The column the query adds per cell (`coverage_ratio`, `length_ratio`, `point_count`).
+    pub extra: Option<&'static str>,
 }
 
 /// SQL aggregate of value column `c` by rule, each cell weighted by `w`.
@@ -566,6 +569,149 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         Plan::Typed(q, probe) => Plan::Typed(wrap(&q), wrap(&probe)),
         other => other,
     })
+}
+
+/// Value columns of a dataset (from its cell manifest).
+fn value_columns(ctx: &QueryCtx) -> Vec<String> {
+    ctx.manifest
+        .as_ref()
+        .and_then(|m| m.get("value_fields"))
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("name").and_then(Json::as_str).map(str::to_string))
+        .collect()
+}
+
+/// Short name of a dataset path for prefixing clashing columns: the last folder, without
+/// `data_name=`.
+fn dataset_alias(path: &str) -> String {
+    let last = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path);
+    last.strip_prefix("data_name=").unwrap_or(last).to_string()
+}
+
+/// query_cell_datasets([path, ...], <the parameters of query_cell_dataset>, fill_nulls := true)
+///
+/// Several datasets over one area in one call: one row per cell (or per `rollup_level` cell)
+/// with the value columns of every dataset. A column name used by more than one dataset is
+/// prefixed with the dataset's folder name (`demographyhires_v2023__population`). Cells that a
+/// dataset lacks get 0 in its columns (`fill_nulls := false` keeps NULL). Without
+/// `rollup_level` the datasets must share domain and level.
+pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
+    let paths: Vec<String> = match p.positional.first() {
+        Some(Param::List(items)) => items
+            .iter()
+            .filter_map(|i| i.text().map(str::to_string))
+            .collect(),
+        Some(Param::Text(t)) => vec![t.clone()],
+        _ => Vec::new(),
+    };
+    if paths.is_empty() {
+        return Err("query_cell_datasets needs a list of dataset paths".into());
+    }
+    let rollup = p.int("rollup_level").is_some();
+    let mut parts = Vec::new();
+    for path in &paths {
+        let (plan, ctx) = plan_query_cells(p, path)?;
+        let plan = add_rollup(plan, p, &ctx)?;
+        parts.push((path.clone(), plan, ctx));
+    }
+    let (code, level) = (parts[0].2.code, parts[0].2.level);
+    for (path, _, ctx) in &parts {
+        if ctx.code != code {
+            return Err(format!(
+                "{path} is in domain {}, the first dataset in {code}",
+                ctx.code
+            )
+            .into());
+        }
+        if !rollup && ctx.level != level {
+            return Err(format!(
+                "{path} is at level {}, the first dataset at level {level}: pass rollup_level := <level> to join them",
+                ctx.level
+            )
+            .into());
+        }
+    }
+    // Columns per dataset; clashing names are prefixed.
+    let cols: Vec<Vec<String>> = parts.iter().map(|(_, _, c)| value_columns(c)).collect();
+    let mut count = std::collections::HashMap::<&str, usize>::new();
+    for c in cols.iter().flatten() {
+        *count.entry(c.as_str()).or_default() += 1;
+    }
+    let fill = p.get("fill_nulls").and_then(Param::int).unwrap_or(1) != 0;
+    let key = if rollup { "gid" } else { "packed_id" };
+    let n = parts.len();
+    let coalesce = |c: &str| {
+        let items: Vec<String> = (0..n).map(|i| format!("t{i}.{c}")).collect();
+        if n == 1 {
+            items[0].clone()
+        } else {
+            format!("coalesce({})", items.join(", "))
+        }
+    };
+    let mut select = vec![
+        format!("{} AS packed_id", coalesce("packed_id")),
+        format!("{} AS gid", coalesce("gid")),
+    ];
+    for (i, (path, _, _)) in parts.iter().enumerate() {
+        let alias = dataset_alias(path);
+        for c in &cols[i] {
+            let out = if count[c.as_str()] > 1 {
+                format!("{alias}__{c}")
+            } else {
+                c.clone()
+            };
+            let v = format!("t{i}.{}", sql::ident(c));
+            let v = if fill { format!("coalesce({v}, 0)") } else { v };
+            select.push(format!("{v} AS {}", sql::ident(&out)));
+        }
+    }
+    if rollup {
+        let items: Vec<String> = (0..n).map(|i| format!("t{i}.cell_count")).collect();
+        select.push(format!("list_max([{}]) AS cell_count", items.join(", ")));
+    }
+    if let Some(extra) = parts[0].2.extra {
+        select.push(format!("{} AS {extra}", coalesce(extra)));
+    }
+    let join = |sqls: &[String]| {
+        let mut from = format!("({}) AS t0", sqls[0]);
+        for (i, s) in sqls.iter().enumerate().skip(1) {
+            let prev: Vec<String> = (0..i).map(|k| format!("t{k}.{key}")).collect();
+            let on = if i == 1 {
+                prev[0].clone()
+            } else {
+                format!("coalesce({})", prev.join(", "))
+            };
+            from.push_str(&format!(" FULL JOIN ({s}) AS t{i} ON t{i}.{key} = {on}"));
+        }
+        format!("SELECT {} FROM {from} ORDER BY 1", select.join(", "))
+    };
+    let typed = parts.iter().all(|(_, pl, _)| matches!(pl, Plan::Typed(..)));
+    let plan = if typed {
+        let (q, pr): (Vec<String>, Vec<String>) = parts
+            .iter()
+            .map(|(_, pl, _)| match pl {
+                Plan::Typed(q, pr) => (q.clone(), pr.clone()),
+                _ => unreachable!(),
+            })
+            .unzip();
+        Plan::Typed(join(&q), join(&pr))
+    } else {
+        let q: Vec<String> = parts
+            .iter()
+            .map(|(_, pl, _)| match pl {
+                Plan::Query(q) | Plan::Typed(q, _) => Ok(q.clone()),
+                _ => Err::<String, E>("unexpected plan".into()),
+            })
+            .collect::<Result<_, _>>()?;
+        Plan::Query(join(&q))
+    };
+    add_geometry(plan, p, Some(code))
 }
 
 /// Query polygon in the grid CRS and its source CRS for `polygon_to_cells`.
@@ -712,6 +858,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
         level,
         manifest: src.manifest.clone(),
         weight: (extra != "point_count").then_some(extra),
+        extra: Some(extra),
     };
     let packed: Vec<i64> = cells
         .iter()

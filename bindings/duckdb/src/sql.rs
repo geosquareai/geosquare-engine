@@ -266,6 +266,7 @@ pub enum Kind {
     Bool,
     Float,
     FloatList,
+    TextList,
 }
 
 impl Kind {
@@ -278,6 +279,12 @@ impl Kind {
                 Kind::Float => duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE),
                 Kind::FloatList => {
                     let mut child = duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE);
+                    let l = duckdb_create_list_type(child);
+                    duckdb_destroy_logical_type(&mut child);
+                    l
+                }
+                Kind::TextList => {
+                    let mut child = duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
                     let l = duckdb_create_list_type(child);
                     duckdb_destroy_logical_type(&mut child);
                     l
@@ -310,6 +317,15 @@ impl Kind {
                         for i in 0..n {
                             let c = duckdb_get_list_child(v, i);
                             items.push(Kind::Float.read(c));
+                        }
+                        Param::List(items)
+                    }
+                    Kind::TextList => {
+                        let n = duckdb_get_list_size(v);
+                        let mut items = Vec::with_capacity(n as usize);
+                        for i in 0..n {
+                            let c = duckdb_get_list_child(v, i);
+                            items.push(Kind::Text.read(c));
                         }
                         Param::List(items)
                     }

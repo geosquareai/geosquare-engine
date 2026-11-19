@@ -180,6 +180,20 @@ SELECT gid, population, cell_count
 FROM read_cell_dataset('/data/pop_part', rollup_level := 7, rollup_rule := 'max');
 ```
 
+Several datasets over one area in one call: `query_cell_datasets([path, ...], ...)` takes
+the parameters of `query_cell_dataset` and returns one row per cell (or per `rollup_level`
+cell) with the value columns of every dataset. A column name that two datasets share is
+prefixed with the dataset folder (`pop_flat__population`); a cell missing from a dataset has
+0 in its columns (`fill_nulls := false` keeps NULL). Datasets at different levels need
+`rollup_level`.
+
+```sql
+SELECT gid, pop_ice__population, pop_part__population, coverage_ratio
+FROM query_cell_datasets(['/data/pop_ice', '/data/pop_part'],
+  geometry := 'POLYGON ((106.80 -6.20, 106.84 -6.20, 106.84 -6.16, 106.80 -6.16, 106.80 -6.20))',
+  rollup_level := 9);
+```
+
 The same by hand is a `GROUP BY left(gid, L)` (pick the aggregate per column yourself):
 
 ```sql

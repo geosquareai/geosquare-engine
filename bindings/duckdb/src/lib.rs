@@ -105,8 +105,18 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 con,
                 "query_cell_dataset",
                 vec![Text],
-                q,
+                q.clone(),
                 dataset::plan_query,
+                pool.clone(),
+            )?;
+            let mut qm = q;
+            qm.push(("fill_nulls", Bool));
+            sql::register(
+                con,
+                "query_cell_datasets",
+                vec![TextList],
+                qm,
+                dataset::plan_query_multi,
                 pool.clone(),
             )?;
             let mut w = identity.clone();

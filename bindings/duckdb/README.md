@@ -256,6 +256,9 @@ Lines follow `geosquare_v2.line_to_cells` (identical on test lines); a segment l
 an internal cell edge goes to the cell on its high side (spec 2.0 half-open rule), so the
 ratios of a line always sum to 1, whereas the Shapely oracle can count such a segment twice.
 
+`query_cell_datasets([path, ...], ...)` queries several datasets over one area and joins them per
+cell (same parameters as `query_cell_dataset`, plus `fill_nulls`).
+
 `read_cell_dataset` / `query_cell_dataset` take `rollup_level := L` for one row per level-L
 ancestor cell (1 km = 9, 10 km = 7), each value column aggregated by its manifest
 `aggregation_rule` and weighted by `coverage_ratio`; `rollup_rule` overrides the rule. See
