@@ -165,11 +165,75 @@ impl Storage {
         Err("no S3 client".into())
     }
 
+    /// Every object below `prefix` (recursive): (path, size, last modified ms since epoch).
+    pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64, i64)>, E> {
+        if is_local(prefix) {
+            let mut out = Vec::new();
+            walk_files(std::path::Path::new(local(prefix)), &mut out);
+            let base = local(prefix).trim_end_matches('/');
+            let shown = prefix.trim_end_matches('/');
+            return Ok(out
+                .into_iter()
+                .map(|(p, n, t)| {
+                    let rel = p.strip_prefix(base).unwrap_or(&p).to_string();
+                    (format!("{shown}{rel}"), n, t)
+                })
+                .collect());
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.list(prefix);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Delete these objects (files, not folders). Returns how many were deleted.
+    pub fn delete_many(&self, paths: &[String]) -> Result<usize, E> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        if paths.iter().all(|p| is_local(p)) {
+            let mut n = 0;
+            for p in paths {
+                match std::fs::remove_file(local(p)) {
+                    Ok(()) => n += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("cannot delete {p}: {e}").into()),
+                }
+            }
+            return Ok(n);
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.delete_many(paths);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
     #[cfg(feature = "native-s3")]
     fn conf(&self) -> Result<&s3::Conf, E> {
         self.s3
             .as_ref()
             .ok_or_else(|| "S3 storage is not configured for this path".into())
+    }
+}
+
+fn walk_files(p: &std::path::Path, out: &mut Vec<(String, u64, i64)>) {
+    let Ok(it) = std::fs::read_dir(p) else { return };
+    for e in it.filter_map(|e| e.ok()) {
+        let path = e.path();
+        if path.is_dir() {
+            walk_files(&path, out);
+        } else if let Ok(m) = e.metadata() {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as i64);
+            out.push((path.to_string_lossy().into_owned(), m.len(), t));
+        }
     }
 }
 
@@ -421,6 +485,46 @@ mod s3 {
                 .await
             })?;
             Ok(())
+        }
+
+        pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64, i64)>, E> {
+            let (bucket, key) = split_s3(prefix)?;
+            let store = self.store(&bucket)?;
+            let base = ObjPath::from(key.trim_end_matches('/').to_string());
+            let items: Vec<object_store::ObjectMeta> =
+                runtime()?.block_on(async move { store.list(Some(&base)).try_collect().await })?;
+            Ok(items
+                .into_iter()
+                .map(|o| {
+                    (
+                        format!("s3://{bucket}/{}", o.location),
+                        o.size,
+                        o.last_modified.timestamp_millis(),
+                    )
+                })
+                .collect())
+        }
+
+        pub fn delete_many(&self, paths: &[String]) -> Result<usize, E> {
+            use futures::StreamExt;
+            let mut by_bucket: std::collections::HashMap<String, Vec<ObjPath>> = Default::default();
+            for p in paths {
+                let (bucket, key) = split_s3(p)?;
+                by_bucket
+                    .entry(bucket)
+                    .or_default()
+                    .push(ObjPath::from(key));
+            }
+            let mut n = 0;
+            for (bucket, keys) in by_bucket {
+                let store = self.store(&bucket)?;
+                n += runtime()?.block_on(async move {
+                    let stream = futures::stream::iter(keys.into_iter().map(Ok)).boxed();
+                    let done: Vec<ObjPath> = store.delete_stream(stream).try_collect().await?;
+                    Ok::<usize, object_store::Error>(done.len())
+                })?;
+            }
+            Ok(n)
         }
 
         pub fn delete_prefix(&self, prefix: &str) -> Result<usize, E> {

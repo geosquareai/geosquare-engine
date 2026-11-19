@@ -13,6 +13,7 @@ mod grid;
 mod iceberg;
 mod icefast;
 mod lines;
+mod maintenance;
 mod metadata;
 mod polyfill;
 mod sql;
@@ -61,6 +62,19 @@ unsafe fn init(
         register_dataset_functions(db)?;
         Ok(true)
     }
+}
+
+fn s3_named() -> Vec<(&'static str, sql::Kind)> {
+    use sql::Kind::Text;
+    vec![
+        ("s3_region", Text),
+        ("s3_endpoint", Text),
+        ("s3_url_style", Text),
+        ("s3_use_ssl", Text),
+        ("s3_access_key_id", Text),
+        ("s3_secret_access_key", Text),
+        ("s3_session_token", Text),
+    ]
 }
 
 unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box<dyn Error>> {
@@ -198,6 +212,21 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 vec![Text],
                 vec![("domain_code", Text), ("level", Int), ("max_rows", Int)],
                 detect_fn::plan,
+                pool.clone(),
+            )?;
+            let mut ex = vec![
+                ("retain_last", Int),
+                ("older_than", Text),
+                ("orphan_age_hours", Float),
+                ("dry_run", Bool),
+            ];
+            ex.extend(s3_named());
+            sql::register(
+                con,
+                "expire_snapshots",
+                vec![Text],
+                ex,
+                maintenance::plan_expire,
                 pool.clone(),
             )?;
             sql::register(

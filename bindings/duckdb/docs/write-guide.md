@@ -12,6 +12,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 | delete cells | rewrite without them, `mode := 'overwrite'` | rows to keep, `mode := 'overwrite'` |
 | add / drop / retype a column | `mode := 'overwrite'` | `mode := 'overwrite'` (new schema id; old snapshots readable) |
 | overview at a coarser level | `rollup_level := L` | `rollup_level := L` |
+| drop old snapshots and their files | - | `expire_snapshots(path, retain_last := N)` |
 | change the partition level | `mode := 'overwrite', partition_level := ...` | same (new partition spec) |
 
 A dataset holds one row per cell (unique `packed_id`), one domain and one level. The writer
@@ -165,6 +166,21 @@ SELECT * FROM write_cell_dataset('SELECT * FROM read_cell_dataset(''/data/w_ice'
   '/data/w_ice_1km', layout := 'iceberg', partition_level := 5, rollup_level := 9,
   aggregation_rule := '{"population": "sum", "workers": "sum", "non_workers": "sum"}');
 SELECT level, row_count FROM cell_dataset_info('/data/w_ice_1km');
+```
+
+## Clean up old snapshots (Iceberg)
+
+Every write keeps the previous snapshots and their files, so a table rewritten often grows.
+`expire_snapshots` keeps the current snapshot and the last `retain_last` ones (and any newer
+than `older_than`), writes new metadata without the others, and deletes the files only they
+used. Files no metadata refers to (left by a failed or running write) are deleted only when
+older than `orphan_age_hours` (default 24), so a write in progress is safe. `dry_run := true`
+reports without changing anything. Older snapshots are no longer readable afterwards.
+
+```sql
+SELECT * FROM expire_snapshots('/data/w_ice', dry_run := true);
+SELECT * FROM expire_snapshots('/data/w_ice', retain_last := 2);
+SELECT count(*) FROM iceberg_snapshots('/data/w_ice');
 ```
 
 ## Check what was written

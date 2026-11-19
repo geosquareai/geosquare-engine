@@ -93,6 +93,10 @@ const MANIFEST_FILES: usize = 128;
 /// Cell id columns, which always get full Iceberg metrics.
 const KEY_COLUMNS: [&str; 4] = ["packed_id", "gid", "x_idx", "y_idx"];
 
+pub(crate) fn s3_params_pub(p: &Params) -> S3Params {
+    s3_params(p)
+}
+
 fn s3_params(p: &Params) -> S3Params {
     S3Params {
         region: p.text("s3_region"),
@@ -178,7 +182,7 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
 
 // ---------------------------------------------------------------------------
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -198,7 +202,7 @@ fn random_u64() -> u64 {
     h.finish()
 }
 
-fn uuid4() -> String {
+pub(crate) fn uuid4() -> String {
     let (a, b) = (random_u64(), random_u64());
     let a = (a & 0xffff_ffff_ffff_0fff) | 0x0000_0000_0000_4000;
     let b = (b & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
@@ -1133,7 +1137,7 @@ fn plain(p: &str) -> &str {
 }
 
 /// Highest metadata version number in `<root>/metadata`.
-fn max_metadata_version(lease: &Lease, root: &str) -> Result<Option<u64>, E> {
+pub(crate) fn max_metadata_version(lease: &Lease, root: &str) -> Result<Option<u64>, E> {
     Ok(sql::query_text_on(
         lease,
         &format!(
