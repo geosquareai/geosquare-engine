@@ -15,6 +15,7 @@ mod icefast;
 mod lines;
 mod metadata;
 mod polyfill;
+mod registry;
 mod sql;
 mod storage;
 mod tables;

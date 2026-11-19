@@ -135,6 +135,9 @@ fn put_i32(v: &mut FlatVector, i: usize, x: i32) {
 fn put_f64(v: &mut FlatVector, i: usize, x: f64) {
     unsafe { v.as_mut_slice::<f64>()[i] = x };
 }
+fn put_bool(v: &mut FlatVector, i: usize, x: bool) {
+    unsafe { v.as_mut_slice::<bool>()[i] = x };
+}
 
 /// A flat output column for row-wise writing (VARCHAR / BIGINT / INTEGER / DOUBLE).
 fn finish_scalar<T>(
@@ -892,6 +895,41 @@ impl VScalar for CellToGeometry {
     }
 }
 
+/// verify_registry(database_path, signature_path, trust_path) -> BOOLEAN.
+///
+/// Returns true only after checking the SHA-256 digest, Ed25519 signature, and trusted key.
+pub struct VerifyRegistry;
+impl VScalar for VerifyRegistry {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (database, signature, trust) = (
+            strings(input, 0, n),
+            strings(input, 1, n),
+            strings(input, 2, n),
+        );
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&database[i], &signature[i], &trust[i]) {
+                (Some(database), Some(signature), Some(trust)) => Some(
+                    crate::registry::verify_paths(database, signature, trust)
+                        .map(|_| true)
+                        .map_err(Box::<dyn Error>::from)?,
+                ),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(
+            &[Varchar, Varchar, Varchar],
+            type_id(LogicalTypeId::Boolean),
+        )]
+    }
+}
+
 /// engine_version() -> VARCHAR
 pub struct EngineVersion;
 impl VScalar for EngineVersion {
@@ -939,6 +977,7 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<DescendantRange>("descendant_range")?;
     con.register_scalar_function::<ParseUri>("parse_uri")?;
     con.register_scalar_function::<CellToGeometry>("cell_to_geometry")?;
+    con.register_scalar_function::<VerifyRegistry>("verify_registry")?;
     con.register_scalar_function::<EngineVersion>("geosquare_engine_version")?;
     Ok(())
 }

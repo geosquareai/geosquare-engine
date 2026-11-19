@@ -98,6 +98,7 @@ Writing is meant for the backend.
 | `descendant_range(domain, parent_gid, child_level)` | `STRUCT(lo, hi)` packed range (spec 8.1) |
 | `parse_uri(uri)` | `STRUCT(domain_code, gid)` |
 | `cell_to_geometry(domain_code, gid [, output_crs [, format [, allow_candidate_crs]]])`, `cell_to_geometry(packed_id, ...)` (domain from packed id) | WKT or GeoJSON; `output_crs` `'grid'` (default, as in v2) or `'EPSG:4326'` |
+| `verify_registry(database_path, signature_path, trust_path)` | `BOOLEAN`; verifies the database digest, Ed25519 signature, and trusted key |
 | `polygon_to_cells(domain_code, wkt, level, ...)` | table: `domain_code, level, x_idx, y_idx, gid, uri, packed_id, coverage_ratio` |
 | `polyfill(domain_code, wkt, level, ...)` | table: `gid, coverage_ratio` |
 | `line_to_cells(domain_code, wkt, level, source_crs := ..., max_candidate_limit := ...)` | table: same cell columns + `length_ratio` (share of the whole line inside the cell, as in v2) |
@@ -167,6 +168,21 @@ functions.
 Not registered: the engine names `encode`, `decode` and `unpack`. `encode`/`decode` are DuckDB
 BLOB built-ins (DuckDB 1.4 resolves `decode('<gid>')` to the built-in) and `UNPACK(...)` is
 DuckDB syntax. Use `canonical_to_gid`, `gid_to_canonical` and `unpack_int64`.
+
+### Registry verification
+
+Verify the signed registry before using its profiles:
+
+```sql
+SELECT verify_registry(
+  '/path/registry.db',
+  '/path/registry.db.sig',
+  '/path/registry-trust.json'
+);
+```
+
+The function raises an error for a changed database, bad signature, or untrusted key.
+It returns `true` only after all three checks pass.
 
 ## Cell datasets: flat, partitioned, Iceberg
 
