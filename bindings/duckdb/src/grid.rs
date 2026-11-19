@@ -885,12 +885,6 @@ impl VScalar for EngineVersion {
     }
 }
 
-/// Register every scalar function.
-///
-/// Engine names that clash with DuckDB are not registered, so results never depend
-/// on the DuckDB version: `encode`/`decode` are DuckDB BLOB built-ins (DuckDB 1.4
-/// resolves `decode('<gid>')` to the built-in), and `UNPACK(...)` is DuckDB syntax.
-/// Use the v2 names `canonical_to_gid`, `gid_to_canonical` and `unpack_int64`.
 // ---------- GeoSquare v1 grid ----------
 
 /// v1_gid_to_cell(domain_code, gid_v1, level) -> the v2 cell holding the centre of a v1 cell
@@ -1023,6 +1017,12 @@ impl VScalar for LonLatToV1Gid {
     }
 }
 
+/// Register every scalar function.
+///
+/// Engine names that clash with DuckDB are not registered, so results never depend
+/// on the DuckDB version: `encode`/`decode` are DuckDB BLOB built-ins (DuckDB 1.4
+/// resolves `decode('<gid>')` to the built-in), and `UNPACK(...)` is DuckDB syntax.
+/// Use the v2 names `canonical_to_gid`, `gid_to_canonical` and `unpack_int64`.
 pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<PointToCell>("point_to_cell")?;
     con.register_scalar_function::<PackInt64>("pack_int64")?;
