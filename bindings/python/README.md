@@ -31,7 +31,7 @@ packed = gs.pack(1, gid)               # Int64, domain ID 1
 gs.unpack(packed)                      # (1, "H2X545M5X4E2")
 gs.k_ring(gid, 1)                      # 8 neighbours, not including the cell itself
 gs.distance_m(gid, gs.k_ring(gid, 1)[0])
-ring = gs.cell_polygon_wgs84(9, gid, 1000.0)  # closed WGS84 (lon, lat) ring
+ring = gs.cell_polygon_wgs84(1, gid, 1000.0)  # closed WGS84 (lon, lat) ring
 ```
 
 `cell_polygon_wgs84` needs the numeric domain ID because a bare GID does not
