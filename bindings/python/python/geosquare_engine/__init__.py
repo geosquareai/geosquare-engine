@@ -7,6 +7,7 @@ conformance vectors in `vectors/spec-2.0`.
 from ._core import (
     __version__,
     cell_side_m,
+    cell_polygon_wgs84,
     children,
     decode,
     descendant_range,
@@ -23,6 +24,7 @@ from ._core import (
 __all__ = [
     "__version__",
     "cell_side_m",
+    "cell_polygon_wgs84",
     "children",
     "decode",
     "descendant_range",

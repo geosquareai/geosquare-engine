@@ -6,7 +6,7 @@
 
 use geosquare_core::codec::{self, Cell};
 use geosquare_core::detect::{self, Column, DType, Kind, Status, Value};
-use geosquare_core::{packing, topology};
+use geosquare_core::{domain, geo, packing, topology};
 use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyInt, PyList, PyString};
@@ -111,6 +111,33 @@ fn distance_m(a: &str, b: &str) -> PyResult<f64> {
 #[pyfunction]
 fn cell_side_m(level: u8) -> PyResult<f64> {
     codec::cell_side_m(level).map_err(value_error)
+}
+
+fn domain_of(domain_id: u16) -> PyResult<&'static domain::Domain> {
+    domain::by_id(domain_id)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown domain ID {domain_id}")))
+}
+
+/// Return a closed WGS84 `(longitude, latitude)` ring for a GID.
+///
+/// `domain_id` selects the grid CRS because a bare GID does not contain a domain.
+/// `max_segment_length_m` is the maximum projected edge segment length in metres.
+/// Candidate CRS domains require explicit `allow_candidate_crs=True`.
+#[pyfunction]
+#[pyo3(signature = (domain_id, gid, max_segment_length_m=1000.0, allow_candidate_crs=false))]
+fn cell_polygon_wgs84(
+    domain_id: u16,
+    gid: &str,
+    max_segment_length_m: f64,
+    allow_candidate_crs: bool,
+) -> PyResult<Vec<(f64, f64)>> {
+    geo::cell_polygon_wgs84_with_options(
+        domain_of(domain_id)?,
+        cell_of(gid)?,
+        max_segment_length_m,
+        allow_candidate_crs,
+    )
+    .map_err(value_error)
 }
 
 fn dtype_of(name: &str) -> PyResult<DType> {
@@ -254,6 +281,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(k_disk, module)?)?;
     module.add_function(wrap_pyfunction!(distance_m, module)?)?;
     module.add_function(wrap_pyfunction!(cell_side_m, module)?)?;
+    module.add_function(wrap_pyfunction!(cell_polygon_wgs84, module)?)?;
     module.add_function(wrap_pyfunction!(detect_table, module)?)?;
     Ok(())
 }
