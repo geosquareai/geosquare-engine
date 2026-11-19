@@ -121,3 +121,36 @@ test("detection result keys are stable", () => {
     "validRatio",
   ]);
 });
+
+test("released domains convert lon/lat to a GID and a closed WGS84 ring", () => {
+  const gid = gs.pointToCell(1, 118.01521445, -2.55029565, 5, false);
+  assert.equal(typeof gid, "string");
+  const ring = gs.cellPolygonWgs84(1, gid, 25_000, false);
+  assert.ok(Array.isArray(ring));
+  assert.ok(ring.length >= 5);
+  assert.deepEqual(ring[0], ring.at(-1));
+  for (const [lon, lat] of ring) {
+    assert.equal(typeof lon, "number");
+    assert.equal(typeof lat, "number");
+  }
+});
+
+test("candidate CRS operations require explicit opt-in", () => {
+  assert.throws(
+    () => gs.pointToCell(2, 107.868144, 15.981051, 5, false),
+    /not released/
+  );
+  const gid = gs.pointToCell(2, 107.868144, 15.981051, 5, true);
+  assert.equal(typeof gid, "string");
+  assert.throws(
+    () => gs.cellPolygonWgs84(2, gid, 25_000, false),
+    /not released/
+  );
+  assert.ok(gs.cellPolygonWgs84(2, gid, 25_000, true).length >= 5);
+});
+
+test("geographic API guards domain and numeric arguments", () => {
+  assert.throws(() => gs.pointToCell(1.5, 118, -2, 5, false), /whole number/);
+  assert.throws(() => gs.pointToCell(99, 118, -2, 5, false), /unknown domain/);
+  assert.throws(() => gs.cellPolygonWgs84(1, "2345", 0, false), /positive and finite/);
+});
