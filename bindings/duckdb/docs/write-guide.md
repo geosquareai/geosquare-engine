@@ -11,6 +11,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 | update / upsert cells | rewrite: merged rows, `mode := 'overwrite'` | merged rows, `mode := 'overwrite'` (one atomic snapshot) |
 | delete cells | rewrite without them, `mode := 'overwrite'` | rows to keep, `mode := 'overwrite'` |
 | add / drop / retype a column | `mode := 'overwrite'` | `mode := 'overwrite'` (new schema id; old snapshots readable) |
+| overview at a coarser level | `rollup_level := L` | `rollup_level := L` |
 | change the partition level | `mode := 'overwrite', partition_level := ...` | same (new partition spec) |
 
 A dataset holds one row per cell (unique `packed_id`), one domain and one level. The writer
@@ -148,6 +149,22 @@ SELECT sequence_number, snapshot_id FROM iceberg_snapshots('/data/w_ice') ORDER 
 ```sql
 SELECT * FROM write_cell_dataset('SELECT * EXCLUDE (gid, x_idx, y_idx) FROM read_cell_dataset(''/data/w_part'')',
   '/data/w_part', layout := 'partitioned', mode := 'overwrite', partition_level := 6);
+```
+
+## Overview datasets (roll-up)
+
+`rollup_level := L` aggregates the input cells to their level-L ancestors before writing:
+one dataset of 1 km (9) or 10 km (7) cells from a 50 m one, for fast overviews of large
+areas. Each numeric column is aggregated by `aggregation_rule` (one word or
+`{column: rule}`; sum, mean, min, max); without a rule, COUNT columns (`value_semantics`) are
+summed and the others averaged. An input `coverage_ratio` (from `query_cell_dataset`)
+weights the cells and is not written.
+
+```sql
+SELECT * FROM write_cell_dataset('SELECT * FROM read_cell_dataset(''/data/w_ice'')',
+  '/data/w_ice_1km', layout := 'iceberg', partition_level := 5, rollup_level := 9,
+  aggregation_rule := '{"population": "sum", "workers": "sum", "non_workers": "sum"}');
+SELECT level, row_count FROM cell_dataset_info('/data/w_ice_1km');
 ```
 
 ## Check what was written

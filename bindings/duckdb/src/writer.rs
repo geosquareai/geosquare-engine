@@ -82,6 +82,8 @@ pub struct Options {
     extra: crate::metadata::Extra,
     /// Write 0 instead of NULL in numeric value columns (default true).
     fill_nulls: bool,
+    /// Aggregate the input cells to this ancestor level before writing (see rollup_query).
+    rollup_level: Option<i64>,
     s3: S3Params,
 }
 
@@ -132,6 +134,7 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
             .unwrap_or_else(|| "query".into())
             .to_ascii_lowercase(),
         fill_nulls: p.int("fill_nulls").is_none_or(|v| v != 0),
+        rollup_level: p.int("rollup_level"),
         column_metrics: p
             .text("column_metrics")
             .unwrap_or_else(|| "auto".into())
@@ -437,6 +440,108 @@ impl Staged {
     fn has(&self, n: &str) -> bool {
         self.columns.iter().any(|(c, _)| c == n)
     }
+}
+
+/// `rollup_level := R`: the input cells aggregated to their level-R ancestors, one row per
+/// ancestor. Each numeric column is aggregated by its `aggregation_rule` (one word or
+/// `{column: rule}`: sum, mean, min, max); without a rule COUNT columns (`value_semantics`)
+/// are summed and the others averaged. An input `coverage_ratio` / `length_ratio` column
+/// (e.g. from query_cell_dataset) weights the cells and is not written.
+fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<String, E> {
+    if !(0..=codec::MAX_LEVEL as i64).contains(&r) {
+        return Err(format!(
+            "rollup_level must be in [0, {}]; received {r}",
+            codec::MAX_LEVEL
+        )
+        .into());
+    }
+    let src = format!("SELECT * FROM ({query}) AS gs_src");
+    let cols = describe(lease, &src)?;
+    let has = |n: &str| cols.iter().any(|(c, _)| c == n);
+    let gid = if has("gid") {
+        "CAST(r.gid AS VARCHAR)"
+    } else if has("packed_id") {
+        "packed_to_gid(CAST(r.packed_id AS BIGINT))"
+    } else {
+        return Err("the query needs a gid or a packed_id column".into());
+    };
+    let weight = ["coverage_ratio", "length_ratio"]
+        .into_iter()
+        .find(|w| has(w));
+    let w = weight.map_or("1.0".to_string(), |w| format!("r.{w}"));
+    type Rules = (Option<String>, serde_json::Map<String, Json>);
+    let word_or_map = |text: &Option<String>| -> Result<Rules, E> {
+        match text.as_deref().map(str::trim) {
+            Some(t) if t.starts_with('{') => match serde_json::from_str::<Json>(t) {
+                Ok(Json::Object(m)) => Ok((None, m)),
+                _ => Err("aggregation_rule / value_semantics must be a word or a JSON object {column: value}".into()),
+            },
+            Some(t) => Ok((Some(t.to_string()), Default::default())),
+            None => Ok((None, Default::default())),
+        }
+    };
+    let (agg_all, agg_map) = word_or_map(&o.aggregation_rule)?;
+    let (sem_all, sem_map) = word_or_map(&Some(o.value_semantics.clone()))?;
+    let skip = [
+        "gid",
+        "packed_id",
+        "x_idx",
+        "y_idx",
+        "uri",
+        "domain_code",
+        "level",
+        "cell_count",
+    ];
+    let mut aggs = Vec::new();
+    for (c, ty) in &cols {
+        if skip.contains(&c.as_str()) || Some(c.as_str()) == weight {
+            continue;
+        }
+        if !is_numeric_type(ty) {
+            return Err(format!(
+                "rollup_level aggregates numeric columns; {c} is {ty}: aggregate or drop it in the query"
+            )
+            .into());
+        }
+        let rule = agg_map
+            .get(c)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .or_else(|| agg_all.clone())
+            .unwrap_or_else(|| {
+                let sem = sem_map
+                    .get(c)
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+                    .or_else(|| sem_all.clone())
+                    .unwrap_or_default();
+                if sem.eq_ignore_ascii_case("COUNT") {
+                    "sum".into()
+                } else {
+                    "mean".into()
+                }
+            });
+        aggs.push(format!(
+            "{} AS {}",
+            crate::dataset::rollup_expr(c, &rule, &w)?,
+            ident(c)
+        ));
+    }
+    if aggs.is_empty() {
+        return Err("rollup_level: the query has no value columns".into());
+    }
+    // Keep the domain with the cells: the parent's packed_id from the input's domain bits.
+    let packed = if has("packed_id") {
+        format!(
+            ", pack(CAST(any_value(r.packed_id >> 54) AS INTEGER), left({gid}, {r})) AS packed_id"
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "SELECT left({gid}, {r}) AS gid{packed}, {} FROM ({src}) AS r GROUP BY 1",
+        aggs.join(", ")
+    ))
 }
 
 /// Stage the query sorted by packed_id and run the identity checks.
@@ -820,6 +925,14 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
         let store = Storage::for_path(&lease, &root, &o.s3)?;
         // Stage (read the whole input) before clearing the target: the input may read the
         // dataset being overwritten (update / delete by rewriting it).
+        let rolled;
+        let query = match o.rollup_level {
+            Some(r) => {
+                rolled = rollup_query(&lease, query, r, o)?;
+                rolled.as_str()
+            }
+            None => query,
+        };
         let st = stage(&lease, query, o)?;
         if o.layout != "iceberg" {
             prepare_target(&lease, &root, o, &store)?;

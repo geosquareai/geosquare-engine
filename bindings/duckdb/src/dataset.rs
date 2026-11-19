@@ -461,7 +461,7 @@ pub struct QueryCtx {
 }
 
 /// SQL aggregate of value column `c` by rule, each cell weighted by `w`.
-fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
+pub fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
     let c = format!("r.{}", sql::ident(name));
     Ok(match rule.to_ascii_lowercase().as_str() {
         "sum" | "count" => format!("CAST(sum({c} * {w}) AS DOUBLE)"),

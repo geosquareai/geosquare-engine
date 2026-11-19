@@ -12,7 +12,7 @@ test:               ## Rust unit tests + spec vectors on the installed duckdb pa
 	python3 tests/test_vectors.py build/$${DUCKDB_PLATFORM:-linux_amd64}/geosquare_v2.duckdb_extension
 
 test_versions:      ## vectors + datasets on DuckDB 1.4.0 ... 2.0.0 (venvs cached in .venvs)
-	TESTS="tests/test_vectors.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py tests/test_rollup.py tests/test_v1.py tests/test_multi_query.py" tests/run_versions.sh
+	TESTS="tests/test_vectors.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py tests/test_rollup.py tests/test_v1.py tests/test_multi_query.py tests/test_write_rollup.py" tests/run_versions.sh
 
 test_wasm:          ## DuckDB-Wasm in headless Chromium vs native
 	tests/wasm/run.sh

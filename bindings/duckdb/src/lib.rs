@@ -140,6 +140,7 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("data_period", Text),
                 ("data_version", Text),
                 ("fill_nulls", Bool),
+                ("rollup_level", Int),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),
