@@ -186,10 +186,10 @@ Vector tiles (MVT) for a web map come from DuckDB spatial on top of the WKB outp
 ```sql
 -- not run in tests: needs INSTALL spatial (network)
 INSTALL spatial; LOAD spatial;
-SET VARIABLE tile_wkt = (SELECT ST_AsText(ST_Transform(ST_TileEnvelope(14, 13054, 8473),
+SET VARIABLE tile_wkt = (SELECT ST_AsText(ST_Transform(ST_TileEnvelope(14, 13053, 8473),
                                           'EPSG:3857', 'EPSG:4326', always_xy := true)));
 SELECT ST_AsMVT({'geometry': ST_AsMVTGeom(ST_Transform(ST_GeomFromWKB(cell_geometry), 'EPSG:4326', 'EPSG:3857', always_xy := true),
-                                          ST_Extent(ST_TileEnvelope(14, 13054, 8473))),
+                                          ST_Extent(ST_TileEnvelope(14, 13053, 8473))),
                  'gid': gid, 'population': population}, 'cells') AS tile
 FROM query_cell_dataset('/data/pop_ice', geometry := getvariable('tile_wkt'), with_geometry := 'wkb');
 ```
