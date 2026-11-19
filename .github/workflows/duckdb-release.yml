@@ -77,6 +77,7 @@ jobs:
           for v in 1.4.0 2.0.0; do
             python -m venv "../../.venv-$v" && "../../.venv-$v/$( [ "$RUNNER_OS" = Windows ] && echo Scripts || echo bin )/python" -m pip install -q "duckdb==$v"
             "../../.venv-$v/$( [ "$RUNNER_OS" = Windows ] && echo Scripts || echo bin )/python" tests/test_vectors.py "dist/${{ matrix.platform }}/geosquare_v2.duckdb_extension"
+            "../../.venv-$v/$( [ "$RUNNER_OS" = Windows ] && echo Scripts || echo bin )/python" tests/test_registry.py "dist/${{ matrix.platform }}/geosquare_v2.duckdb_extension"
           done
 
       - uses: actions/upload-artifact@v4
@@ -136,7 +137,7 @@ jobs:
           else
             VERSIONS=$(echo "$DUCKDB_VERSIONS" | tr ',' ' ' | sed 's/v//g')
           fi
-          DUCKDB_VERSIONS="$VERSIONS" TESTS="tests/test_vectors.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py" tests/run_versions.sh
+          DUCKDB_VERSIONS="$VERSIONS" TESTS="tests/test_vectors.py tests/test_registry.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py" tests/run_versions.sh
       - name: DuckDB-Wasm in headless Chromium
         run: |
           python -m pip install -q duckdb==2.0.0
