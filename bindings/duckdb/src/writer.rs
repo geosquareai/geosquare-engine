@@ -84,6 +84,11 @@ pub struct Options {
     fill_nulls: bool,
     /// Aggregate the input cells to this ancestor level before writing (see rollup_query).
     rollup_level: Option<i64>,
+    /// value_semantics was passed (not the default), so it is not inherited.
+    value_semantics_given: bool,
+    /// (cell manifest, dataset_info) of the dataset being appended to or overwritten: its
+    /// metadata is kept unless this write passes other values.
+    prev: Option<(Json, Json)>,
     s3: S3Params,
 }
 
@@ -139,6 +144,8 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
             .to_ascii_lowercase(),
         fill_nulls: p.int("fill_nulls").is_none_or(|v| v != 0),
         rollup_level: p.int("rollup_level"),
+        value_semantics_given: p.text("value_semantics").is_some(),
+        prev: None,
         column_metrics: p
             .text("column_metrics")
             .unwrap_or_else(|| "auto".into())
@@ -548,6 +555,131 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
     ))
 }
 
+/// compact_cell_dataset(path, partition_level := <current>): rewrite a dataset in place with
+/// one sorted file per partition (merging the files of many appends), optionally at another
+/// partition level, keeping its metadata (value fields with units and rules, source,
+/// coverage, notes, title, description, period, version, column descriptions). Iceberg: one
+/// new snapshot; run expire_snapshots afterwards to delete the old files.
+pub fn plan_compact(p: &Params) -> Result<Plan, E> {
+    let path = p.pos_text(0, "path")?;
+    let partition_level = p.int("partition_level");
+    let s3 = s3_params(p);
+    Ok(Plan::Action(
+        Box::new(move || compact(&path, partition_level, &s3)),
+        ["layout", "location", "files", "rows"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    ))
+}
+
+/// The partition level a dataset is written with (from the manifest's storage.partitioning).
+fn current_partition_level(manifest: &Json) -> Option<i64> {
+    let level = manifest.get("level").and_then(Json::as_i64)? as u8;
+    for p in manifest
+        .pointer("/storage/partitioning")
+        .and_then(Json::as_array)?
+        .iter()
+        .filter_map(Json::as_str)
+    {
+        if let Some(l) = p.strip_prefix("gid_prefix:") {
+            return l.parse().ok();
+        }
+        if let Some(w) = p
+            .strip_prefix("iceberg:truncate(")
+            .and_then(|r| r.split(',').next())
+            .and_then(|w| w.parse::<i64>().ok())
+        {
+            return (1..=level)
+                .find(|pl| truncate_width(level, *pl) == w)
+                .map(i64::from);
+        }
+    }
+    None
+}
+
+fn compact(
+    path: &str,
+    partition_level: Option<i64>,
+    s3: &S3Params,
+) -> Result<Vec<Vec<Option<String>>>, E> {
+    let lease = sql::lease()?;
+    let root = path.trim_end_matches('/').to_string();
+    let src = dataset::open(&lease, &root)?;
+    let manifest = src
+        .manifest
+        .clone()
+        .ok_or("compact_cell_dataset needs a dataset with a cell manifest")?;
+    let info = dataset::dataset_info(&lease, &src)?;
+    let layout = match src.layout {
+        dataset::Layout::Flat => "flat",
+        dataset::Layout::Partitioned(_) => "partitioned",
+        dataset::Layout::Iceberg { .. } => "iceberg",
+    };
+    let text = |v: Option<&Json>| v.and_then(Json::as_str).map(str::to_string);
+    let descriptions: serde_json::Map<String, Json> = info
+        .get("columns")
+        .and_then(Json::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| {
+            v.get("description")
+                .filter(|d| d.is_string())
+                .map(|d| (k.clone(), d.clone()))
+        })
+        .collect();
+    let object = |v: Option<&Json>| v.and_then(Json::as_object).cloned();
+    let fields = manifest
+        .get("value_fields")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let o = Options {
+        layout: layout.into(),
+        mode: "overwrite".into(),
+        domain_code: text(manifest.get("domain_code")),
+        level: None,
+        partition_level: partition_level.or_else(|| current_partition_level(&manifest)),
+        row_group_size: 8192,
+        value_semantics: "MEASUREMENT".into(),
+        aggregation_rule: None,
+        value_fields: Some(fields.to_string()),
+        notes: text(manifest.pointer("/provenance/notes")),
+        identity: if manifest
+            .pointer("/identity/packed_id_column")
+            .is_some_and(Json::is_null)
+        {
+            "compact".into()
+        } else {
+            "query".into()
+        },
+        column_metrics: if fields.as_array().map_or(0, Vec::len) > 96 {
+            "key".into()
+        } else {
+            "auto".into()
+        },
+        extra: crate::metadata::Extra {
+            descriptions: crate::metadata::PerColumn::parse(
+                (!descriptions.is_empty()).then(|| Json::Object(descriptions).to_string()),
+                "column_descriptions",
+            )?,
+            title: text(info.get("title")),
+            description: text(info.get("description")),
+            data_period: text(info.get("data_period")),
+            data_version: text(info.get("data_version")),
+            source: object(manifest.get("source")),
+            coverage: object(manifest.get("coverage")),
+            ..Default::default()
+        },
+        fill_nulls: true,
+        rollup_level: None,
+        value_semantics_given: false,
+        prev: None,
+        s3: s3.clone(),
+    };
+    let query = format!("SELECT * FROM read_cell_dataset({})", lit(&root));
+    write(&query, &root, &o)
+}
+
 /// Stage the query sorted by packed_id and run the identity checks.
 fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
     let stage = stage_table();
@@ -819,8 +951,71 @@ fn manifest(
             "notes": o.notes
         }
     });
+    if let Some((prev, _)) = &o.prev {
+        inherit(&mut m, prev, o);
+    }
     crate::metadata::apply(&mut m, &o.extra)?;
     Ok(m)
+}
+
+/// Keep the metadata of the dataset being appended to or overwritten: per column (same name)
+/// unit, semantics and aggregation rule; source, coverage, notes and the provenance rules.
+/// What this write passes explicitly wins (units/source/coverage are applied afterwards).
+fn inherit(m: &mut Json, prev: &Json, o: &Options) {
+    if o.value_fields.is_none() {
+        let old: std::collections::HashMap<&str, &Json> = prev
+            .get("value_fields")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| Some((f.get("name")?.as_str()?, f)))
+            .collect();
+        if let Some(fields) = m.get_mut("value_fields").and_then(Json::as_array_mut) {
+            for f in fields {
+                let name = f
+                    .get("name")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let Some(p) = old.get(name.as_str()) else {
+                    continue;
+                };
+                let mut keys = vec!["unit"];
+                if !o.value_semantics_given {
+                    keys.push("semantics");
+                }
+                if o.aggregation_rule.is_none() {
+                    keys.push("aggregation_rule");
+                }
+                for k in keys {
+                    if let Some(v) = p.get(k) {
+                        f[k] = v.clone();
+                    }
+                }
+            }
+        }
+    }
+    for section in ["source", "coverage"] {
+        if let Some(v) = prev.get(section).filter(|v| v.is_object()) {
+            m[section] = v.clone();
+        }
+    }
+    let pv = |k: &str| prev.pointer(&format!("/provenance/{k}")).cloned();
+    if o.notes.is_none() {
+        if let Some(v) = pv("notes") {
+            m["provenance"]["notes"] = v;
+        }
+    }
+    if o.aggregation_rule.is_none() {
+        if let Some(v) = pv("aggregation_rule") {
+            m["provenance"]["aggregation_rule"] = v;
+        }
+    }
+    if !o.value_semantics_given {
+        if let Some(v) = pv("value_semantics") {
+            m["provenance"]["value_semantics"] = v;
+        }
+    }
 }
 
 /// DuckDB numeric column types (as DESCRIBE prints them).
@@ -927,6 +1122,17 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
     let root = path.trim_end_matches('/').to_string();
     let result = (|| -> Result<Vec<Vec<Option<String>>>, E> {
         let store = Storage::for_path(&lease, &root, &o.s3)?;
+        // Metadata of the dataset being appended to or overwritten, kept by default.
+        let mut o = o.clone();
+        if o.mode != "create" {
+            if let Ok(src) = dataset::open(&lease, &root) {
+                if let Some(m) = src.manifest.clone() {
+                    let info = dataset::dataset_info(&lease, &src).unwrap_or(Json::Null);
+                    o.prev = Some((m, info));
+                }
+            }
+        }
+        let o = &o;
         // Stage (read the whole input) before clearing the target: the input may read the
         // dataset being overwritten (update / delete by rewriting it).
         let rolled;
@@ -985,7 +1191,7 @@ fn write_flat(
     write_json(
         lease,
         &join(root, crate::metadata::INFO_FILE),
-        &crate::metadata::info(None, &m, &o.extra),
+        &crate::metadata::info(o.prev.as_ref().map(|(_, i)| i), &m, &o.extra),
     )?;
     Ok(vec![vec![
         Some("flat".into()),
@@ -1057,7 +1263,7 @@ fn write_partitioned(
     write_json(
         lease,
         &join(root, crate::metadata::INFO_FILE),
-        &crate::metadata::info(None, &m, &o.extra),
+        &crate::metadata::info(o.prev.as_ref().map(|(_, i)| i), &m, &o.extra),
     )?;
     // Partition index for readers that cannot list folders (plain HTTP).
     let list = serde_json::to_string(&prefixes)?;

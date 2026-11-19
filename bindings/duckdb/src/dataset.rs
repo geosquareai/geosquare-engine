@@ -965,20 +965,25 @@ fn describe_dataset(p: &Params) -> Result<(Source, Json, Json), E> {
     let lease = sql::lease()?;
     let src = open(&lease, &path)?;
     let manifest = src.manifest.clone().unwrap_or(Json::Null);
-    let info: Json = match &src.layout {
-        Layout::Iceberg { metadata } => metadata_json(&lease, metadata)?
+    let info = dataset_info(&lease, &src)?;
+    Ok((src, manifest, info))
+}
+
+/// The dataset_info document (title, description, period, version, column descriptions).
+pub fn dataset_info(lease: &Lease, src: &Source) -> Result<Json, E> {
+    Ok(match &src.layout {
+        Layout::Iceberg { metadata } => metadata_json(lease, metadata)?
             .pointer(&format!(
                 "/properties/{}",
                 crate::metadata::INFO_KEY.replace('/', "~1")
             ))
             .and_then(Json::as_str)
             .and_then(|t| serde_json::from_str(t).ok()),
-        _ => read_text(&lease, &join(&src.root, crate::metadata::INFO_FILE))
+        _ => read_text(lease, &join(&src.root, crate::metadata::INFO_FILE))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok()),
     }
-    .unwrap_or(Json::Null);
-    Ok((src, manifest, info))
+    .unwrap_or(Json::Null))
 }
 
 fn jlit(v: &Json) -> String {

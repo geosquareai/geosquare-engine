@@ -12,6 +12,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 | delete cells | rewrite without them, `mode := 'overwrite'` | rows to keep, `mode := 'overwrite'` |
 | add / drop / retype a column | `mode := 'overwrite'` | `mode := 'overwrite'` (new schema id; old snapshots readable) |
 | overview at a coarser level | `rollup_level := L` | `rollup_level := L` |
+| merge files / repartition, keep metadata | `compact_cell_dataset(path [, partition_level])` | same |
 | drop old snapshots and their files | - | `expire_snapshots(path, retain_last := N)` |
 | change the partition level | `mode := 'overwrite', partition_level := ...` | same (new partition spec) |
 
@@ -28,6 +29,9 @@ Rules of thumb:
   `overwrite` deletes the old files first, so readers can see a partial folder meanwhile;
   write to a new path and switch readers over if that matters.
 - Iceberg has no lock between writers: run one writer per table at a time.
+- `append` and `overwrite` keep the dataset's metadata (per column by name: unit, semantics,
+  aggregation rule, description; and source, coverage, notes, title, period, version).
+  Values passed to the write replace them; new columns start without metadata.
 - Large inserts into Iceberg: `append` in blocks of whole partitions (for example per 100 km
   or 500 km block of `packed_id`), so a partition is never split across appends.
 
@@ -166,6 +170,20 @@ SELECT * FROM write_cell_dataset('SELECT * FROM read_cell_dataset(''/data/w_ice'
   '/data/w_ice_1km', layout := 'iceberg', partition_level := 5, rollup_level := 9,
   aggregation_rule := '{"population": "sum", "workers": "sum", "non_workers": "sum"}');
 SELECT level, row_count FROM cell_dataset_info('/data/w_ice_1km');
+```
+
+## Compact a dataset
+
+`compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset in place with
+one sorted file per partition, merging the files many appends left, and keeps all its
+metadata. `partition_level` moves it to coarser partitions (fewer, larger files). The whole
+dataset is staged in memory, as for any write. Iceberg: one new snapshot; the old files stay
+until `expire_snapshots`.
+
+```sql
+SELECT * FROM compact_cell_dataset('/data/w_ice');
+SELECT * FROM compact_cell_dataset('/data/w_part', partition_level := 6);
+SELECT * FROM expire_snapshots('/data/w_ice');
 ```
 
 ## Clean up old snapshots (Iceberg)

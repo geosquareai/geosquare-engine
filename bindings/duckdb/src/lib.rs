@@ -221,6 +221,16 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("dry_run", Bool),
             ];
             ex.extend(s3_named());
+            let mut cp = vec![("partition_level", Int)];
+            cp.extend(s3_named());
+            sql::register(
+                con,
+                "compact_cell_dataset",
+                vec![Text],
+                cp,
+                writer::plan_compact,
+                pool.clone(),
+            )?;
             sql::register(
                 con,
                 "expire_snapshots",

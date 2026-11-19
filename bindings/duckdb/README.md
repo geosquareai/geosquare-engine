@@ -256,6 +256,9 @@ Lines follow `geosquare_v2.line_to_cells` (identical on test lines); a segment l
 an internal cell edge goes to the cell on its high side (spec 2.0 half-open rule), so the
 ratios of a line always sum to 1, whereas the Shapely oracle can count such a segment twice.
 
+`compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset with one file per
+partition and keeps its metadata.
+
 `expire_snapshots(path, retain_last := 1, older_than := NULL, orphan_age_hours := 24, dry_run := false)`
 drops old Iceberg snapshots and deletes the files only they used (see
 [docs/write-guide.md](docs/write-guide.md#clean-up-old-snapshots-iceberg)).
