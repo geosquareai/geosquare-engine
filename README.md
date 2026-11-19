@@ -9,7 +9,8 @@ Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. Al
 | WebAssembly / npm binding | Done | `bindings/wasm/` |
 | CRS: point to cell, cell to polygon | Phase 3 E8. Explicit datum operations for all 11 domains; VN provisional | `core/src/projection.rs`, `core/src/domain.rs`, `core/src/geo.rs` |
 | `points.json` and `projected.json` vectors | Pass for released domains. Blocked domains must refuse lon/lat | `vectors/spec-2.0/` |
-| DuckDB, Postgres, BigQuery bindings | Planned | - |
+| DuckDB extension (C API, DuckDB 1.4 to 2.0): grid functions, polyfill, cell datasets (flat, partitioned, Iceberg) | Done | `bindings/duckdb/` |
+| Postgres, BigQuery bindings | Planned | - |
 
 ## What this repo is
 
@@ -21,6 +22,7 @@ The calculation engine for GeoSquare V2. One set of rules runs in Rust, Python, 
 core/                 Rust core: codec, packing, topology, detector, grid CRS
 bindings/python/      Python package geosquare-engine (PyO3)
 bindings/wasm/        npm package geosquare-engine (WebAssembly)
+bindings/duckdb/      DuckDB loadable extension geosquare_v2 (C API)
 vectors/spec-2.0/     Copy of the spec 2.0 test vectors
 .github/workflows/    CI: vectors, core, Python, WASM
 ```

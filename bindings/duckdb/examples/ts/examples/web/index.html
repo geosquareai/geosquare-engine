@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="id">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeoSquare V2 cells in the browser</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; max-width: 960px; }
+  label { display: block; margin-top: 8px; font-weight: 600; }
+  input, textarea { width: 100%; box-sizing: border-box; font: 13px ui-monospace, monospace; }
+  button { margin: 12px 8px 0 0; }
+  pre { background: #f4f4f4; padding: 8px; overflow: auto; max-height: 360px; }
+</style>
+<h1>GeoSquare V2 cells (DuckDB-Wasm)</h1>
+<label>Extension (.wasm or repository URL) <input id="ext" value="/www/geosquare_v2.duckdb_extension.wasm"></label>
+<label>Dataset (http(s):// or s3://) <input id="path" value="/www/data/iceberg"></label>
+<label>Area: bbox "xmin,ymin,xmax,ymax", WKT, or GeoJSON geometry
+  <textarea id="area" rows="3">106.82,-6.18,106.83,-6.17</textarea></label>
+<label>Columns (comma separated) <input id="cols" value="population,workers"></label>
+<button id="sum">Total</button><button id="km">1 km roll-up</button><button id="geo">Download GeoJSON</button>
+<pre id="out">loading DuckDB-Wasm…</pre>
+<script type="module" src="/www/demo.js"></script>
+</html>
