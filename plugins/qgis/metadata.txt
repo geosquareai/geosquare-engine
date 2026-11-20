@@ -1,6 +1,6 @@
 [general]
 name=GeoSquare E14
-qgisMinimumVersion=3.44
+qgisMinimumVersion=4.0
 description=Create WGS84 cell layers from GeoSquare GIDs and roll them up to an ancestor level.
 about=Internal analysis plugin for GeoSquare V2. v1 creates in-memory layers only and does not implement k-anonymity.
 version=1.0.0
