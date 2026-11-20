@@ -185,8 +185,8 @@ try:
 
     # 3. Invalid GID shows an error and adds no layer
     FakeMessageBox.shown = []
-    before = len(QgsProject.instance().mapLayers())
     bad = make_source([("not-a-gid", 1.0)])
+    before = len(QgsProject.instance().mapLayers())
     FakeInputDialog.item_answers = ["gid", "ID (released)"]
     iface.setActiveLayer(bad)
     adapter.add_cells_from_gid(iface)
