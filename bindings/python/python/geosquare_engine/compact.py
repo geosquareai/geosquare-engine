@@ -103,9 +103,13 @@ def expand(gids: Iterable[str], level: int) -> frozenset[str]:
 
 
 def contains(gids: Iterable[str], gid: str) -> bool:
-    """Return whether ``gid`` is covered: stored exactly, or under a stored ancestor."""
+    """Return whether ``gid`` is covered: stored exactly, or under a stored ancestor.
+
+    Pass a set or frozenset to avoid rebuilding the set on every call. A join over
+    many cells needs that.
+    """
     _level(gid)
-    members = set(gids)
+    members = gids if isinstance(gids, (set, frozenset)) else set(gids)
     if gid in members:
         return True
     return any(ancestor in members for ancestor in _ancestors(gid))

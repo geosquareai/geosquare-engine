@@ -60,3 +60,9 @@ def test_root_and_leaf_edges_follow_the_core():
     assert len(compact.expand([root], 2)) == 100
     with pytest.raises(compact.CompactSetError):
         compact.child_gids("2" * 14)
+
+
+def test_contains_accepts_a_prebuilt_set():
+    members = frozenset({encode(1, 0, 0)})
+    assert compact.contains(members, encode(2, 0, 0))
+    assert not compact.contains(members, encode(1, 1, 0))
