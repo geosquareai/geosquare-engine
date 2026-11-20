@@ -3,7 +3,8 @@
 # DuckDB-Wasm in headless Chromium loads build/<platform>/geosquare_v2.duckdb_extension.wasm in
 # every bundle and must return the same results:
 #   DuckDB-Wasm dev (DuckDB 2.0):  base -> wasm_eh, threads -> wasm_threads
-#   DuckDB-Wasm 1.32.0 (DuckDB 1.4): mvp -> wasm_mvp, eh -> wasm_eh, coi -> wasm_threads
+#   DuckDB-Wasm 1.31.0 (DuckDB 1.4.0) and 1.32.0 (DuckDB 1.4.3):
+#                                  mvp -> wasm_mvp, eh -> wasm_eh, coi -> wasm_threads
 # The page is served with COOP/COEP headers (the threads bundles need SharedArrayBuffer). In the
 # threads bundles DuckDB's own parquet extension does not load from extensions.duckdb.org (a
 # non-shared-memory build), so there only the checks without Parquet run.
@@ -13,12 +14,14 @@ cd "$(dirname "$0")"
 EXT_DIR="$(cd ../.. && pwd)"
 PYTHON="${PYTHON:-python3}"
 PORT="${PORT:-8799}"
-OLD_PKG=1.32.0
+OLD_PKGS="1.31.0 1.32.0"
 [ -d node_modules ] || npm install --silent
-if [ ! -d "pkgs/$OLD_PKG/package/dist" ]; then
-  mkdir -p "pkgs/$OLD_PKG"
-  (cd "pkgs/$OLD_PKG" && npm pack --silent "@duckdb/duckdb-wasm@$OLD_PKG" >/dev/null && tar xzf duckdb-duckdb-wasm-$OLD_PKG.tgz)
-fi
+for pkg in $OLD_PKGS; do
+  if [ ! -d "pkgs/$pkg/package/dist" ]; then
+    mkdir -p "pkgs/$pkg"
+    (cd "pkgs/$pkg" && npm pack --silent "@duckdb/duckdb-wasm@$pkg" >/dev/null && tar xzf duckdb-duckdb-wasm-$pkg.tgz)
+  fi
+done
 rm -rf www build && mkdir -p www build
 for p in wasm_eh wasm_mvp wasm_threads; do
   [ -f "$EXT_DIR/build/$p/geosquare_v2.duckdb_extension.wasm" ] || { echo "missing build/$p (PLATFORM=all ./build_wasm.sh)" >&2; exit 1; }
@@ -56,7 +59,9 @@ exp["multi"] = s(c.execute(f"SELECT count(*), round(sum(flat__population + icebe
 json.dump(exp, open(f"{www}/expected.json", "w"), indent=1)
 PY
 fail=0
-for combo in "dev base wasm_eh" "dev threads wasm_threads" "$OLD_PKG mvp wasm_mvp" "$OLD_PKG eh wasm_eh" "$OLD_PKG coi wasm_threads"; do
+COMBOS=("dev base wasm_eh" "dev threads wasm_threads")
+for pkg in $OLD_PKGS; do COMBOS+=("$pkg mvp wasm_mvp" "$pkg eh wasm_eh" "$pkg coi wasm_threads"); done
+for combo in "${COMBOS[@]}"; do
   set -- $combo
   echo "== DuckDB-Wasm $1, bundle $2, extension $3"
   # one retry: the coi/threads bundles occasionally stall while starting their pthread workers

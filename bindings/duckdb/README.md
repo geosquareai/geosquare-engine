@@ -300,8 +300,8 @@ partition and keeps its metadata.
 drops old Iceberg snapshots and deletes the files only they used (see
 [docs/write-guide.md](docs/write-guide.md#clean-up-old-snapshots-iceberg)).
 
-`query_cell_datasets([path, ...], ...)` queries several datasets over one area and joins them per
-cell (same parameters as `query_cell_dataset`, plus `fill_nulls`).
+`query_cell_datasets([path, ...], ...)` (or `query_cell_dataset([path, ...], ...)`) queries several
+datasets over one area and joins them per cell (same parameters as `query_cell_dataset`, plus `fill_nulls`).
 
 `read_cell_dataset` / `query_cell_dataset` take `rollup_level := L` for one row per level-L
 ancestor cell (1 km = 9, 10 km = 7), each value column aggregated by its manifest

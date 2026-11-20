@@ -8,7 +8,13 @@ const fs = require("fs");
   const page = await browser.newPage();
   page.on("pageerror", (e) => console.log("pageerror:", e.message));
   await page.goto(url);
-  await page.waitForFunction(() => window.__results, null, { timeout: 180000 });
+  try {
+    await page.waitForFunction(() => window.__results, null, { timeout: 180000 });
+  } catch (e) {
+    const steps = await page.evaluate(() => window.__progress || []).catch(() => []);
+    await browser.close();
+    throw new Error(`${e.message} (stalled at: ${steps.slice(-1)[0] || "page load"})`);
+  }
   const got = await page.evaluate(() => window.__results);
   console.log(`chromium ${await browser.version()}, DuckDB-Wasm ${got.duckdb} (${got.platform})`);
   await browser.close();

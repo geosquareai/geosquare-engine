@@ -969,6 +969,12 @@ fn query_polygon(p: &Params, d: &Domain, level: u8) -> Result<(String, String, f
 ///
 /// `bbox` behaves like a polygon (every cell overlapping the projected envelope).
 pub fn plan_query(p: &Params) -> Result<Plan, E> {
+    if let Some(Param::List(_)) = p.positional.first() {
+        return plan_query_multi(p);
+    }
+    if p.get("fill_nulls").is_some() {
+        return Err("fill_nulls is for several datasets: query_cell_dataset([path, ...])".into());
+    }
     let path = p.pos_text(0, "path")?;
     let (plan, ctx) = plan_query_cells(p, &path)?;
     let plan = add_rollup(plan, p, &ctx)?;

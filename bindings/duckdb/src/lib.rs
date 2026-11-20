@@ -125,16 +125,17 @@ unsafe fn register_dataset_functions(
                 ("rollup_level", Int),
                 ("rollup_rule", Text),
             ]);
+            let mut qm = q;
+            qm.push(("fill_nulls", Bool));
+            // query_cell_dataset(path | [path, ...]): a list behaves as query_cell_datasets.
             sql::register(
                 con,
                 "query_cell_dataset",
-                vec![Text],
-                q.clone(),
+                vec![TextOrList],
+                qm.clone(),
                 dataset::plan_query,
                 pool.clone(),
             )?;
-            let mut qm = q;
-            qm.push(("fill_nulls", Bool));
             sql::register(
                 con,
                 "query_cell_datasets",
@@ -143,6 +144,7 @@ unsafe fn register_dataset_functions(
                 dataset::plan_query_multi,
                 pool.clone(),
             )?;
+
             let mut w = identity.clone();
             w.extend([
                 ("layout", Text),

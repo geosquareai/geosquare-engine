@@ -274,6 +274,8 @@ pub enum Kind {
     Float,
     FloatList,
     TextList,
+    /// ANY: a VARCHAR or a list of VARCHAR (read as Param::Text or Param::List).
+    TextOrList,
 }
 
 impl Kind {
@@ -296,6 +298,7 @@ impl Kind {
                     duckdb_destroy_logical_type(&mut child);
                     l
                 }
+                Kind::TextOrList => duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_ANY),
             }
         }
     }
@@ -326,6 +329,25 @@ impl Kind {
                             items.push(Kind::Float.read(c));
                         }
                         Param::List(items)
+                    }
+                    Kind::TextOrList => {
+                        let mut t = duckdb_get_value_type(v);
+                        let id = duckdb_get_type_id(t);
+                        let _ = &mut t; // borrowed from the value: not destroyed here
+                        if id == DUCKDB_TYPE_DUCKDB_TYPE_LIST {
+                            let n = duckdb_get_list_size(v);
+                            let mut items = Vec::with_capacity(n as usize);
+                            for i in 0..n {
+                                let c = duckdb_get_list_child(v, i);
+                                items.push(Kind::Text.read(c));
+                            }
+                            Param::List(items)
+                        } else {
+                            let s = duckdb_get_varchar(v);
+                            let t = take_cstr(s);
+                            duckdb_free(s as *mut c_void);
+                            Param::Text(t)
+                        }
                     }
                     Kind::TextList => {
                         let n = duckdb_get_list_size(v);

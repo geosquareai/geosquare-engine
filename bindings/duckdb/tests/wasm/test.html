@@ -24,13 +24,19 @@ const bundles = {
 const results = {};
 try {
   const b = bundles[bundleName];
+  window.__progress = ["instantiate"];
   const db = new duckdb.AsyncDuckDB(new duckdb.VoidLogger(), new Worker(dist + b.mainWorker));
   await db.instantiate(dist + b.mainModule, b.pthreadWorker ? dist + b.pthreadWorker : undefined);
   await db.open({ allowUnsignedExtensions: true });
   const c = await db.connect();
-  const one = async (s) => Object.values((await c.query(s)).toArray()[0].toJSON()).map((v) => (v === null ? null : String(v)));
+  window.__progress = [];
+  const one = async (s) => { window.__progress.push(s.slice(0, 70)); return Object.values((await c.query(s)).toArray()[0].toJSON()).map((v) => (v === null ? null : String(v))); };
   results.duckdb = (await one("SELECT version()"))[0];
   results.platform = (await one("SELECT platform FROM pragma_platform()"))[0];
+  // Threads bundles: keep queries on one thread (see examples/ts/src/web.ts); a pool thread
+  // can otherwise run extension code before it picked up the module and hang.
+  if (b.pthreadWorker) await c.query("SET threads = 1");
+  window.__progress.push("LOAD");
   await c.query(`LOAD '${location.origin}/build/${ext}/geosquare_v2.duckdb_extension.wasm'`);
   results.point_to_cell = (await one("SELECT point_to_cell('ID', 106.894082, -6.26109, 12).gid"))[0];
   results.v1_gid = await one("SELECT v1_gid_to_cell('ID', lonlat_to_v1_gid(106.8272, -6.1754, 12), 12).gid, octet_length(cell_to_wkb('ID', point_to_cell('ID', 106.8, -6.2, 12).gid))");

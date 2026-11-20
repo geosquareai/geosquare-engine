@@ -217,7 +217,8 @@ SELECT gid, population, cell_count
 FROM read_cell_dataset('/data/pop_part', rollup_level := 7, rollup_rule := 'max');
 ```
 
-Several datasets over one area in one call: `query_cell_datasets([path, ...], ...)` takes
+Several datasets over one area in one call: `query_cell_datasets([path, ...], ...)` (or
+`query_cell_dataset` with a list of paths) takes
 the parameters of `query_cell_dataset` and returns one row per cell (or per `rollup_level`
 cell) with the value columns of every dataset. A column name that two datasets share is
 prefixed with the dataset folder (`pop_flat__population`); a cell missing from a dataset has
