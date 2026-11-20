@@ -24,6 +24,11 @@ for p in wasm_eh wasm_mvp wasm_threads; do
 done
 python3 scripts/make_repository.py --artifacts dist --out repo --versions auto
 aws s3 sync repo "$DEST/" --exclude "*" --include "*.duckdb_extension.gz" --content-type application/octet-stream
-aws s3 sync repo "$DEST/" --exclude "*" --include "*.wasm" --content-type application/wasm
+# Wasm builds are stored gzip-compressed with Content-Encoding: gzip (about 60% smaller);
+# browsers decompress them transparently, the path and name stay the same.
+rm -rf repo_wasm_gz && mkdir repo_wasm_gz
+(cd repo && find . -name '*.wasm' | while read -r f; do mkdir -p "../repo_wasm_gz/$(dirname "$f")"; gzip -9 -n -c "$f" > "../repo_wasm_gz/$f"; done)
+aws s3 sync repo_wasm_gz "$DEST/" --exclude "*" --include "*.wasm" --content-type application/wasm --content-encoding gzip
+rm -rf repo_wasm_gz
 aws s3 cp repo/index.json "$DEST/index.json" --content-type application/json
 echo "published $(find repo -type f | wc -l) files to $DEST"

@@ -196,5 +196,9 @@ jobs:
           PREFIX: ${{ vars.EXTENSION_REPO_PREFIX }}
         run: |
           if [ -z "$BUCKET" ]; then echo "EXTENSION_REPO_BUCKET is not set; skipping"; exit 0; fi
-          aws s3 sync repo "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/octet-stream --exclude index.json
+          aws s3 sync repo "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/octet-stream --exclude index.json --exclude "*.wasm"
+          # Wasm builds gzip-compressed with Content-Encoding: gzip (browsers decompress them)
+          mkdir repo_wasm_gz
+          (cd repo && find . -name '*.wasm' | while read -r f; do mkdir -p "../repo_wasm_gz/$(dirname "$f")"; gzip -9 -n -c "$f" > "../repo_wasm_gz/$f"; done)
+          aws s3 sync repo_wasm_gz "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/wasm --content-encoding gzip
           aws s3 cp repo/index.json "s3://$BUCKET/${PREFIX:+$PREFIX/}index.json" --content-type application/json

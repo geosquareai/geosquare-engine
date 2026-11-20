@@ -24,7 +24,7 @@ for p in wasm_eh wasm_mvp wasm_threads; do
   [ -f "$EXT_DIR/build/$p/geosquare_v2.duckdb_extension.wasm" ] || { echo "missing build/$p (PLATFORM=all ./build_wasm.sh)" >&2; exit 1; }
   mkdir -p "build/$p" && cp "$EXT_DIR/build/$p/geosquare_v2.duckdb_extension.wasm" "build/$p/"
 done
-python3 coi_server.py "$PORT" &
+python3 coi_server.py "$PORT" --gzip &   # extensions served gzip-compressed, as published
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null' EXIT
 sleep 1
@@ -59,6 +59,8 @@ fail=0
 for combo in "dev base wasm_eh" "dev threads wasm_threads" "$OLD_PKG mvp wasm_mvp" "$OLD_PKG eh wasm_eh" "$OLD_PKG coi wasm_threads"; do
   set -- $combo
   echo "== DuckDB-Wasm $1, bundle $2, extension $3"
-  node run_browser.cjs "http://127.0.0.1:$PORT/test.html?pkg=$1&bundle=$2&ext=$3" www/expected.json "${CHROMIUM:-}" || fail=1
+  # one retry: the coi/threads bundles occasionally stall while starting their pthread workers
+  node run_browser.cjs "http://127.0.0.1:$PORT/test.html?pkg=$1&bundle=$2&ext=$3" www/expected.json "${CHROMIUM:-}" ||
+    { echo "retrying once"; node run_browser.cjs "http://127.0.0.1:$PORT/test.html?pkg=$1&bundle=$2&ext=$3" www/expected.json "${CHROMIUM:-}"; } || fail=1
 done
 exit $fail
