@@ -348,17 +348,24 @@ fn identity(src: &Source, p: &Params) -> Result<(&'static Domain, u8), E> {
         .int("level")
         .or_else(|| src.manifest.as_ref()?.get("level")?.as_i64())
         .ok_or("level is unknown: the dataset has no manifest, pass level := ...")?;
-    let d = crate::grid::domain_by_code(&code)?;
+    let current = crate::grid::domain_by_code(&code)?;
+    // The dataset's own profile picks the datum step: 2.2.0 or the legacy 2.1.0 of geosquare-v2 1.0.0.
+    let profile = src
+        .manifest
+        .as_ref()
+        .and_then(|m| m.get("profile_version"))
+        .and_then(Json::as_str);
+    let d = match profile {
+        None => current,
+        Some(pv) => geosquare_core::domain::by_code_for_profile(&code, pv).ok_or_else(|| {
+            format!(
+                "dataset profile_version {pv:?} is not supported; this engine reads {:?} and {:?}",
+                geosquare_core::domain::PROFILE_VERSION,
+                geosquare_core::domain::LEGACY_PROFILE_VERSION
+            )
+        })?,
+    };
     if let Some(m) = &src.manifest {
-        if let Some(pv) = m.get("profile_version").and_then(Json::as_str) {
-            if pv != geosquare_core::domain::PROFILE_VERSION {
-                return Err(format!(
-                    "dataset profile_version {pv:?} does not match the engine profile {:?}",
-                    geosquare_core::domain::PROFILE_VERSION
-                )
-                .into());
-            }
-        }
         if let Some(id) = m.get("domain_id").and_then(Json::as_i64) {
             if id != d.id as i64 {
                 return Err(
@@ -559,7 +566,8 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
             )
         }
         geom::Geometry::Points(points) => {
-            let cells = crate::lines::points_to_cells(d, &points, level, &crs)?;
+            let allow_candidate = p.int("allow_candidate_crs").unwrap_or(0) != 0;
+            let cells = crate::lines::points_to_cells(d, &points, level, &crs, allow_candidate)?;
             let rows: Vec<String> = cells
                 .iter()
                 .map(|(c, n)| {
