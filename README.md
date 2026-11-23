@@ -72,6 +72,16 @@ For Python, see `bindings/python/README.md`.
 - Vectors: `geosquare-v2/conformance/spec-2.0/`.
 - Phase plan: the `plan/` folder in the workspace.
 
+## Documentation
+
+The full guide is in [`docs/`](docs/README.md):
+
+- [Concepts](docs/concepts.md): GIDs, levels, domains, packed IDs, errors.
+- [Python API](docs/python-api.md): every function, with examples.
+- [Compact cell sets](docs/compact-sets.md): mixed-level areas.
+- [Development](docs/development.md): build, test, and CI.
+- [Release](docs/release.md): how to publish a Python version.
+
 ---
 
 # Bahasa Indonesia
