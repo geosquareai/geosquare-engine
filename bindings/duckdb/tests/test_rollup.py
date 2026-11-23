@@ -49,13 +49,16 @@ for layout in ("flat", "partitioned", "iceberg"):
     # an area without data: no rows, same columns
     assert c.execute("SELECT count(*) FROM query_cell_dataset(?, bbox := [110.0, -7.0, 110.01, -6.99], rollup_level := 9)", [p]).fetchone()[0] == 0
 
-for bad, msg in (("rollup_level := 13", "between 0 and the dataset level"), ("rollup_rule := 'sum'", "needs rollup_level"),
-                 ("rollup_level := 9, rollup_rule := '{\"people\": \"median\"}'", "cannot apply")):
+for bad, msg in (("rollup_level := 13", "between 0 and the dataset level"), ("rollup_rule := 'sum'", "needs rollup_level"),):
     try:
         c.execute(f"SELECT * FROM query_cell_dataset(?, geometry := ?, {bad})", [f"{d}/flat", AREA])
         raise AssertionError(f"{bad}: no error")
     except duckdb.Error as e:
         assert msg in str(e), (bad, e)
+# median is a valid rule for a query rollup: one row per parent, values from its children
+med = c.execute("SELECT count(*), count(people) FROM query_cell_dataset(?, geometry := ?, rollup_level := 9, "
+                "rollup_rule := '{\"people\": \"median\"}')", [f"{d}/flat", AREA]).fetchone()
+assert med[0] > 0 and med[1] <= med[0], med
 try:
     c.execute("SELECT * FROM query_cell_dataset(?, geometry := 'POINT (106.81 -6.20)', rollup_level := 9)", [f"{d}/flat"])
     raise AssertionError("points: no error")

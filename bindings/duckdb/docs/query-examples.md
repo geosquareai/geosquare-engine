@@ -199,11 +199,13 @@ FROM query_cell_dataset('/data/pop_ice', geometry := getvariable('tile_wkt'), wi
 A level-L ancestor's gid is the first L characters of the gid: level 9 = 1 km, 7 = 10 km,
 6 = 50 km, 5 = 100 km. `rollup_level := L` returns one row per level-L cell directly. Each
 value column is aggregated by its `aggregation_rule` from the cell manifest (`sum`: sum
-weighted by `coverage_ratio`, `mean`: weighted mean, `min`, `max`; without a rule COUNT
+weighted by `coverage_ratio`, `mean`: weighted mean, `min`, `max`, `median`: the plain median
+of the children, NULL with fewer than 3 children; without a rule COUNT
 columns are summed and the others averaged). The result has `gid` and `packed_id` of the
 level-L cell, the value columns, `cell_count` (dataset cells in it) and, for an area, the
 level-L cell's own `coverage_ratio` (its share inside the area). `rollup_rule` overrides the
-rule: one word for every column or `{"column or pattern*": "sum" | "mean" | "min" | "max"}`.
+rule: one word for every column or `{"column or pattern*": "sum" | "mean" | "min" | "max" | "median"}`.
+A rollup value with no child data stays NULL. It is not filled with 0.
 
 ```sql
 -- 1 km overview of an area, with the 1 km outlines
