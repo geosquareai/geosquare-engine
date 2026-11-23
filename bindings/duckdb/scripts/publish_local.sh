@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Build what this machine can build, lay out the extension repository for every DuckDB release
-# from 1.4.0, and sync it to S3 (default s3://geosquare-static/geosquare-v2).
+# Build every platform on this Linux machine, lay out the extension repository for every
+# DuckDB release from 1.4.0, and sync it to S3 (default s3://geosquare-static/geosquare-v2).
 #   scripts/publish_local.sh [s3://bucket/prefix]
-# Needs: rust targets x86_64/aarch64-unknown-linux-gnu, cargo-zigbuild + zig (Linux builds
-# against glibc 2.28, so they load on RHEL 8 / Debian 10 / Ubuntu 18.10 and newer), emcc
-# and Rust nightly with rust-src (wasm_eh, wasm_mvp, wasm_threads), the AWS CLI with write access to the bucket. macOS and Windows come from
-# .github/workflows/duckdb-release.yml.
+# Needs: cargo-zigbuild + zig, Rust targets x86_64/aarch64-unknown-linux-gnu,
+# x86_64-pc-windows-gnu, x86_64/aarch64-apple-darwin, emcc and Rust nightly with rust-src
+# (Wasm), the AWS CLI with write access to the bucket.
+#   linux_amd64/arm64  glibc 2.28 (RHEL 8 / Debian 10 / Ubuntu 18.10 and newer)
+#   windows_amd64      MinGW build; imports only Windows system DLLs (Windows 10+)
+#   osx_amd64/arm64    macOS 11+, linked against a CoreFoundation stub (scripts/macos-stubs,
+#                      the 7 functions chrono/iana-time-zone use; macOS has the real
+#                      framework). Built without the native S3 client (no macOS SDK here):
+#                      reading S3 through httpfs works, writing/maintaining S3 tables does not.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DEST="${1:-s3://geosquare-static/geosquare-v2}"
@@ -16,6 +21,19 @@ for pair in "x86_64-unknown-linux-gnu.2.28 linux_amd64" "aarch64-unknown-linux-g
   cargo zigbuild --release --target "$1"
   mkdir -p "dist/$2"
   python3 scripts/append_extension_metadata.py -l "target/${1%.2.28}/release/libgeosquare_v2.so" \
+    -n geosquare_v2 -p "$2" -dv v1.2.0 -ev "v$VERSION" -o "dist/$2/geosquare_v2.duckdb_extension" >/dev/null
+done
+cargo zigbuild --release --target x86_64-pc-windows-gnu
+mkdir -p dist/windows_amd64
+python3 scripts/append_extension_metadata.py -l target/x86_64-pc-windows-gnu/release/geosquare_v2.dll \
+  -n geosquare_v2 -p windows_amd64 -dv v1.2.0 -ev "v$VERSION" -o dist/windows_amd64/geosquare_v2.duckdb_extension >/dev/null
+for pair in "aarch64-apple-darwin osx_arm64" "x86_64-apple-darwin osx_amd64"; do
+  set -- $pair
+  env MACOSX_DEPLOYMENT_TARGET=11.0 \
+    "CARGO_TARGET_$(echo "$1" | tr 'a-z-' 'A-Z_')_RUSTFLAGS=-C link-arg=-F$PWD/scripts/macos-stubs" \
+    cargo zigbuild --release --target "$1" --no-default-features
+  mkdir -p "dist/$2"
+  python3 scripts/append_extension_metadata.py -l "target/$1/release/libgeosquare_v2.dylib" \
     -n geosquare_v2 -p "$2" -dv v1.2.0 -ev "v$VERSION" -o "dist/$2/geosquare_v2.duckdb_extension" >/dev/null
 done
 PLATFORM=all ./build_wasm.sh
