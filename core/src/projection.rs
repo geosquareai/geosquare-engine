@@ -57,6 +57,28 @@ pub enum Projection {
     },
 }
 
+/// Parameters of one coordinate-frame (Helmert) operation. Rotations use arc-seconds; scale
+/// uses ppm. `inverse` applies the operation backwards, as PROJ's `inv` step does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameParams {
+    pub x_m: f64,
+    pub y_m: f64,
+    pub z_m: f64,
+    pub rx_arcsec: f64,
+    pub ry_arcsec: f64,
+    pub rz_arcsec: f64,
+    pub scale_ppm: f64,
+    pub inverse: bool,
+}
+
+/// A frame operation that applies only inside `area`, given as `[west, south, east, north]`
+/// in degrees of WGS84 longitude and latitude.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AreaFrame {
+    pub area: [f64; 4],
+    pub frame: FrameParams,
+}
+
 /// A WGS84-to-grid geodetic operation. Rotations use arc-seconds; scale uses ppm.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DatumOperation {
@@ -76,6 +98,28 @@ pub enum DatumOperation {
         scale_ppm: f64,
         inverse: bool,
     },
+    /// Legacy (profile 2.1.0) choice. PROJ 9.5.1 chose one operation per point: `first` where
+    /// the WGS84 point lies in its area, else `second` in its area, else no shift.
+    AreaFrames {
+        first: AreaFrame,
+        second: Option<AreaFrame>,
+    },
+}
+
+impl DatumOperation {
+    /// The coordinate-frame operation with these parameters.
+    pub const fn frame(p: FrameParams) -> Self {
+        DatumOperation::CoordinateFrame {
+            x_m: p.x_m,
+            y_m: p.y_m,
+            z_m: p.z_m,
+            rx_arcsec: p.rx_arcsec,
+            ry_arcsec: p.ry_arcsec,
+            rz_arcsec: p.rz_arcsec,
+            scale_ppm: p.scale_ppm,
+            inverse: p.inverse,
+        }
+    }
 }
 
 /// A projected CRS: an ellipsoid, a datum operation, a projection, and false offsets.
@@ -198,11 +242,30 @@ impl DatumOperation {
         if matches!(self, DatumOperation::None) {
             return (lon_deg, lat_deg);
         }
+        if let DatumOperation::AreaFrames { first, second } = self {
+            return match choose_area_frame(
+                first,
+                second,
+                lon_deg,
+                lat_deg,
+                target,
+                inverse_direction,
+            ) {
+                Some(frame) => DatumOperation::frame(frame).transform(
+                    lon_deg,
+                    lat_deg,
+                    target,
+                    inverse_direction,
+                ),
+                None => (lon_deg, lat_deg),
+            };
+        }
         let input_ellipsoid = if inverse_direction { target } else { WGS84 };
         let output_ellipsoid = if inverse_direction { WGS84 } else { target };
         let (mut x, mut y, mut z) = geodetic_to_cartesian(input_ellipsoid, lon_deg, lat_deg);
         match self {
-            DatumOperation::None => unreachable!(),
+            DatumOperation::None | DatumOperation::AreaFrames { .. } => unreachable!(),
+
             DatumOperation::GeocentricTranslation { x_m, y_m, z_m } => {
                 if inverse_direction {
                     x -= x_m;
@@ -267,6 +330,36 @@ fn cartesian_to_geodetic(ellipsoid: Ellipsoid, x: f64, y: f64, z: f64) -> (f64, 
         latitude = next;
     }
     (y.atan2(x).to_degrees(), latitude.to_degrees())
+}
+
+/// The frame that applies at this point for an `AreaFrames` operation, or `None` for no shift.
+///
+/// Forward, the area is tested on the WGS84 input. Inverse, the area is tested on the WGS84
+/// point that each frame's inverse gives, which is the point PROJ tests for the same choice.
+fn choose_area_frame(
+    first: AreaFrame,
+    second: Option<AreaFrame>,
+    lon_deg: f64,
+    lat_deg: f64,
+    target: Ellipsoid,
+    inverse_direction: bool,
+) -> Option<FrameParams> {
+    let inside = |candidate: AreaFrame| -> bool {
+        let (lon, lat) = if inverse_direction {
+            DatumOperation::frame(candidate.frame).transform(lon_deg, lat_deg, target, true)
+        } else {
+            (lon_deg, lat_deg)
+        };
+        let [west, south, east, north] = candidate.area;
+        (west..=east).contains(&lon) && (south..=north).contains(&lat)
+    };
+    if inside(first) {
+        return Some(first.frame);
+    }
+    match second {
+        Some(candidate) if inside(candidate) => Some(candidate.frame),
+        _ => None,
+    }
 }
 
 fn coordinate_frame(
