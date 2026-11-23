@@ -18,6 +18,7 @@ mod maintenance;
 mod metadata;
 mod polyfill;
 mod raster;
+mod registry;
 mod sql;
 mod storage;
 mod tables;
@@ -120,6 +121,7 @@ unsafe fn register_dataset_functions(
                 ("source_crs", Text),
                 ("coverage_mode", Text),
                 ("max_candidate_limit", Int),
+                ("allow_candidate_crs", Bool),
                 ("with_geometry", Text),
                 ("geometry_crs", Text),
                 ("rollup_level", Int),

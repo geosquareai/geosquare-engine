@@ -1,8 +1,8 @@
 //! CRS parity: lon/lat to GID against `points.json`, which the Python oracle generated with
 //! pyproj 3.7.1 (PROJ 9.5.1).
 //!
-//! A domain whose explicit datum operation is blocked must refuse lon/lat, so it never
-//! returns a cell based on an unapproved operation.
+//! A domain whose CRS is not released must refuse lon/lat by default, so it never returns
+//! a cell without an explicit candidate opt-in.
 
 use geosquare_core::codec;
 use geosquare_core::domain;
@@ -64,10 +64,12 @@ fn released_domains_match_pyproj_at_every_listed_level() {
         }
     }
 
-    eprintln!(
-        "blocked explicit datum operations: {:?}",
-        domain::CRS_DOMAINS_BLOCKED
-    );
+    let candidates: Vec<&str> = domain::DOMAINS
+        .iter()
+        .filter(|domain| !domain.crs_released())
+        .map(|domain| domain.code)
+        .collect();
+    eprintln!("candidate CRS domains: {:?}", candidates);
     assert!(
         failures.is_empty(),
         "parity failures:\n{}",
@@ -75,7 +77,7 @@ fn released_domains_match_pyproj_at_every_listed_level() {
     );
     assert_eq!(
         released_checked.len(),
-        12,
-        "all 11 domains plus one extra ID case have released operations"
+        7,
+        "six released domains plus one extra ID case have released operations"
     );
 }

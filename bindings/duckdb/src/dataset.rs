@@ -412,8 +412,19 @@ fn add_geometry(plan: Plan, p: &Params, domain_code: Option<&str>) -> Result<Pla
     }
     let crs = p.text("geometry_crs").unwrap_or_else(|| "EPSG:4326".into());
     let code = domain_code.ok_or("with_geometry needs the domain: pass domain_code := '<code>' (the dataset has no cell manifest)")?;
+    let allow_candidate = p.int("allow_candidate_crs").unwrap_or(0) != 0;
     let expr = if format == "wkb" {
+        if allow_candidate {
+            return Err("allow_candidate_crs is not supported with with_geometry := 'wkb'; use 'wkt' or 'geojson'".into());
+        }
         format!("cell_to_wkb({}, gid, {})", lit(code), lit(&crs))
+    } else if allow_candidate {
+        format!(
+            "cell_to_geometry({}, gid, {}, {}, true)",
+            lit(code),
+            lit(&crs),
+            lit(&format)
+        )
     } else {
         format!(
             "cell_to_geometry({}, gid, {}, {})",
@@ -924,6 +935,14 @@ fn query_polygon(p: &Params, d: &Domain, level: u8) -> Result<(String, String, f
         return Ok((wkt, crs, min_cov));
     }
     if let Some(Param::List(b)) = p.get("bbox") {
+        let allow_candidate = p.int("allow_candidate_crs").unwrap_or(0) != 0;
+        if !d.crs_released() && !allow_candidate {
+            return Err(format!(
+                "domain {} is not released for lon/lat: pass allow_candidate_crs := true for technical use",
+                d.code
+            )
+            .into());
+        }
         let v: Vec<f64> = b.iter().filter_map(Param::float).collect();
         if v.len() != 4 {
             return Err("bbox must be [min_lon, min_lat, max_lon, max_lat]".into());
@@ -996,6 +1015,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
     // and `keys` is the matching cell table for the join inside DuckDB.
     let (cells, keys, extra, extra_type): (Vec<Cell>, String, &str, &str) = match shape {
         geom::Geometry::Polygons(polys) => {
+            let allow_candidate = p.int("allow_candidate_crs").unwrap_or(0) != 0;
             let opts = polyfill::PolyfillOptions {
                 source_crs: crs.clone(),
                 coverage_mode: p
@@ -1003,11 +1023,12 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
                     .unwrap_or_else(|| "GRID_PLANAR".into()),
                 min_coverage: min_cov,
                 max_candidate_limit: limit,
+                allow_candidate_crs: allow_candidate,
             };
             let cells = polyfill::polyfill(d, polys, level, &opts)?;
             let keys = format!(
-                "polygon_to_cells({}, {}, {}, source_crs := {}, coverage_mode := {}, min_coverage := {}, max_candidate_limit := {})",
-                lit(d.code), lit(&wkt), level, lit(&crs), lit(&opts.coverage_mode), opts.min_coverage, limit
+                "polygon_to_cells({}, {}, {}, source_crs := {}, coverage_mode := {}, min_coverage := {}, max_candidate_limit := {}, allow_candidate_crs := {})",
+                lit(d.code), lit(&wkt), level, lit(&crs), lit(&opts.coverage_mode), opts.min_coverage, limit, allow_candidate
             );
             (
                 cells.into_iter().map(|(c, _)| c).collect(),

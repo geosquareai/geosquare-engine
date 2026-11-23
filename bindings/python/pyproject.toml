@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "geosquare-engine"
-version = "0.1.0"
+version = "0.2.0"
 description = "GeoSquare V2 grid engine: GID codec, Int64 packing, topology, and column detection (spec 2.0)."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,6 +1,6 @@
 [package]
 name = "geosquare-python"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python binding (PyO3) for the GeoSquare V2 grid core, spec 2.0."
@@ -12,4 +12,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 geosquare-core = { path = "../../core" }
-pyo3 = { version = "0.30", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }

@@ -104,7 +104,7 @@ Writing is meant for the backend.
 
 | Function | Returns |
 |---|---|
-| `point_to_cell(domain_code, longitude, latitude, level)` | `STRUCT(domain_code, level, x_idx, y_idx, gid, uri, packed_id)` |
+| `point_to_cell(domain_code, longitude, latitude, level [, allow_candidate_crs])` | `STRUCT(domain_code, level, x_idx, y_idx, gid, uri, packed_id)` |
 | `pack(domain, gid)` (domain = code or id) | `BIGINT` packed id |
 | `pack_int64(domain_id, level, x_idx, y_idx)` | `BIGINT` |
 | `unpack_int64(packed_id)` | `STRUCT(domain_id, level, x_idx, y_idx)` |
@@ -116,7 +116,8 @@ Writing is meant for the backend.
 | `cell_side_m(level)` | `DOUBLE` |
 | `descendant_range(domain, parent_gid, child_level)` | `STRUCT(lo, hi)` packed range (spec 8.1) |
 | `parse_uri(uri)` | `STRUCT(domain_code, gid)` |
-| `cell_to_geometry(domain_code, gid [, output_crs [, format]])`, `cell_to_geometry(packed_id [, output_crs [, format]])` (domain from the packed id) | WKT or GeoJSON; `output_crs` `'grid'` (default, as in v2) or `'EPSG:4326'` |
+| `cell_to_geometry(domain_code, gid [, output_crs [, format [, allow_candidate_crs]]])`, `cell_to_geometry(packed_id, ...)` (domain from packed id) | WKT or GeoJSON; `output_crs` `'grid'` (default, as in v2) or `'EPSG:4326'` |
+| `verify_registry(database_path, signature_path, trust_path)` | `BOOLEAN`; verifies the database digest, Ed25519 signature, and trusted key |
 | `polygon_to_cells(domain_code, wkt, level, ...)` | table: `domain_code, level, x_idx, y_idx, gid, uri, packed_id, coverage_ratio` |
 | `polyfill(domain_code, wkt, level, ...)` | table: `gid, coverage_ratio` |
 | `line_to_cells(domain_code, wkt, level, source_crs := ..., max_candidate_limit := ...)` | table: same cell columns + `length_ratio` (share of the whole line inside the cell, as in v2) |
@@ -126,9 +127,41 @@ Writing is meant for the backend.
 | `v1_gid_center(gid_v1)` / `v1_gid_to_geometry(gid_v1 [, format])` | `STRUCT(lon, lat)` / the v1 cell box in lon/lat as WKT or GeoJSON |
 | `lonlat_to_v1_gid(longitude, latitude, level_v1)` | `VARCHAR` v1 gid (v1 level 12 = 50 m, 9 = 1 km), identical to `@geosquare/grid` `lonLatToGid` |
 
+The six released domains are `BN`, `ID`, `LA`, `MY`, `PH`, and `SG`. `point_to_cell` and WGS84 `cell_to_geometry` reject candidate domains by default. Pass `true` as the final `allow_candidate_crs` argument for technical candidate use. The candidate domains are `KH`, `MM`, `TH`, `TL`, and `VN`.
+
+### Candidate CRS use
+
+This call is blocked because `VN` is a candidate domain:
+
+```sql
+SELECT point_to_cell('VN', 107.868144, 15.981051, 5);
+```
+
+Use the final boolean only for technical work:
+
+```sql
+SELECT point_to_cell('VN', 107.868144, 15.981051, 5, true);
+SELECT cell_to_geometry('VN', 'H3T4T', 'EPSG:4326', 'wkt', true);
+```
+
+The final `true` does not make the domain production-ready. It only enables explicit candidate use. The same rule applies to WGS84 cell geometry.
+
 `polygon_to_cells` / `polyfill` take `source_crs := 'EPSG:4326' | 'grid'`,
-`coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0` and
-`max_candidate_limit := 100000`, and follow `geosquare_v2.polyfill_stream`: vertices are
+`coverage_mode := 'GRID_PLANAR' | 'EQUAL_AREA'`, `min_coverage := 0.0`,
+`max_candidate_limit := 100000`, and `allow_candidate_crs := false`.
+Candidate domains reject WGS84 input by default. Pass `allow_candidate_crs := true` only for
+technical candidate use:
+
+```sql
+SELECT * FROM polyfill(
+  'VN',
+  'POLYGON ((107.8 15.9, 107.9 15.9, 107.9 16.0, 107.8 16.0, 107.8 15.9))',
+  12,
+  allow_candidate_crs := true
+);
+```
+
+These functions follow `geosquare_v2.polyfill_stream`: vertices are
 projected without densification, the intersection is taken in the grid plane, cells come in
 row-major order, and a cell is kept when `ratio > 0 and ratio >= min_coverage`.
 `EQUAL_AREA` measures both areas in Equal Earth (EPSG:8857), the profiles' equal-area CRS.
@@ -157,6 +190,21 @@ functions.
 Not registered: the engine names `encode`, `decode` and `unpack`. `encode`/`decode` are DuckDB
 BLOB built-ins (DuckDB 1.4 resolves `decode('<gid>')` to the built-in) and `UNPACK(...)` is
 DuckDB syntax. Use `canonical_to_gid`, `gid_to_canonical` and `unpack_int64`.
+
+### Registry verification
+
+Verify the signed registry before using its profiles:
+
+```sql
+SELECT verify_registry(
+  '/path/registry.db',
+  '/path/registry.db.sig',
+  '/path/registry-trust.json'
+);
+```
+
+The function raises an error for a changed database, bad signature, or untrusted key.
+It returns `true` only after all three checks pass.
 
 ## Cell datasets: flat, partitioned, Iceberg
 
@@ -311,6 +359,8 @@ ancestor cell (1 km = 9, 10 km = 7), each value column aggregated by its manifes
 `read_cell_dataset` / `query_cell_dataset` take `with_geometry := 'wkt' | 'geojson'` (and
 `geometry_crs := 'EPSG:4326'` (default) `| 'grid'`) to add each cell's outline as a
 `cell_geometry` column; the domain comes from the dataset, so no `domain_code` is needed.
+For polygon queries, `allow_candidate_crs := false` is the default. Pass `true` only for
+technical candidate CRS use.
 
 `read_cell_dataset` / `query_cell_dataset` accept `domain_code` and `level` for tables
 without a cell manifest. `query_cell_dataset` reads only the `gid_prefix` folders that the

@@ -22,6 +22,7 @@ pub struct PolyfillOptions {
     pub coverage_mode: String,
     pub min_coverage: f64,
     pub max_candidate_limit: i64,
+    pub allow_candidate_crs: bool,
 }
 
 impl Default for PolyfillOptions {
@@ -31,6 +32,7 @@ impl Default for PolyfillOptions {
             coverage_mode: "GRID_PLANAR".into(),
             min_coverage: 0.0,
             max_candidate_limit: 100_000,
+            allow_candidate_crs: false,
         }
     }
 }
@@ -56,6 +58,7 @@ pub fn to_grid(
     domain: &Domain,
     polys: Vec<Polygon>,
     source_crs: &str,
+    allow_candidate_crs: bool,
 ) -> Result<Vec<Polygon>, BoxErr> {
     if is_grid(source_crs) {
         return Ok(polys);
@@ -66,8 +69,12 @@ pub fn to_grid(
         )
         .into());
     }
-    if !domain.crs_released() {
-        return Err(format!("domain {} has no released CRS operation", domain.code).into());
+    if !(domain.crs_released() || allow_candidate_crs && domain.crs_available()) {
+        return Err(format!(
+            "domain {} is not released for lon/lat: pass allow_candidate_crs := true for technical use",
+            domain.code
+        )
+        .into());
     }
     let mut out = Vec::with_capacity(polys.len());
     for p in polys {
@@ -129,7 +136,7 @@ pub fn polyfill(
         _ => return Err("coverage_mode must be GRID_PLANAR or EQUAL_AREA".into()),
     };
     let (polys, _) = crate::valid::make_valid(polys);
-    let projected = to_grid(domain, polys, &opt.source_crs)?;
+    let projected = to_grid(domain, polys, &opt.source_crs, opt.allow_candidate_crs)?;
     // Area of a grid-CRS ring after projecting its vertices to Equal Earth.
     let ea_area = |ring: &[geom::Point]| -> Result<f64, BoxErr> {
         let pts = ring

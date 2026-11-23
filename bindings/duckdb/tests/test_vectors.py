@@ -79,7 +79,12 @@ def test_points(con):
     n = 0
     for c in pts:
         for lvl, gid in c["gids"].items():
-            got = rows(con, "SELECT point_to_cell(?, ?, ?, ?)", [c["domain_code"], c["lon"], c["lat"], int(lvl)])[0][0]
+            args = [c["domain_code"], c["lon"], c["lat"], int(lvl)]
+            if c["production_ready"]:
+                got = rows(con, "SELECT point_to_cell(?, ?, ?, ?)", args)[0][0]
+            else:
+                check(raises(con, "SELECT point_to_cell(?, ?, ?, ?)", args), f"candidate CRS accepted: {c['domain_code']}")
+                got = rows(con, "SELECT point_to_cell(?, ?, ?, ?, true)", args)[0][0]
             check(got["gid"] == gid, f"point_to_cell {c['domain_code']} {lvl}: {got['gid']} != {gid}")
             check(got["uri"] == f"geosquare:v2:{c['domain_code']}:{gid}", f"uri {got}")
             check(rows(con, "SELECT pack(?, ?)", [c["domain_code"], gid])[0][0] == got["packed_id"], "packed_id")
@@ -124,6 +129,17 @@ def test_polygon(con):
     half = rows(con, "SELECT count(*) FROM polyfill('ID', ?, 12, source_crs := 'grid', min_coverage := 0.6)", [wkt])[0][0]
     check(half == 4, f"min_coverage filter: {half}")
     check(raises(con, "SELECT * FROM polygon_to_cells('ID', ?, 12, source_crs := 'grid', max_candidate_limit := 3)", [wkt]), "candidate limit")
+    candidate_wkt = "POLYGON ((107.86 15.97, 107.87 15.97, 107.87 15.98, 107.86 15.98, 107.86 15.97))"
+    check(
+        raises(con, "SELECT * FROM polygon_to_cells('VN', ?, 12)", [candidate_wkt]),
+        "candidate polygon CRS accepted",
+    )
+    candidate_cells = rows(
+        con,
+        "SELECT * FROM polygon_to_cells('VN', ?, 12, allow_candidate_crs := true)",
+        [candidate_wkt],
+    )
+    check(candidate_cells, "candidate polygon opt-in returned no cells")
     check(raises(con, "SELECT * FROM polygon_to_cells('ID', 'POINT (1 2)', 12)"), "non-polygon rejected")
     geom = rows(con, "SELECT cell_to_geometry('ID', 'H2X545P49342'), cell_to_geometry('ID', 'H2X545P49342', 'EPSG:4326', 'geojson')")[0]
     check(geom[0].startswith("POLYGON ((") and '"Polygon"' in geom[1], f"cell_to_geometry: {geom}")

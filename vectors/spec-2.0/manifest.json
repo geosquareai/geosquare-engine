@@ -5,77 +5,77 @@
       "domain_id": 1,
       "production_ready": true,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "production_ready"
+      "support_status": "released"
     },
     {
       "domain_code": "VN",
       "domain_id": 2,
       "production_ready": false,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "blocked_datum_review"
+      "support_status": "candidate"
     },
     {
       "domain_code": "BN",
       "domain_id": 3,
       "production_ready": true,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "production_ready"
+      "support_status": "released"
     },
     {
       "domain_code": "KH",
       "domain_id": 4,
       "production_ready": false,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "provisional_technical_candidate"
+      "support_status": "candidate"
     },
     {
       "domain_code": "LA",
       "domain_id": 5,
       "production_ready": true,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "production_ready"
+      "support_status": "released"
     },
     {
       "domain_code": "MY",
       "domain_id": 6,
       "production_ready": true,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "production_ready"
+      "support_status": "released"
     },
     {
       "domain_code": "MM",
       "domain_id": 7,
       "production_ready": false,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "provisional_technical_candidate"
+      "support_status": "candidate"
     },
     {
       "domain_code": "PH",
       "domain_id": 8,
       "production_ready": true,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "production_ready"
+      "support_status": "released"
     },
     {
       "domain_code": "SG",
       "domain_id": 9,
       "production_ready": true,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "production_ready"
+      "support_status": "released"
     },
     {
       "domain_code": "TH",
       "domain_id": 10,
       "production_ready": false,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "provisional_technical_candidate"
+      "support_status": "candidate"
     },
     {
       "domain_code": "TL",
       "domain_id": 11,
       "production_ready": false,
       "profile_version": "2.2.0-explicit-datum",
-      "support_status": "provisional_technical_candidate"
+      "support_status": "candidate"
     }
   ],
   "files": {
@@ -83,13 +83,17 @@
       "bytes": 128083,
       "sha256": "87c362e4dc9085403ca9453a88a51bfd8783f299f72ce33d6b792c3688c383bd"
     },
+    "compact-set.json": {
+      "bytes": 10072,
+      "sha256": "ffaa4454c88d55c40eefe43d8f40d944be122b8a27726c2903af0ed0f40242b9"
+    },
     "detect.json": {
       "bytes": 16927,
       "sha256": "5828f8cffba2857317badba2fba95d4ed39cc522fe48c6054fbf8b8a49d390cb"
     },
     "points.json": {
-      "bytes": 3738,
-      "sha256": "6d9e7ac85845b30970dccd54f3a1097788eca689a7690e1601229e9a00e7332b"
+      "bytes": 3547,
+      "sha256": "ed42aab24a53560a3763093657dd1a451e7b6aa7b8e453d234fadd9b3216a527"
     },
     "projected.json": {
       "bytes": 95402,
@@ -101,7 +105,7 @@
     }
   },
   "generated_by": "tools/generate_conformance_vectors.py",
-  "geosquare_v2_version": "1.0.0",
+  "geosquare_v2_version": "1.1.0",
   "proj_version": "9.5.1",
   "proj_version_exact": "9.5.1",
   "registry_version": "2.0.0",
