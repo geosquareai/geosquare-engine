@@ -40,7 +40,7 @@ src = ("SELECT packed_id, (packed_id % 97)::INTEGER AS population FROM polygon_t
        "'POLYGON ((106.80 -6.25, 106.90 -6.25, 106.90 -6.15, 106.80 -6.15, 106.80 -6.25))', 12)")
 for layout in ("flat", "partitioned", "iceberg"):
     extra = "" if layout == "flat" else ", partition_level := 7"
-    c.execute(f"SELECT * FROM write_cell_dataset(?, ?, layout := '{layout}', aggregation_rule := 'sum'{extra})", [src, f"{www}/{layout}"]).fetchall()
+    c.execute(f"SELECT * FROM write_cell_dataset(?, ?, layout := '{layout}', value_semantics := 'COUNT'{extra})", [src, f"{www}/{layout}"]).fetchall()
 wkt = "POLYGON ((" + ", ".join(f"{106.85 + 0.02 * math.cos(2 * math.pi * (i % 48) / 48)} {-6.2 + 0.02 * math.sin(2 * math.pi * (i % 48) / 48)}" for i in range(49)) + "))"
 open(f"{www}/query.wkt", "w").write(wkt)
 s = lambda row: [None if v is None else str(v) for v in row]
