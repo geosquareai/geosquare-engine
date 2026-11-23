@@ -2,8 +2,7 @@
 
 This internal-analysis plugin turns a GeoSquare V2 GID column into an in-memory
 polygon layer and rolls numeric attributes up to an ancestor level. It writes no
-files and makes no network calls. v1 does not implement k-anonymity. The decision
-about k-anonymity remains open in `plan/10-status-fase4.md`.
+files and makes no network calls. v1 does not implement k-anonymity. Its output stays internal.
 
 ## Actions
 
@@ -20,6 +19,8 @@ The plugin deliberately exposes candidate CRS domains as an explicit technical
 choice. The engine still applies its candidate-CRS opt-in rules.
 
 ## Install the Python package in QGIS
+
+Use QGIS 4.0 or newer. The plugin needs Python 3.11 or newer. QGIS 4.0.2 uses Python 3.12. QGIS 3.40 uses Python 3.9, which is too old.
 
 The plugin needs the `geosquare-engine` Python package in QGIS's own Python
 runtime. Installing it into another virtual environment is not enough.
