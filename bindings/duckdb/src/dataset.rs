@@ -627,10 +627,13 @@ pub fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
         ),
         "min" => format!("min({c})"),
         "max" => format!("max({c})"),
+        // The plain median of the child values, with no weight. It needs at least 3 child
+        // values with data; with fewer the parent value is NULL.
+        "median" => format!("CASE WHEN count({c}) >= 3 THEN median({c}) END"),
         other => {
             return Err(format!(
                 "column {name} has aggregation_rule {other:?}, which rollup_level cannot apply; \
-                 pass rollup_rule := '{{\"{name}\": \"sum\" | \"mean\" | \"min\" | \"max\"}}'"
+                 pass rollup_rule := '{{\"{name}\": \"sum\" | \"mean\" | \"min\" | \"max\" | \"median\"}}'"
             )
             .into())
         }
@@ -639,7 +642,7 @@ pub fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
 
 /// `rollup_level := R`: one row per level-R ancestor cell instead of one per dataset cell.
 /// Each value column is aggregated by its `aggregation_rule` from the cell manifest (sum:
-/// weighted sum, mean: weighted mean, min, max; without a rule COUNT columns are summed and
+/// weighted sum, mean: weighted mean, min, max, median; without a rule COUNT columns are summed and
 /// the others averaged), weighted by the share of each cell inside the query area.
 /// `rollup_rule` overrides the rule: one word for every column or `{column or pattern: rule}`.
 /// Adds `cell_count` (dataset cells in the group) and, for areas, the ancestor's

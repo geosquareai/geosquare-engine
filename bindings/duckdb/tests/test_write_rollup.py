@@ -44,10 +44,24 @@ c.execute(f"SELECT * FROM write_cell_dataset('SELECT * FROM read_cell_dataset(''
 x = c.execute("SELECT sum(people), avg(hazard) FROM read_cell_dataset(?)", [f"{d}/sem"]).fetchone()
 y = c.execute("SELECT sum(people), avg(h) FROM (SELECT left(gid, 9), sum(people) people, avg(hazard) h FROM read_cell_dataset(?) GROUP BY 1)", [f"{d}/fine"]).fetchone()
 assert close(x, y), (x, y)
-for bad, msg in (("rollup_level := 20", "rollup_level must be"), ("rollup_level := 9, aggregation_rule := 'median'", "cannot apply")):
+for bad, msg in (("rollup_level := 20", "rollup_level must be"),):
     try:
         c.execute(f"SELECT * FROM write_cell_dataset('SELECT * FROM read_cell_dataset(''{d}/fine'')', '{d}/bad', {bad})").fetchall()
         raise AssertionError(bad)
     except duckdb.Error as e:
         assert msg in str(e), (bad, e)
+# median: the plain median of the children, NULL with fewer than 3 children
+groups = {}
+for (g,) in c.execute("SELECT gid FROM polygon_to_cells('ID', ?, 12)", [area]).fetchall():
+    groups.setdefault(g[:9], []).append(g)
+rich = next(k for k, v in groups.items() if len(v) >= 3)
+sparse = next(k for k, v in groups.items() if k != rich and len(v) >= 2)
+vals = {g: float(i) for i, g in enumerate(groups[rich][:3])}
+vals.update({g: float(10 + i) for i, g in enumerate(groups[sparse][:2])})
+src = ("SELECT pack('ID', gid) AS packed_id, hazard FROM (VALUES "
+       + ", ".join(f"('{g}', {v})" for g, v in vals.items()) + ") AS t(gid, hazard)")
+c.execute("SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, aggregation_rule := ?)",
+          [src, f"{d}/median", json.dumps({"hazard": "median"})]).fetchall()
+got = dict(c.execute("SELECT gid, hazard FROM read_cell_dataset(?)", [f"{d}/median"]).fetchall())
+assert got[rich] == 1.0 and got[sparse] is None, (got, rich, sparse)
 print("write rollup OK")

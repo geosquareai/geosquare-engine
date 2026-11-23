@@ -471,7 +471,7 @@ impl Staged {
 
 /// `rollup_level := R`: the input cells aggregated to their level-R ancestors, one row per
 /// ancestor. Each numeric column is aggregated by its `aggregation_rule` (one word or
-/// `{column: rule}`: sum, mean, min, max); without a rule COUNT columns (`value_semantics`)
+/// `{column: rule}`: sum, mean, min, max, median); without a rule COUNT columns (`value_semantics`)
 /// are summed and the others averaged. An input `coverage_ratio` / `length_ratio` column
 /// (e.g. from query_cell_dataset) weights the cells and is not written.
 fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<String, E> {
@@ -760,7 +760,13 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
         if c == "gid" || c == "packed_id" {
             continue;
         }
-        if o.fill_nulls && !IDENTITY.contains(&c.as_str()) && is_numeric_type(ty) {
+        // A rollup value stays NULL where no child has data (median: fewer than 3 children).
+        // Filling it with 0 would make that gap look like a measured zero.
+        if o.fill_nulls
+            && o.rollup_level.is_none()
+            && !IDENTITY.contains(&c.as_str())
+            && is_numeric_type(ty)
+        {
             select.push(format!("coalesce({0}, CAST(0 AS {ty})) AS {0}", ident(c)));
         } else {
             select.push(ident(c));
