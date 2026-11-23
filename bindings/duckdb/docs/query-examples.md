@@ -207,6 +207,11 @@ level-L cell's own `coverage_ratio` (its share inside the area). `rollup_rule` o
 rule: one word for every column or `{"column or pattern*": "sum" | "mean" | "min" | "max" | "median"}`.
 A rollup value with no child data stays NULL. It is not filled with 0.
 
+A `RATE` column (semantics `RATE`) is a weighted mean, not a plain average. Name its denominator
+with `rollup_weight := '{"rate": "people"}'`: the parent is the sum of rate x people over the
+sum of people. A RATE with no denominator is an error, and its rule must be a mean. Any other
+mean column can take a denominator the same way. `rollup_weight` needs `rollup_level`.
+
 ```sql
 -- 1 km overview of an area, with the 1 km outlines
 SELECT gid, population, workers, cell_count, coverage_ratio, cell_geometry

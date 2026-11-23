@@ -1,10 +1,12 @@
 //! Upkeep of catalog-less Iceberg cell datasets.
 //!
 //! `expire_snapshots(path, retain_last := 1, older_than := NULL, orphan_age_hours := 24,
-//! dry_run := false)`: drop old snapshots from the table metadata and delete the files only
-//! they used (data files, manifests, manifest lists, older metadata files). Files in the table
-//! folders that no metadata refers to (left by a failed or running write) are deleted only when
-//! older than `orphan_age_hours`, so a write in progress is never touched.
+//! dry_run := true)`: drop old snapshots from the table metadata and delete the files only
+//! they used (data files, manifests, manifest lists, older metadata files). Dry run is the
+//! default: the call reports what it would delete and deletes nothing. Pass
+//! `dry_run := false` to delete. Files in the table folders that no metadata refers to (left
+//! by a failed or running write) are deleted only when older than `orphan_age_hours`, so a
+//! write in progress is never touched.
 
 use crate::{
     avro::{self, D},
@@ -89,7 +91,7 @@ pub fn plan_expire(p: &Params) -> Result<Plan, E> {
     if orphan_hours < 0.0 {
         return Err("orphan_age_hours must not be negative".into());
     }
-    let dry = p.get("dry_run").and_then(sql::Param::int).unwrap_or(0) != 0;
+    let dry = p.get("dry_run").and_then(sql::Param::int).unwrap_or(1) != 0;
     let s3 = writer::s3_params_pub(p);
     Ok(Plan::Action(
         Box::new(move || expire(&path, retain as usize, older_than, orphan_hours, dry, &s3)),

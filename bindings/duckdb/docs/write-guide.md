@@ -13,7 +13,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 | add / drop / retype a column | `mode := 'overwrite'` | `alter_cell_dataset` (rename, drop, add: no data rewrite) or `mode := 'overwrite'` |
 | overview at a coarser level | `rollup_level := L` | `rollup_level := L` |
 | merge files / repartition, keep metadata | `compact_cell_dataset(path [, partition_level])` | same |
-| drop old snapshots and their files | - | `expire_snapshots(path, retain_last := N)` |
+| drop old snapshots and their files | - | `expire_snapshots(path, retain_last := N, dry_run := false)` |
 | change the partition level | `mode := 'overwrite', partition_level := ...` | same (new partition spec) |
 
 A dataset holds one row per cell (unique `packed_id`), one domain and one level. The writer
@@ -31,7 +31,7 @@ Rules of thumb:
 - Iceberg has no catalog lock: a commit is refused ("changed during the write; retry") when
   another writer committed first. On S3 the version hint is replaced with a conditional
   PUT (If-Match), so of two writers committing at the same moment only one succeeds.
-  A refused write leaves unreferenced data files; `expire_snapshots` removes them later.
+  A refused write leaves unreferenced data files; `expire_snapshots(path, dry_run := false)` removes them later.
 - `append` and `overwrite` keep the dataset's metadata (per column by name: unit, semantics,
   aggregation rule, description; and source, coverage, notes, title, period, version).
   Values passed to the write replace them; new columns start without metadata.
@@ -210,7 +210,7 @@ until `expire_snapshots`.
 ```sql
 SELECT * FROM compact_cell_dataset('/data/w_ice');
 SELECT * FROM compact_cell_dataset('/data/w_part', partition_level := 6);
-SELECT * FROM expire_snapshots('/data/w_ice');
+SELECT * FROM expire_snapshots('/data/w_ice', dry_run := false);
 ```
 
 ## Clean up old snapshots (Iceberg)
@@ -219,12 +219,13 @@ Every write keeps the previous snapshots and their files, so a table rewritten o
 `expire_snapshots` keeps the current snapshot and the last `retain_last` ones (and any newer
 than `older_than`), writes new metadata without the others, and deletes the files only they
 used. Files no metadata refers to (left by a failed or running write) are deleted only when
-older than `orphan_age_hours` (default 24), so a write in progress is safe. `dry_run := true`
-reports without changing anything. Older snapshots are no longer readable afterwards.
+older than `orphan_age_hours` (default 24), so a write in progress is safe. Dry run is the
+default: the call only reports what it would delete. Pass `dry_run := false` to delete. Older
+snapshots are no longer readable after a real run.
 
 ```sql
-SELECT * FROM expire_snapshots('/data/w_ice', dry_run := true);
-SELECT * FROM expire_snapshots('/data/w_ice', retain_last := 2);
+SELECT * FROM expire_snapshots('/data/w_ice');
+SELECT * FROM expire_snapshots('/data/w_ice', retain_last := 2, dry_run := false);
 SELECT count(*) FROM iceberg_snapshots('/data/w_ice');
 ```
 

@@ -51,7 +51,7 @@ jobs:
         working-directory: bindings/duckdb
         env:
           DUCKDB_VERSIONS: ${{ matrix.duckdb }}
-          TESTS: tests/test_vectors.py tests/test_registry.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py tests/test_legacy_profile.py
+          TESTS: tests/test_vectors.py tests/test_registry.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py tests/test_legacy_profile.py tests/test_rate_rollup.py
         run: tests/run_versions.sh
 
       - name: S3 writes against an emulator

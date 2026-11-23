@@ -47,7 +47,7 @@ for layout in ("iceberg", "partitioned", "flat"):
         # coarser partitions, then drop the old snapshots
         c.execute("SELECT * FROM compact_cell_dataset(?, partition_level := 5)", [p]).fetchall()
         assert data() == before[0] and info() == before[1] and cols() == before[2] and parts() != before[3]
-        e = c.execute("SELECT * FROM expire_snapshots(?)", [p]).fetchone()
+        e = c.execute("SELECT * FROM expire_snapshots(?, dry_run := false)", [p]).fetchone()
         assert int(e[0]) == 1 and int(e[1]) == 7, e   # 6 appends + 2 compactions, keep the current one
         left = glob.glob(f"{p}/data/**/*.parquet", recursive=True)
         assert len(left) == c.execute("SELECT count(DISTINCT left(gid, 5)) FROM read_cell_dataset(?)", [p]).fetchone()[0], left

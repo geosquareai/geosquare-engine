@@ -84,6 +84,8 @@ pub struct Options {
     fill_nulls: bool,
     /// Aggregate the input cells to this ancestor level before writing (see rollup_query).
     rollup_level: Option<i64>,
+    /// Per-column denominators (`rollup_weight`): a mean weighted by that column. RATE needs one.
+    rollup_weights: Vec<(String, String)>,
     /// value_semantics was passed (not the default), so it is not inherited.
     value_semantics_given: bool,
     /// (cell manifest, dataset_info) of the dataset being appended to or overwritten: its
@@ -119,6 +121,9 @@ fn s3_params(p: &Params) -> S3Params {
 pub fn plan_write(p: &Params) -> Result<Plan, E> {
     let query = p.pos_text(0, "query")?;
     let path = p.pos_text(1, "path")?;
+    if p.text("rollup_weight").is_some() && p.int("rollup_level").is_none() {
+        return Err("rollup_weight needs rollup_level".into());
+    }
     let o = Options {
         layout: p
             .text("layout")
@@ -144,6 +149,7 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
             .to_ascii_lowercase(),
         fill_nulls: p.int("fill_nulls").is_none_or(|v| v != 0),
         rollup_level: p.int("rollup_level"),
+        rollup_weights: crate::dataset::rollup_weights(p.text("rollup_weight").as_deref())?,
         value_semantics_given: p.text("value_semantics").is_some(),
         prev: None,
         column_metrics: p
@@ -530,18 +536,18 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
             )
             .into());
         }
+        let sem = sem_map
+            .get(c)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .or_else(|| sem_all.clone())
+            .unwrap_or_default();
         let rule = agg_map
             .get(c)
             .and_then(Json::as_str)
             .map(str::to_string)
             .or_else(|| agg_all.clone())
             .unwrap_or_else(|| {
-                let sem = sem_map
-                    .get(c)
-                    .and_then(Json::as_str)
-                    .map(str::to_string)
-                    .or_else(|| sem_all.clone())
-                    .unwrap_or_default();
                 if sem.eq_ignore_ascii_case("COUNT") {
                     "sum".into()
                 } else {
@@ -550,7 +556,7 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
             });
         aggs.push(format!(
             "{} AS {}",
-            crate::dataset::rollup_expr(c, &rule, &w)?,
+            crate::dataset::column_rollup_expr(c, &rule, &sem, &o.rollup_weights, &w)?,
             ident(c)
         ));
     }
@@ -688,6 +694,7 @@ fn compact(
         },
         fill_nulls: true,
         rollup_level: None,
+        rollup_weights: Vec::new(),
         value_semantics_given: false,
         prev: None,
         s3: s3.clone(),

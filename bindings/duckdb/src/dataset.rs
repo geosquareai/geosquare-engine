@@ -647,6 +647,83 @@ pub fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
     })
 }
 
+/// Parse `rollup_weight := '{"column": "denominator column"}'`. Each listed column is a mean
+/// weighted by that column. A RATE column must be listed.
+pub fn rollup_weights(text: Option<&str>) -> Result<Vec<(String, String)>, E> {
+    let Some(t) = text else {
+        return Ok(Vec::new());
+    };
+    let Ok(Json::Object(map)) = serde_json::from_str::<Json>(t.trim()) else {
+        return Err(
+            "rollup_weight must be a JSON object {column: denominator column}, e.g. '{\"rate\": \"people\"}'"
+                .into(),
+        );
+    };
+    map.into_iter()
+        .map(|(column, denominator)| match denominator.as_str() {
+            Some(d) => Ok((column, d.to_string())),
+            None => Err(format!(
+                "rollup_weight: the denominator of {column} must be a column name"
+            )
+            .into()),
+        })
+        .collect()
+}
+
+/// The rollup expression for one value column.
+///
+/// A RATE is a weighted mean: the parent is the sum of rate x denominator over the sum of the
+/// denominators. A plain average is wrong. One cell with 1 person at 100 % and one with 999
+/// people at 5 % average to 52.5 %, but the weighted rate is 5.095 %. So a RATE needs a
+/// denominator, and its rule must be a mean. A non-RATE column with a denominator is a weighted
+/// mean too. `area_weight` is the cell's share inside the query area (`1.0` when there is none).
+pub fn column_rollup_expr(
+    column: &str,
+    rule: &str,
+    semantics: &str,
+    weights: &[(String, String)],
+    area_weight: &str,
+) -> Result<String, E> {
+    let denominator = weights
+        .iter()
+        .find(|(c, _)| c == column)
+        .map(|(_, d)| d.as_str());
+    let is_mean = matches!(
+        rule.to_ascii_lowercase().as_str(),
+        "mean" | "avg" | "average" | "weighted_mean"
+    );
+    if semantics.eq_ignore_ascii_case("RATE") {
+        if !is_mean {
+            return Err(format!(
+                "column {column} is a RATE: roll it up as a weighted mean, not {rule:?}"
+            )
+            .into());
+        }
+        let Some(d) = denominator else {
+            return Err(format!(
+                "column {column} is a RATE and needs its denominator: pass rollup_weight := '{{\"{column}\": \"<denominator column>\"}}'"
+            )
+            .into());
+        };
+        return rollup_expr(
+            column,
+            "mean",
+            &format!("(r.{} * {area_weight})", sql::ident(d)),
+        );
+    }
+    match denominator {
+        Some(d) if is_mean => rollup_expr(
+            column,
+            "mean",
+            &format!("(r.{} * {area_weight})", sql::ident(d)),
+        ),
+        Some(_) => {
+            Err(format!("rollup_weight names {column}, but its rule {rule:?} is not a mean").into())
+        }
+        None => rollup_expr(column, rule, area_weight),
+    }
+}
+
 /// `rollup_level := R`: one row per level-R ancestor cell instead of one per dataset cell.
 /// Each value column is aggregated by its `aggregation_rule` from the cell manifest (sum:
 /// weighted sum, mean: weighted mean, min, max, median; without a rule COUNT columns are summed and
@@ -658,6 +735,9 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
     let Some(r) = p.int("rollup_level") else {
         if p.text("rollup_rule").is_some() {
             return Err("rollup_rule needs rollup_level".into());
+        }
+        if p.text("rollup_weight").is_some() {
+            return Err("rollup_weight needs rollup_level".into());
         }
         return Ok(plan);
     };
@@ -685,6 +765,7 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         .filter(|f| !f.is_empty())
         .ok_or("rollup_level needs the value columns of the cell manifest (value_fields)")?;
     let over = crate::metadata::PerColumn::parse(p.text("rollup_rule"), "rollup_rule")?;
+    let weights = rollup_weights(p.text("rollup_weight").as_deref())?;
     let w = ctx
         .weight
         .map(|w| format!("r.{w}"))
@@ -715,9 +796,10 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
                     "mean".into()
                 }
             });
+        let semantics = f.get("semantics").and_then(Json::as_str).unwrap_or("");
         aggs.push(format!(
             "{} AS {}",
-            rollup_expr(name, &rule, &w)?,
+            column_rollup_expr(name, &rule, semantics, &weights, &w)?,
             sql::ident(name)
         ));
     }
