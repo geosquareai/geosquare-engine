@@ -5,6 +5,7 @@
 //! `geosquare-engine` bindings.
 
 mod avro;
+mod content_hash;
 mod dataset;
 mod detect_fn;
 mod equal_area;
@@ -195,6 +196,14 @@ unsafe fn register_dataset_functions(
                 vec![Text],
                 identity.clone(),
                 dataset::plan_columns,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "cell_dataset_content_hashes",
+                vec![Text],
+                identity.clone(),
+                dataset::plan_content_hashes,
                 pool.clone(),
             )?;
             let mut u = vec![

@@ -1417,3 +1417,60 @@ pub fn plan_columns(p: &Params) -> Result<Plan, E> {
         rows.join(", ")
     )))
 }
+
+/// cell_dataset_content_hashes(path): one row per data file listed in `storage.data_files` of a
+/// manifest 1.1 dataset. `content_sha256` is computed now from the file's rows (section 3.1).
+/// `manifest_content_sha256` is the hash the manifest records, or NULL if it records none.
+pub fn plan_content_hashes(p: &Params) -> Result<Plan, E> {
+    let path = p.pos_text(0, "path")?;
+    let lease = sql::lease()?;
+    let src = open(&lease, &path)?;
+    let m = src.manifest.clone().ok_or("the dataset has no manifest")?;
+    let fields = m
+        .get("value_fields")
+        .and_then(Json::as_array)
+        .ok_or("the manifest has no value_fields")?
+        .iter()
+        .map(|f| {
+            Ok(crate::content_hash::ValueField {
+                name: f["name"]
+                    .as_str()
+                    .ok_or("a value field has no name")?
+                    .to_string(),
+                parquet_type: f["parquet_type"]
+                    .as_str()
+                    .ok_or("a value field has no parquet_type")?
+                    .to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, E>>()?;
+    let files = m
+        .pointer("/storage/data_files")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(files.len());
+    for f in &files {
+        let rel = f["path"].as_str().ok_or("a data file has no path")?;
+        let recorded = f["content_sha256"]
+            .as_str()
+            .map_or("NULL::VARCHAR".into(), lit);
+        let hash = crate::content_hash::file_content_hash(&lease, &join(&src.root, rel), &fields)?;
+        rows.push(format!(
+            "({}, {}::BIGINT, {}, {recorded})",
+            lit(rel),
+            hash.rows,
+            lit(&hash.sha256)
+        ));
+    }
+    Ok(Plan::Query(if rows.is_empty() {
+        "SELECT NULL::VARCHAR AS file, NULL::BIGINT AS row_count, NULL::VARCHAR AS content_sha256, \
+         NULL::VARCHAR AS manifest_content_sha256 LIMIT 0"
+            .into()
+    } else {
+        format!(
+            "SELECT * FROM (VALUES {}) AS t(file, row_count, content_sha256, manifest_content_sha256)",
+            rows.join(", ")
+        )
+    }))
+}
