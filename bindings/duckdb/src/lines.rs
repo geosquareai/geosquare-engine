@@ -59,6 +59,7 @@ pub fn points_to_cells(
     points: &[Point],
     level: u8,
     source_crs: &str,
+    allow_candidate_crs: bool,
 ) -> Result<Vec<(Cell, i64)>, BoxErr> {
     let mut order: Vec<Cell> = Vec::new();
     let mut counts: BTreeMap<(u64, u64), i64> = BTreeMap::new();
@@ -67,7 +68,7 @@ pub fn points_to_cells(
             geo::cell_from_projected(domain, p.0, p.1, level)?
         } else {
             project(domain, p, source_crs)?; // validates lon/lat and source_crs
-            geo::point_to_cell(domain, p.0, p.1, level)?
+            geo::point_to_cell_with_options(domain, p.0, p.1, level, allow_candidate_crs)?
         };
         let n = counts.entry((cell.x_idx, cell.y_idx)).or_insert(0);
         if *n == 0 {

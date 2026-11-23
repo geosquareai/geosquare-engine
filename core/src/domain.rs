@@ -8,7 +8,7 @@
 //! `production_ready: false` is provisional and must not be released.
 
 use crate::codec::ROOT_SIDE_M;
-use crate::projection::{DatumOperation, Ellipsoid, GridCrs, Projection};
+use crate::projection::{AreaFrame, DatumOperation, Ellipsoid, FrameParams, GridCrs, Projection};
 
 /// Registry version this table is pinned to.
 pub const REGISTRY_VERSION: &str = "2.0.0";
@@ -54,6 +54,117 @@ pub fn by_code(code: &str) -> Option<&'static Domain> {
 /// Look up a domain by its numeric ID, such as `1` for `"ID"`.
 pub fn by_id(id: u16) -> Option<&'static Domain> {
     DOMAINS.iter().find(|domain| domain.id == id)
+}
+
+/// Profile version of the datasets written by geosquare-v2 1.0.0. Its grid CRS is the same as
+/// [`PROFILE_VERSION`]. Only the datum step differs: PROJ 9.5.1 chose each operation per point
+/// from its area of use, and [`LEGACY_DOMAINS`] keeps that choice so old GIDs stay the same.
+pub const LEGACY_PROFILE_VERSION: &str = "2.1.0-static-datum";
+
+/// Areas of use `[west, south, east, north]` that PROJ 9.5.1 applied the legacy operations to.
+const ID_AREA: [f64; 4] = [92.01, -13.95, 141.46, 7.79];
+const VN_AREA: [f64; 4] = [102.14, 8.33, 109.53, 23.4];
+const VN_SOUTH_AREA: [f64; 4] = [104.24, 9.35, 107.11, 11.04];
+const LA_AREA: [f64; 4] = [100.09, 13.92, 107.64, 22.5];
+const PH_AREA: [f64; 4] = [116.04, 3.0, 129.95, 22.18];
+
+/// VN-2000 to WGS 84 (1). PROJ 9.5.1 applied it inside `VN_SOUTH_AREA`.
+const VN_OPERATION_1: FrameParams = FrameParams {
+    x_m: -192.873,
+    y_m: -39.382,
+    z_m: -111.202,
+    rx_arcsec: 0.00205,
+    ry_arcsec: 0.0005,
+    rz_arcsec: -0.00335,
+    scale_ppm: 0.0188,
+    inverse: true,
+};
+
+/// The Lao 1997 geocentric translation, as a frame with no rotation and no scale.
+const LA_TRANSLATION: FrameParams = FrameParams {
+    x_m: -44.585,
+    y_m: 131.212,
+    z_m: 39.544,
+    rx_arcsec: 0.0,
+    ry_arcsec: 0.0,
+    rz_arcsec: 0.0,
+    scale_ppm: 0.0,
+    inverse: false,
+};
+
+const fn frame_of(op: DatumOperation) -> FrameParams {
+    match op {
+        DatumOperation::CoordinateFrame {
+            x_m,
+            y_m,
+            z_m,
+            rx_arcsec,
+            ry_arcsec,
+            rz_arcsec,
+            scale_ppm,
+            inverse,
+        } => FrameParams {
+            x_m,
+            y_m,
+            z_m,
+            rx_arcsec,
+            ry_arcsec,
+            rz_arcsec,
+            scale_ppm,
+            inverse,
+        },
+        _ => panic!("the legacy table needs a coordinate-frame operation"),
+    }
+}
+
+/// The 11 domains as geosquare-v2 1.0.0 computed them. Index order follows [`DOMAINS`]:
+/// ID 0, VN 1, LA 4, PH 7. The other domains have no datum shift, so they are unchanged.
+const fn legacy_domains() -> [Domain; 11] {
+    let mut d = DOMAINS;
+    d[0].grid_crs.datum_operation = DatumOperation::AreaFrames {
+        first: AreaFrame {
+            area: ID_AREA,
+            frame: frame_of(DOMAINS[0].grid_crs.datum_operation),
+        },
+        second: None,
+    };
+    d[1].grid_crs.datum_operation = DatumOperation::AreaFrames {
+        first: AreaFrame {
+            area: VN_SOUTH_AREA,
+            frame: VN_OPERATION_1,
+        },
+        second: Some(AreaFrame {
+            area: VN_AREA,
+            frame: frame_of(DOMAINS[1].grid_crs.datum_operation),
+        }),
+    };
+    d[4].grid_crs.datum_operation = DatumOperation::AreaFrames {
+        first: AreaFrame {
+            area: LA_AREA,
+            frame: LA_TRANSLATION,
+        },
+        second: None,
+    };
+    d[7].grid_crs.datum_operation = DatumOperation::AreaFrames {
+        first: AreaFrame {
+            area: PH_AREA,
+            frame: frame_of(DOMAINS[7].grid_crs.datum_operation),
+        },
+        second: None,
+    };
+    d
+}
+
+/// The domains for reading profile [`LEGACY_PROFILE_VERSION`] datasets.
+pub static LEGACY_DOMAINS: [Domain; 11] = legacy_domains();
+
+/// Look up a domain under a dataset's profile version.
+pub fn by_code_for_profile(code: &str, profile_version: &str) -> Option<&'static Domain> {
+    match profile_version {
+        PROFILE_VERSION => by_code(code),
+        LEGACY_PROFILE_VERSION => LEGACY_DOMAINS.iter().find(|domain| domain.code == code),
+        _ => None,
+    }
 }
 
 /// All spec 2.0 domains, in registry order.
@@ -313,6 +424,100 @@ pub const DOMAINS: [Domain; 11] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GIDs written by geosquare-v2 1.0.0 under PROJ 9.5.1 (the signed registry pin).
+    /// VN 9.80 N and LA 100.0 E lie in the cases the legacy datum rule changes.
+    #[test]
+    fn legacy_profile_reproduces_geosquare_v2_1_0_gids() {
+        let cases = [
+            (
+                "VN",
+                106.9492673256204,
+                9.804505192464923,
+                14,
+                "H2Y3R2C5E243V4",
+            ),
+            (
+                "VN",
+                106.15885694488477,
+                15.218925236358746,
+                12,
+                "H2Y5X373V2W4",
+            ),
+            (
+                "VN",
+                106.15885694488477,
+                15.218925236358746,
+                14,
+                "H2Y5X373V2W4L3",
+            ),
+            (
+                "LA",
+                100.00753028497924,
+                18.5829608512224,
+                12,
+                "H46323Y455Y2",
+            ),
+            (
+                "LA",
+                100.00753028497924,
+                18.5829608512224,
+                14,
+                "H46323Y455Y294",
+            ),
+            (
+                "LA",
+                104.73257650510985,
+                18.463674669301646,
+                12,
+                "H52223L4P475",
+            ),
+            (
+                "ID",
+                107.02127000657265,
+                -6.489789411968728,
+                12,
+                "H2X545C335Y3",
+            ),
+        ];
+        for (code, lon, lat, level, gid) in cases {
+            let domain = by_code_for_profile(code, LEGACY_PROFILE_VERSION).unwrap();
+            let cell =
+                crate::geo::point_to_cell_with_options(domain, lon, lat, level, true).unwrap();
+            assert_eq!(
+                crate::codec::encode(cell).unwrap(),
+                gid,
+                "{code} {lon} {lat} L{level}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_table_differs_only_in_the_datum_of_its_domains() {
+        for (current, legacy) in DOMAINS.iter().zip(LEGACY_DOMAINS.iter()) {
+            assert_eq!(current.code, legacy.code);
+            assert_eq!(current.grid_crs.ellipsoid, legacy.grid_crs.ellipsoid);
+            assert_eq!(current.grid_crs.projection, legacy.grid_crs.projection);
+            let changed = current.grid_crs.datum_operation != legacy.grid_crs.datum_operation;
+            assert_eq!(
+                changed,
+                ["ID", "VN", "LA", "PH"].contains(&current.code),
+                "{}",
+                current.code
+            );
+        }
+    }
+
+    #[test]
+    fn profile_versions_select_their_own_domain_table() {
+        let current = by_code_for_profile("VN", PROFILE_VERSION).unwrap();
+        let legacy = by_code_for_profile("VN", LEGACY_PROFILE_VERSION).unwrap();
+        assert_ne!(
+            current.grid_crs.datum_operation,
+            legacy.grid_crs.datum_operation
+        );
+        assert!(by_code_for_profile("VN", "9.9.9").is_none());
+    }
 
     #[test]
     fn ids_and_codes_are_unique_and_complete() {
