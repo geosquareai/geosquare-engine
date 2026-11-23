@@ -1,10 +1,11 @@
-"""RATE rollups are weighted by their denominator, in the writer and in the query path.
+"""A RATE rolls up as a weighted mean, weighted by its denominator (spec 2.0, dataset metadata
+section 4). Writer and query paths.
 
     python tests/test_rate_rollup.py build/linux_amd64/geosquare_v2.duckdb_extension
 
 Two children of one parent: 1 person at 100 % and 999 people at 5 %. The parent rate is
-(100 x 1 + 5 x 999) / 1000 = 5.095 %. A plain average would give 52.5 %, so a RATE without a
-denominator is refused, and so is a RATE with a rule that is not a mean.
+(100 x 1 + 5 x 999) / 1000 = 5.095 %. A plain average would give 52.5 %, so a RATE needs
+space_weight, and its rule must be weighted_mean.
 """
 
 import json
@@ -29,7 +30,8 @@ src = (
     "SELECT pack('ID', gid) AS packed_id, rate, people FROM (VALUES "
     f"('{a}', 100.0, 1.0), ('{b}', 5.0, 999.0)) AS t(gid, rate, people)"
 )
-SEM = '{"rate": "RATE", "people": "COUNT"}'
+SEM = json.dumps({"rate": "RATE", "people": "COUNT"})
+RULE = json.dumps({"rate": "weighted_mean"})
 WEIGHT = json.dumps({"rate": "people"})
 EXPECT = (100.0 * 1 + 5.0 * 999) / 1000
 
@@ -48,46 +50,57 @@ def refused(sql, args, msg):
     raise AssertionError(f"no error for {msg!r}")
 
 
-# Writer: the rollup is weighted by people.
+# Writer: the parent rate is weighted by people.
 out = f"{d}/w_rate"
 c.execute(
-    "SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, value_semantics := ?, rollup_weight := ?)",
-    [src, out, SEM, WEIGHT],
+    "SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, value_semantics := ?, "
+    "space_aggregation := ?, space_weight := ?)",
+    [src, out, SEM, RULE, WEIGHT],
 ).fetchall()
 got = c.execute("SELECT gid, rate, people FROM read_cell_dataset(?)", [out]).fetchall()
 check(len(got) == 1 and got[0][0] == parent, f"writer rows: {got}")
 check(math.isclose(got[0][1], EXPECT, rel_tol=1e-9), f"writer rate {got[0][1]} != {EXPECT}")
 check(got[0][2] == 1000.0, f"writer people {got[0][2]}")
 
-# Writer refusals: no denominator, a rule that is not a mean, and no rollup level.
+# Writer refusals.
 refused(
     "SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, value_semantics := ?)",
-    [src, f"{d}/no_weight", SEM],
-    "needs its denominator",
+    [src, f"{d}/no_rule", SEM],
+    "has no space_aggregation",
 )
 refused(
-    "SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, value_semantics := ?, "
-    "aggregation_rule := ?, rollup_weight := ?)",
+    "SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, value_semantics := ?, space_aggregation := ?, space_weight := ?)",
     [src, f"{d}/sum_rule", SEM, json.dumps({"rate": "sum"}), WEIGHT],
-    "roll it up as a weighted mean",
+    "is not allowed for RATE",
 )
 refused(
-    "SELECT * FROM write_cell_dataset(?, ?, value_semantics := ?, rollup_weight := ?)",
-    [src, f"{d}/no_level", SEM, WEIGHT],
-    "rollup_weight needs rollup_level",
+    "SELECT * FROM write_cell_dataset(?, ?, rollup_level := 9, value_semantics := ?, space_aggregation := ?)",
+    [src, f"{d}/no_weight", SEM, RULE],
+    "weighted_mean needs a space_weight",
+)
+refused(
+    "SELECT * FROM write_cell_dataset(?, ?, value_semantics := ?, space_aggregation := ?)",
+    [src, f"{d}/no_level", SEM, RULE],
+    "need rollup_level",
 )
 
-# Query path: the same rule on a dataset read with rollup_level.
+# Query path: the rule and weight are given to the read; the stored dataset has none (1.0).
 fine = f"{d}/fine"
 c.execute("SELECT * FROM write_cell_dataset(?, ?, value_semantics := ?)", [src, fine, SEM]).fetchall()
 got_q = c.execute(
-    "SELECT gid, rate FROM read_cell_dataset(?, rollup_level := 9, rollup_weight := ?)", [fine, WEIGHT]
+    "SELECT gid, rate FROM read_cell_dataset(?, rollup_level := 9, rollup_rule := ?, space_weight := ?)",
+    [fine, RULE, WEIGHT],
 ).fetchall()
 check(len(got_q) == 1 and got_q[0][0] == parent, f"query rows: {got_q}")
 check(math.isclose(got_q[0][1], EXPECT, rel_tol=1e-9), f"query rate {got_q[0][1]} != {EXPECT}")
 refused(
     "SELECT * FROM read_cell_dataset(?, rollup_level := 9)",
     [fine],
-    "needs its denominator",
+    "has no space_aggregation",
+)
+refused(
+    "SELECT * FROM read_cell_dataset(?, rollup_level := 9, rollup_rule := ?)",
+    [fine, RULE],
+    "weighted_mean needs a space_weight",
 )
 print("rate rollup OK")

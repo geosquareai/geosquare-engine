@@ -647,81 +647,98 @@ pub fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
     })
 }
 
-/// Parse `rollup_weight := '{"column": "denominator column"}'`. Each listed column is a mean
-/// weighted by that column. A RATE column must be listed.
-pub fn rollup_weights(text: Option<&str>) -> Result<Vec<(String, String)>, E> {
-    let Some(t) = text else {
-        return Ok(Vec::new());
-    };
-    let Ok(Json::Object(map)) = serde_json::from_str::<Json>(t.trim()) else {
-        return Err(
-            "rollup_weight must be a JSON object {column: denominator column}, e.g. '{\"rate\": \"people\"}'"
-                .into(),
-        );
-    };
-    map.into_iter()
-        .map(|(column, denominator)| match denominator.as_str() {
-            Some(d) => Ok((column, d.to_string())),
-            None => Err(format!(
-                "rollup_weight: the denominator of {column} must be a column name"
-            )
-            .into()),
-        })
-        .collect()
+/// The parent rules spec 2.0 (dataset metadata, section 4) allows for each semantics.
+fn allowed_space_rules(semantics: &str) -> Option<&'static [&'static str]> {
+    Some(match semantics.to_ascii_uppercase().as_str() {
+        "COUNT" | "TOTAL" => &["sum", "none"],
+        "DENSITY" => &["weighted_mean", "none"],
+        "MEASUREMENT" => &["weighted_mean", "median", "max", "min", "none"],
+        "RATE" => &["weighted_mean", "none"],
+        "CATEGORICAL" => &["majority_weighted", "none"],
+        "ORDINAL" => &["max", "min", "none"],
+        "RANGE" => &["none"],
+        _ => return None,
+    })
 }
 
-/// The rollup expression for one value column.
+/// The parent rule and weight of one value column. `rule` and `weight` are the explicit
+/// parameter if given, else the manifest value (spec 1.1 `space_aggregation`, `space_weight`).
 ///
-/// A RATE is a weighted mean: the parent is the sum of rate x denominator over the sum of the
-/// denominators. A plain average is wrong. One cell with 1 person at 100 % and one with 999
-/// people at 5 % average to 52.5 %, but the weighted rate is 5.095 %. So a RATE needs a
-/// denominator, and its rule must be a mean. A non-RATE column with a denominator is a weighted
-/// mean too. `area_weight` is the cell's share inside the query area (`1.0` when there is none).
-pub fn column_rollup_expr(
+/// With neither, COUNT and TOTAL sum, and DENSITY is a mean weighted by `area`. Other
+/// semantics have no default and must name a rule. `none` returns `None`: the column is not
+/// rolled up. Every other rule must be allowed for the semantics, and must have a weight
+/// exactly when the table says so.
+pub fn space_rule(
+    column: &str,
+    semantics: &str,
+    rule: Option<String>,
+    weight: Option<String>,
+) -> Result<Option<(String, Option<String>)>, E> {
+    let sem = semantics.to_ascii_uppercase();
+    let Some(allowed) = allowed_space_rules(&sem) else {
+        return Err(format!("column {column}: unknown semantics {semantics:?}").into());
+    };
+    let rule = match (rule, sem.as_str()) {
+        (Some(r), _) => r,
+        (None, "COUNT" | "TOTAL") => "sum".into(),
+        (None, "DENSITY") => "weighted_mean".into(),
+        (None, _) => {
+            return Err(format!(
+                "column {column} ({sem}) has no space_aggregation: name one of {}",
+                allowed.join(", ")
+            )
+            .into())
+        }
+    };
+    if rule == "none" {
+        return Ok(None);
+    }
+    if !allowed.contains(&rule.as_str()) {
+        return Err(format!(
+            "column {column}: {rule:?} is not allowed for {sem} (allowed: {})",
+            allowed.join(", ")
+        )
+        .into());
+    }
+    let weight = match (weight, sem.as_str(), rule.as_str()) {
+        (None, "DENSITY", "weighted_mean") => Some("area".to_string()),
+        (w, _, _) => w,
+    };
+    match rule.as_str() {
+        "weighted_mean" if weight.is_none() => Err(format!(
+            "column {column}: weighted_mean needs a space_weight: a COUNT or TOTAL column, or area"
+        )
+        .into()),
+        "sum" | "min" | "max" | "median" if weight.is_some() => {
+            Err(format!("column {column}: {rule} takes no space_weight").into())
+        }
+        "majority_weighted" => Err(format!(
+            "column {column}: majority_weighted is not implemented in the engine yet"
+        )
+        .into()),
+        _ => Ok(Some((rule, weight))),
+    }
+}
+
+/// The rollup expression of one column for a resolved parent rule and weight. `area_weight` is
+/// the cell's share inside the query area (`1.0` when there is none). A weight that names a
+/// field multiplies it in. `area` needs no field: cells at one level have the same area.
+pub fn space_expr(
     column: &str,
     rule: &str,
-    semantics: &str,
-    weights: &[(String, String)],
+    weight: Option<&str>,
     area_weight: &str,
 ) -> Result<String, E> {
-    let denominator = weights
-        .iter()
-        .find(|(c, _)| c == column)
-        .map(|(_, d)| d.as_str());
-    let is_mean = matches!(
-        rule.to_ascii_lowercase().as_str(),
-        "mean" | "avg" | "average" | "weighted_mean"
-    );
-    if semantics.eq_ignore_ascii_case("RATE") {
-        if !is_mean {
-            return Err(format!(
-                "column {column} is a RATE: roll it up as a weighted mean, not {rule:?}"
-            )
-            .into());
-        }
-        let Some(d) = denominator else {
-            return Err(format!(
-                "column {column} is a RATE and needs its denominator: pass rollup_weight := '{{\"{column}\": \"<denominator column>\"}}'"
-            )
-            .into());
-        };
-        return rollup_expr(
-            column,
-            "mean",
-            &format!("(r.{} * {area_weight})", sql::ident(d)),
-        );
-    }
-    match denominator {
-        Some(d) if is_mean => rollup_expr(
-            column,
-            "mean",
-            &format!("(r.{} * {area_weight})", sql::ident(d)),
-        ),
-        Some(_) => {
-            Err(format!("rollup_weight names {column}, but its rule {rule:?} is not a mean").into())
-        }
-        None => rollup_expr(column, rule, area_weight),
-    }
+    let w = match weight {
+        None | Some("area") => area_weight.to_string(),
+        Some(field) => format!("(r.{} * {area_weight})", sql::ident(field)),
+    };
+    let engine_rule = if rule == "weighted_mean" {
+        "mean"
+    } else {
+        rule
+    };
+    rollup_expr(column, engine_rule, &w).map_err(|e| format!("column {column}: {e}").into())
 }
 
 /// `rollup_level := R`: one row per level-R ancestor cell instead of one per dataset cell.
@@ -736,8 +753,8 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         if p.text("rollup_rule").is_some() {
             return Err("rollup_rule needs rollup_level".into());
         }
-        if p.text("rollup_weight").is_some() {
-            return Err("rollup_weight needs rollup_level".into());
+        if p.text("space_weight").is_some() {
+            return Err("space_weight needs rollup_level".into());
         }
         return Ok(plan);
     };
@@ -764,8 +781,8 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         .and_then(Json::as_array)
         .filter(|f| !f.is_empty())
         .ok_or("rollup_level needs the value columns of the cell manifest (value_fields)")?;
-    let over = crate::metadata::PerColumn::parse(p.text("rollup_rule"), "rollup_rule")?;
-    let weights = rollup_weights(p.text("rollup_weight").as_deref())?;
+    let over_rule = crate::metadata::PerColumn::parse(p.text("rollup_rule"), "rollup_rule")?;
+    let over_weight = crate::metadata::PerColumn::parse(p.text("space_weight"), "space_weight")?;
     let w = ctx
         .weight
         .map(|w| format!("r.{w}"))
@@ -781,25 +798,24 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         {
             continue;
         }
-        let rule = over
-            .get(name)
-            .map(str::to_string)
-            .or_else(|| {
-                f.get("aggregation_rule")
-                    .and_then(Json::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| {
-                if f.get("semantics").and_then(Json::as_str) == Some("COUNT") {
-                    "sum".into()
-                } else {
-                    "mean".into()
-                }
-            });
+        // Parameters win over the manifest (spec 1.1 space_aggregation / space_weight).
         let semantics = f.get("semantics").and_then(Json::as_str).unwrap_or("");
+        let rule = over_rule.get(name).map(str::to_string).or_else(|| {
+            f.get("space_aggregation")
+                .and_then(Json::as_str)
+                .map(str::to_string)
+        });
+        let weight = over_weight.get(name).map(str::to_string).or_else(|| {
+            f.get("space_weight")
+                .and_then(Json::as_str)
+                .map(str::to_string)
+        });
+        let Some((rule, weight)) = space_rule(name, semantics, rule, weight)? else {
+            continue; // `none`: the column is not rolled up
+        };
         aggs.push(format!(
             "{} AS {}",
-            column_rollup_expr(name, &rule, semantics, &weights, &w)?,
+            space_expr(name, &rule, weight.as_deref(), &w)?,
             sql::ident(name)
         ));
     }

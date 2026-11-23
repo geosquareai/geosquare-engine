@@ -100,7 +100,7 @@ unsafe fn register_dataset_functions(
             ("geometry_crs", Text),
             ("rollup_level", Int),
             ("rollup_rule", Text),
-            ("rollup_weight", Text),
+            ("space_weight", Text),
         ]);
         let r = (|| -> Result<(), Box<dyn Error>> {
             sql::register(
@@ -127,7 +127,7 @@ unsafe fn register_dataset_functions(
                 ("geometry_crs", Text),
                 ("rollup_level", Int),
                 ("rollup_rule", Text),
-                ("rollup_weight", Text),
+                ("space_weight", Text),
             ]);
             let mut qm = q;
             qm.push(("fill_nulls", Bool));
@@ -171,7 +171,8 @@ unsafe fn register_dataset_functions(
                 ("data_version", Text),
                 ("fill_nulls", Bool),
                 ("rollup_level", Int),
-                ("rollup_weight", Text),
+                ("space_aggregation", Text),
+                ("space_weight", Text),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),

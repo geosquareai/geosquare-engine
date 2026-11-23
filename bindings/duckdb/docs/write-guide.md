@@ -187,15 +187,18 @@ SELECT * FROM write_cell_dataset('SELECT * EXCLUDE (gid, x_idx, y_idx) FROM read
 
 `rollup_level := L` aggregates the input cells to their level-L ancestors before writing:
 one dataset of 1 km (9) or 10 km (7) cells from a 50 m one, for fast overviews of large
-areas. Each numeric column is aggregated by `aggregation_rule` (one word or
-`{column: rule}`; sum, mean, min, max); without a rule, COUNT columns (`value_semantics`) are
-summed and the others averaged. An input `coverage_ratio` (from `query_cell_dataset`)
-weights the cells and is not written.
+areas. Each numeric column is aggregated by its parent rule, `space_aggregation` (one word or
+`{column: rule}`), weighted by `space_weight` (a COUNT or TOTAL column, or `area`). The rules
+and weights follow spec 2.0, dataset metadata section 4. COUNT and TOTAL columns sum by
+default; other semantics need `space_aggregation`. `aggregation_rule` is not used here: it
+records how the source became a cell value. An input `coverage_ratio` (from
+`query_cell_dataset`) weights the cells and is not written.
 
 ```sql
 SELECT * FROM write_cell_dataset('SELECT * FROM read_cell_dataset(''/data/w_ice'')',
   '/data/w_ice_1km', layout := 'iceberg', partition_level := 5, rollup_level := 9,
-  aggregation_rule := '{"population": "sum", "workers": "sum", "non_workers": "sum"}');
+  value_semantics := '{"population": "COUNT", "workers": "COUNT", "non_workers": "COUNT"}',
+  space_aggregation := '{"population": "sum", "workers": "sum", "non_workers": "sum"}');
 SELECT level, row_count FROM cell_dataset_info('/data/w_ice_1km');
 ```
 

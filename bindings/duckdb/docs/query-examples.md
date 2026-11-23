@@ -198,19 +198,25 @@ FROM query_cell_dataset('/data/pop_ice', geometry := getvariable('tile_wkt'), wi
 
 A level-L ancestor's gid is the first L characters of the gid: level 9 = 1 km, 7 = 10 km,
 6 = 50 km, 5 = 100 km. `rollup_level := L` returns one row per level-L cell directly. Each
-value column is aggregated by its `aggregation_rule` from the cell manifest (`sum`: sum
-weighted by `coverage_ratio`, `mean`: weighted mean, `min`, `max`, `median`: the plain median
-of the children, NULL with fewer than 3 children; without a rule COUNT
-columns are summed and the others averaged). The result has `gid` and `packed_id` of the
-level-L cell, the value columns, `cell_count` (dataset cells in it) and, for an area, the
-level-L cell's own `coverage_ratio` (its share inside the area). `rollup_rule` overrides the
-rule: one word for every column or `{"column or pattern*": "sum" | "mean" | "min" | "max" | "median"}`.
-A rollup value with no child data stays NULL. It is not filled with 0.
+value column is aggregated by its parent rule, the spec 2.0 `space_aggregation` (dataset
+metadata, section 4). Its weight is `space_weight`. A manifest 1.1 dataset stores both. For
+other datasets, pass them as parameters. `rollup_rule` and `space_weight` override the
+manifest, one word for every column or `{"column": "..."}`. Allowed rules by semantics:
 
-A `RATE` column (semantics `RATE`) is a weighted mean, not a plain average. Name its denominator
-with `rollup_weight := '{"rate": "people"}'`: the parent is the sum of rate x people over the
-sum of people. A RATE with no denominator is an error, and its rule must be a mean. Any other
-mean column can take a denominator the same way. `rollup_weight` needs `rollup_level`.
+- COUNT, TOTAL: `sum`
+- MEASUREMENT: `weighted_mean` (needs a weight), `median` (3 children or NULL), `max`, `min`
+- DENSITY: `weighted_mean` by `area`
+- RATE: `weighted_mean` (needs a weight, its denominator)
+- ORDINAL: `max`, `min`
+- `none`: the column is left out of the rollup
+
+A column with no rule and no default is an error, so a value is never averaged silently. A
+rollup value with no child data stays NULL. It is not filled with 0. `coverage_ratio` (an
+area query) multiplies every weight. `rollup_rule` and `space_weight` need `rollup_level`.
+
+A RATE is a weighted mean: `space_weight` names its denominator, for example
+`space_weight := '{"rate": "people"}'`. The parent rate is the sum of rate x people over the
+sum of people.
 
 ```sql
 -- 1 km overview of an area, with the 1 km outlines
@@ -219,9 +225,9 @@ FROM query_cell_dataset('/data/pop_ice',
   geometry := 'POLYGON ((106.80 -6.20, 106.84 -6.20, 106.84 -6.16, 106.80 -6.16, 106.80 -6.20))',
   rollup_level := 9, with_geometry := 'geojson');
 
--- 10 km overview of the whole dataset, highest 50 m value per 10 km cell
+-- 10 km overview of the whole dataset: population is a COUNT, so it sums
 SELECT gid, population, cell_count
-FROM read_cell_dataset('/data/pop_part', rollup_level := 7, rollup_rule := 'max');
+FROM read_cell_dataset('/data/pop_part', rollup_level := 7);
 ```
 
 Several datasets over one area in one call: `query_cell_datasets([path, ...], ...)` (or
