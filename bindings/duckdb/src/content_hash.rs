@@ -211,20 +211,35 @@ pub struct FileHash {
 
 /// Hash the rows of a Parquet file. `gid` is the first column; `fields` follow in order.
 pub fn file_content_hash(lease: &Lease, path: &str, fields: &[ValueField]) -> Result<FileHash, E> {
+    let columns = std::iter::once("gid")
+        .chain(fields.iter().map(|f| f.name.as_str()))
+        .map(sql::ident)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT {columns} FROM read_parquet({})", sql::lit(path));
+    query_content_hash(lease, &query, fields)
+}
+
+/// Whether a declared `parquet_type` can be hashed. Other types are refused, not guessed.
+pub fn check_parquet_type(parquet_type: &str) -> Result<(), E> {
+    declared_family(parquet_type).map(|_| ())
+}
+
+/// Hash the rows a query returns, as a data file with these value fields would store them. The
+/// query lists `gid` first, then the value fields in the same order.
+pub fn query_content_hash(
+    lease: &Lease,
+    query: &str,
+    fields: &[ValueField],
+) -> Result<FileHash, E> {
     let names: Vec<&str> = std::iter::once("gid")
         .chain(fields.iter().map(|f| f.name.as_str()))
         .collect();
     let types: Vec<&str> = std::iter::once("string")
         .chain(fields.iter().map(|f| f.parquet_type.as_str()))
         .collect();
-    let columns = names
-        .iter()
-        .map(|n| sql::ident(n))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!("SELECT {columns} FROM read_parquet({})", sql::lit(path));
     let mut lines = Vec::new();
-    let rows = for_each_row(lease, &query, &types, &names, |row| {
+    let rows = for_each_row(lease, query, &types, &names, |row| {
         lines.push(encode_row(row, &types, &names)?);
         Ok(())
     })?;
@@ -236,7 +251,7 @@ pub fn file_content_hash(lease: &Lease, path: &str, fields: &[ValueField]) -> Re
 
 /// Run `query` and call `f` on each row as typed values. Checks each stored column against its
 /// declared type first. Returns the number of rows.
-fn for_each_row(
+pub(crate) fn for_each_row(
     lease: &Lease,
     query: &str,
     types: &[&str],
@@ -272,11 +287,7 @@ unsafe fn read_rows(
     let mut stored = Vec::with_capacity(columns);
     for c in 0..columns {
         let family = stored_family(duckdb_column_type(res, c as idx_t))?;
-        let declared = if c == 0 {
-            Declared::Text
-        } else {
-            declared_family(types[c])?
-        };
+        let declared = declared_family(types[c])?;
         if !compatible(declared, family) {
             return Err(format!(
                 "column {}: stored as {family:?} but declared as {}",
