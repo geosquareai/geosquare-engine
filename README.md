@@ -1,6 +1,94 @@
 # geosquare-engine
 
-Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. All 11 domains have an engine operation. VN remains non-production and provisional. See "CRS status" below.
+geosquare-engine is the grid engine for GeoSquare V2. It turns coordinates into cell codes (GIDs), and it rolls cells up to coarser cells. The same rules run in Python, in the browser, and in DuckDB.
+
+Read the [quick start](docs/quickstart.md) to run your first example in a few minutes.
+
+## Why use it
+
+- **Stable IDs across versions.** GIDs from profile 1.0.0 and 2.1.0 still match. See [profile compatibility](https://github.com/geosquareai/geosquare-v2/blob/main/docs/profile-compatibility.md).
+- **Near-square cells.** Cells are about 50 m at level 12. The comparison doc tests the cell shape in all 11 ASEAN countries. See [comparison](https://github.com/geosquareai/geosquare-v2/blob/main/docs/comparison.md).
+- **Explicit datum per country.** Each country profile names its datum and projection. See [country profiles](https://github.com/geosquareai/geosquare-v2/blob/main/docs/country-profiles.md).
+- **Same rules in browser and server.** The browser build and the server use the same Rust core. See [WebAssembly package](bindings/wasm/README.md).
+- **Correct rollups.** Weighted means and NULL handling follow the spec. See [data and aggregation](https://github.com/geosquareai/geosquare-v2/blob/main/docs/data-and-aggregation.md).
+- **Strict input.** Bad values raise an error. Nothing is rounded or cut silently.
+
+Trade-offs: H3 and S2 cover the whole globe. GeoSquare covers the 11 ASEAN domains. Geohash cells are about twice as wide as they are tall. Admin boundaries suit official reports better than grid cells.
+
+Only 6 domains are released: BN, ID, LA, MY, PH, and SG. KH, MM, TH, TL, and VN are candidate domains. Candidate use needs an explicit opt-in flag. See [CRS status](#crs-status).
+
+## Install
+
+### Python
+
+```zsh
+pip install geosquare-engine
+```
+
+Version 0.3.0 is on PyPI. It needs Python 3.11 to 3.14.
+
+### DuckDB extension
+
+The DuckDB extension is not on PyPI. Build it from this repo:
+
+```zsh
+cd bindings/duckdb
+DUCKDB_PLATFORM=osx_arm64 ./build.sh   # on Linux, use linux_amd64
+```
+
+Load it in DuckDB:
+
+```sql
+LOAD 'build/osx_arm64/geosquare_v2.duckdb_extension';
+```
+
+Start DuckDB with `duckdb -unsigned` for a local build. Linux users can also install a published build. See [the DuckDB README](bindings/duckdb/README.md).
+
+### Browser and npm
+
+The npm package is not published yet. Build the WebAssembly package from this repo:
+
+```zsh
+cargo install wasm-bindgen-cli --version 0.2.130 --locked   # once
+cd bindings/wasm
+npm run build
+```
+
+The build writes `bindings/wasm/pkg/`. See [the WebAssembly README](bindings/wasm/README.md).
+
+### gsq command-line tool
+
+The `gsq` tool is not on PyPI yet. Install it from this repo. It needs the DuckDB extension from the step above.
+
+```zsh
+python -m pip install ./cli
+export GSQ_EXTENSION="$PWD/bindings/duckdb/build/osx_arm64/geosquare_v2.duckdb_extension"
+gsq check cells.csv --domain ID
+```
+
+See [the CLI README](cli/README.md).
+
+## Quick start
+
+```python
+import geosquare_engine as gs
+
+gid = gs.encode(12, 475168, 491792)  # level 12 cell, about 50 m
+print(gid)                           # H2X545M5X4E2
+print(gs.decode(gid))                # (12, 475168, 491792)
+print(gs.parent(gid))                # H2X545M5X4E
+packed = gs.pack(1, gid)             # 1 is the ID domain
+print(packed)                        # 31528546977439304
+print(gs.unpack(packed))             # (1, 'H2X545M5X4E2')
+ring = gs.cell_polygon_wgs84(1, gid, 1000.0, False)
+print(len(ring))                     # 5: the first point repeats at the end
+```
+
+More examples are in [docs/quickstart.md](docs/quickstart.md).
+
+## Status
+
+Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. All 11 domains have an engine operation. VN remains non-production and provisional. See "CRS status" below.
 
 | Part | Status | Location |
 |---|---|---|
@@ -78,6 +166,7 @@ For Python, see `bindings/python/README.md`.
 
 The full guide is in [`docs/`](docs/README.md):
 
+- [Quick start](docs/quickstart.md): Python, pandas and Polars, DuckDB, CLI, and browser.
 - [Concepts](docs/concepts.md): GIDs, levels, domains, packed IDs, errors.
 - [Python API](docs/python-api.md): every function, with examples.
 - [Compact cell sets](docs/compact-sets.md): mixed-level areas.
