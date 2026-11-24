@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import pathlib
+import struct
 import sys
 import tempfile
 from typing import Any, Iterable
@@ -159,11 +160,19 @@ def temp_output(path: str) -> tuple[str, pathlib.Path]:
     return temporary, destination
 
 
-def copy_atomic(con: duckdb.DuckDBPyConnection, query: str, out: str) -> None:
+def copy_atomic(
+    con: duckdb.DuckDBPyConnection, query: str, out: str, metadata: dict[str, str] | None = None
+) -> None:
     fmt = output_format(out)
     temporary, destination = temp_output(out)
     try:
-        options = "(FORMAT CSV, HEADER TRUE)" if fmt == "csv" else "(FORMAT PARQUET)"
+        if fmt == "csv":
+            options = "(FORMAT CSV, HEADER TRUE)"
+        elif metadata:
+            pairs = ", ".join(f"{sql_string(k)}: {sql_string(v)}" for k, v in metadata.items())
+            options = f"(FORMAT PARQUET, KV_METADATA {{{pairs}}})"
+        else:
+            options = "(FORMAT PARQUET)"
         con.execute(f"COPY ({query}) TO {sql_string(temporary)} {options}")
         os.replace(temporary, destination)
     except Exception as exc:
@@ -362,6 +371,35 @@ def column_total(con: duckdb.DuckDBPyConnection, table: str, column: str) -> flo
     return float(row[0])
 
 
+def gid_report(con: duckdb.DuckDBPyConnection, domain: str, gid_column: str) -> dict[str, Any]:
+    """Check the GIDs of table gsq_input. Shared by `gsq check` and `gsq export`."""
+
+    try:
+        # Probe the domain once: the engine raises for an unknown domain, and per-row TRY would hide it.
+        con.execute(f"SELECT gid_to_canonical({sql_string(domain)}, 'H2X545V39')").fetchall()
+    except Exception as exc:
+        raise UsageError(f"unknown domain {domain}: {exc}") from exc
+    columns = [row[0] for row in con.execute("DESCRIBE gsq_input").fetchall()]
+    require_columns(columns, [gid_column])
+    gid = sql_identifier(gid_column)
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE gsq_check AS SELECT row_number() OVER () AS row_no, "
+        f"CAST({gid} AS VARCHAR) AS gid, "
+        f"TRY(gid_to_canonical({sql_string(domain)}, CAST({gid} AS VARCHAR))) AS cell FROM gsq_input"
+    )
+    return {
+        "rows": con.execute("SELECT count(*) FROM gsq_check").fetchone()[0],
+        "levels": [r[0] for r in con.execute(
+            "SELECT DISTINCT cell.level FROM gsq_check WHERE cell IS NOT NULL ORDER BY 1").fetchall()],
+        "invalid_gids": [list(r) for r in con.execute(
+            "SELECT row_no, gid FROM gsq_check WHERE cell IS NULL ORDER BY row_no").fetchall()],
+        "duplicate_gids": [list(r) for r in con.execute(
+            "SELECT gid, count(*) FROM gsq_check WHERE gid IS NOT NULL "
+            "GROUP BY gid HAVING count(*) > 1 ORDER BY gid").fetchall()],
+        "totals": None,
+    }
+
+
 def run_check(args: argparse.Namespace) -> int:
     domain = args.domain.upper()
     if args.value and not args.source:
@@ -370,32 +408,13 @@ def run_check(args: argparse.Namespace) -> int:
         raise UsageError("--source needs --value")
     con = connect(args.extension)
     try:
-        try:
-            # Probe the domain once: the engine raises for an unknown domain, and per-row TRY would hide it.
-            con.execute(f"SELECT gid_to_canonical({sql_string(domain)}, 'H2X545V39')").fetchall()
-        except Exception as exc:
-            raise UsageError(f"unknown domain {domain}: {exc}") from exc
         columns = create_input_table(con, args.input)
         require_columns(columns, [args.gid_column])
-        gid = sql_identifier(args.gid_column)
-        con.execute(
-            "CREATE OR REPLACE TEMP TABLE gsq_check AS SELECT row_number() OVER () AS row_no, "
-            f"CAST({gid} AS VARCHAR) AS gid, "
-            f"TRY(gid_to_canonical({sql_string(domain)}, CAST({gid} AS VARCHAR))) AS cell FROM gsq_input"
-        )
         report: dict[str, Any] = {
             "input": args.input,
             "gid_column": args.gid_column,
             "domain": domain,
-            "rows": con.execute("SELECT count(*) FROM gsq_check").fetchone()[0],
-            "levels": [r[0] for r in con.execute(
-                "SELECT DISTINCT cell.level FROM gsq_check WHERE cell IS NOT NULL ORDER BY 1").fetchall()],
-            "invalid_gids": [list(r) for r in con.execute(
-                "SELECT row_no, gid FROM gsq_check WHERE cell IS NULL ORDER BY row_no").fetchall()],
-            "duplicate_gids": [list(r) for r in con.execute(
-                "SELECT gid, count(*) FROM gsq_check WHERE gid IS NOT NULL "
-                "GROUP BY gid HAVING count(*) > 1 ORDER BY gid").fetchall()],
-            "totals": None,
+            **gid_report(con, domain, args.gid_column),
         }
         if args.source:
             source_columns = create_input_table(con, args.source, "gsq_source")
@@ -421,6 +440,150 @@ def run_check(args: argparse.Namespace) -> int:
                 print(f"  {problem}")
             print("OK" if report["ok"] else f"{len(problems)} problem(s) found")
         return 0 if report["ok"] else 1
+    finally:
+        con.close()
+
+
+GEOMETRY_COLUMN = "geometry"
+WGS84_PROJJSON = {
+    "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
+    "type": "GeographicCRS",
+    "name": "WGS 84",
+    "datum": {
+        "type": "GeodeticReferenceFrame",
+        "name": "World Geodetic System 1984",
+        "ellipsoid": {"name": "WGS 84", "semi_major_axis": 6378137, "inverse_flattening": 298.257223563},
+    },
+    "coordinate_system": {
+        "subtype": "ellipsoidal",
+        "axis": [
+            {"name": "Geodetic longitude", "abbreviation": "Lon", "direction": "east", "unit": "degree"},
+            {"name": "Geodetic latitude", "abbreviation": "Lat", "direction": "north", "unit": "degree"},
+        ],
+    },
+    "id": {"authority": "EPSG", "code": 4326},
+}
+
+
+def polygon_wkb(geometry: dict[str, Any]) -> bytes:
+    """Encode a GeoJSON Polygon as little-endian WKB (ISO type 3)."""
+
+    rings = geometry["coordinates"]
+    parts = [struct.pack("<BII", 1, 3, len(rings))]
+    for ring in rings:
+        parts.append(struct.pack("<I", len(ring)))
+        parts.extend(struct.pack("<dd", x, y) for x, y in ring)
+    return b"".join(parts)
+
+
+def kepler_type(duck_type: str) -> str:
+    name = duck_type.upper()
+    if "INTERVAL" in name:
+        return "string"
+    if "INT" in name:
+        return "integer"
+    if name.startswith(("DOUBLE", "FLOAT", "REAL", "DECIMAL")):
+        return "real"
+    return "string"
+
+
+def kepler_config(dataset: str, bounds: list[float], color: str | None, color_type: str | None) -> dict[str, Any]:
+    """A Kepler.gl map config with one GeoJSON layer on the geometry column."""
+
+    layer: dict[str, Any] = {
+        "dataId": dataset,
+        "label": dataset,
+        "isVisible": True,
+        "columns": {"geojson": GEOMETRY_COLUMN},
+        "visConfig": {"opacity": 0.8, "filled": True, "stroked": False, "thickness": 0.5},
+    }
+    if color:
+        layer["colorField"] = {"name": color, "type": color_type}
+        layer["colorScale"] = "quantile" if color_type in {"integer", "real"} else "ordinal"
+        layer["colorRange"] = {
+            "name": "GeoSquare",
+            "type": "sequential",
+            "category": "Custom",
+            "colors": ["#5A1846", "#900C3F", "#C70039", "#E3611C", "#F1920E", "#FFC300"],
+        }
+    west, south, east, north = bounds
+    return {
+        "version": "v1",
+        "config": {
+            "visState": {"layers": [{"id": f"{dataset}-layer", "type": "geojson", "config": layer}]},
+            "mapState": {"bounds": {"west": west, "south": south, "east": east, "north": north}},
+        },
+    }
+
+
+def run_export(args: argparse.Namespace) -> int:
+    if args.color and not args.kepler:
+        raise UsageError("--color needs --kepler")
+    if output_format(args.out) != "parquet":
+        raise UsageError(f"export writes GeoParquet; --out must end in .parquet: {args.out}")
+    domain = args.domain.upper()
+    if domain in CANDIDATE_DOMAINS and not args.allow_candidate_crs:
+        raise CLIError(f"domain {domain} is a candidate CRS; pass --allow-candidate-crs for technical use")
+    con = connect(args.extension)
+    try:
+        create_input_table(con, args.input)
+        types = {row[0]: row[1] for row in con.execute("DESCRIBE gsq_input").fetchall()}
+        if GEOMETRY_COLUMN in types:
+            raise CLIError(f"input already has a column named {GEOMETRY_COLUMN}")
+        if args.color:
+            require_columns(types, [args.color])
+        report = gid_report(con, domain, args.gid_column)
+        problems = check_problems(report)
+        if problems:
+            raise CLIError("input failed gsq check:\n  " + "\n  ".join(problems))
+
+        names, rows = rows_for_geojson(con, domain, args.gid_column, "EPSG:4326", args.allow_candidate_crs)
+        west = south = float("inf")
+        east = north = float("-inf")
+        values = []
+        for row in rows:
+            geometry = json.loads(row[-1])
+            for lon, lat in geometry["coordinates"][0]:
+                west, east = min(west, lon), max(east, lon)
+                south, north = min(south, lat), max(north, lat)
+            values.append((*row[:-1], polygon_wkb(geometry)))
+
+        con.execute("CREATE OR REPLACE TEMP TABLE gsq_export AS SELECT * FROM gsq_input LIMIT 0")
+        con.execute(f"ALTER TABLE gsq_export ADD COLUMN {sql_identifier(GEOMETRY_COLUMN)} BLOB")
+        placeholders = ", ".join("?" for _ in range(len(names)))
+        con.executemany(f"INSERT INTO gsq_export VALUES ({placeholders})", values)
+
+        bbox = [west, south, east, north]
+        geo = {
+            "version": "1.1.0",
+            "primary_column": GEOMETRY_COLUMN,
+            "columns": {
+                GEOMETRY_COLUMN: {
+                    "encoding": "WKB",
+                    "geometry_types": ["Polygon"],
+                    "crs": WGS84_PROJJSON,
+                    "bbox": bbox,
+                }
+            },
+        }
+        copy_atomic(con, "SELECT * FROM gsq_export", args.out, {"geo": json.dumps(geo, separators=(",", ":"))})
+
+        if args.kepler:
+            dataset = pathlib.Path(args.out).stem
+            color_type = kepler_type(types[args.color]) if args.color else None
+            config = kepler_config(dataset, bbox, args.color, color_type)
+            temporary, destination = temp_output(args.kepler)
+            try:
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    json.dump(config, handle, indent=2)
+                os.replace(temporary, destination)
+            except OSError as exc:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise CLIError(f"could not write {args.kepler}: {exc}") from exc
+        return 0
     finally:
         con.close()
 
@@ -466,6 +629,17 @@ def build_parser() -> argparse.ArgumentParser:
     geo.add_argument("--crs", choices=("EPSG:4326", "grid"), default="EPSG:4326")
     geo.add_argument("--allow-candidate-crs", action="store_true")
     geo.set_defaults(func=run_to_geo)
+
+    export = sub.add_parser("export", help="write cells as GeoParquet, with an optional Kepler.gl config")
+    export.add_argument("input")
+    export.add_argument("--extension", dest="command_extension")
+    export.add_argument("--domain", required=True, help="domain of the GIDs, e.g. ID")
+    export.add_argument("-o", "--out", required=True, help="output .parquet file")
+    export.add_argument("--gid-column", default="gid")
+    export.add_argument("--allow-candidate-crs", action="store_true")
+    export.add_argument("--kepler", help="also write a Kepler.gl map config (JSON) to this path")
+    export.add_argument("--color", help="column to color the Kepler layer by (needs --kepler)")
+    export.set_defaults(func=run_export)
 
     check = sub.add_parser("check", help="check GID quality before upload")
     check.add_argument("input")

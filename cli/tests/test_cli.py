@@ -193,3 +193,53 @@ def test_check_parquet_input(tmp_path: Path) -> None:
     result = run_gsq("check", str(source), "--domain", "ID", "--json", extension_path=extension())
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["rows"] == 3
+
+
+def test_export_geoparquet_keeps_values_and_nulls(tmp_path: Path) -> None:
+    import duckdb
+
+    source = tmp_path / "cells.csv"
+    output = tmp_path / "cells.parquet"
+    write_csv(source, [{"gid": gid, "value": None if i == 1 else i + 1} for i, gid in enumerate(GIDS)])
+    result = run_gsq("export", str(source), "--domain", "ID", "-o", str(output), extension_path=extension())
+    assert result.returncode == 0, result.stderr
+    con = duckdb.connect()
+    rows = con.execute(f"SELECT gid, value, CAST(geometry AS BLOB) FROM read_parquet('{output}') ORDER BY gid").fetchall()
+    assert len(rows) == len(GIDS)
+    assert [row[1] for row in sorted(rows, key=lambda r: GIDS.index(r[0]))] == [1, None, 3]
+    for _, _, wkb in rows:
+        # Little-endian WKB header, geometry type 3 (Polygon).
+        assert wkb[:5] == b"\x01\x03\x00\x00\x00"
+    geo = json.loads(con.execute(f"SELECT value FROM parquet_kv_metadata('{output}') WHERE key = 'geo'").fetchone()[0])
+    assert geo["primary_column"] == "geometry"
+    assert geo["columns"]["geometry"]["encoding"] == "WKB"
+    assert geo["columns"]["geometry"]["geometry_types"] == ["Polygon"]
+
+
+def test_export_refuses_bad_gid(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    output = tmp_path / "cells.parquet"
+    write_csv(source, [{"gid": "H2X545V39", "value": 1}, {"gid": "NOTAGID", "value": 2}])
+    result = run_gsq("export", str(source), "--domain", "ID", "-o", str(output), extension_path=extension())
+    assert result.returncode == 1
+    assert "invalid GID at row 2: NOTAGID" in result.stderr
+    assert not output.exists()
+
+
+def test_export_kepler_config_colors_by_column(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    output = tmp_path / "cells.parquet"
+    config = tmp_path / "cells.kepler.json"
+    write_csv(source, [{"gid": gid, "value": i + 1} for i, gid in enumerate(GIDS)])
+    result = run_gsq(
+        "export", str(source), "--domain", "ID", "-o", str(output),
+        "--kepler", str(config), "--color", "value", extension_path=extension(),
+    )
+    assert result.returncode == 0, result.stderr
+    layer = json.loads(config.read_text())["config"]["visState"]["layers"][0]["config"]
+    assert layer["dataId"] == "cells"
+    assert layer["columns"] == {"geojson": "geometry"}
+    assert layer["colorField"] == {"name": "value", "type": "integer"}
+    result = run_gsq("export", str(source), "--domain", "ID", "-o", str(output), "--color", "value", extension_path=extension())
+    assert result.returncode == 2
+    assert "--color needs --kepler" in result.stderr

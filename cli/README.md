@@ -96,6 +96,26 @@ gsq check cells.csv --domain ID --source source.csv --value population --json
 The command exits 0 when no problem is found and 1 when it finds one. An empty
 file counts as a problem. `--json` prints the full report on stdout.
 
+### Export GeoParquet and a Kepler.gl map
+
+`export` writes the cells as GeoParquet. Each row becomes one polygon in a
+`geometry` column (WKB, WGS84). All other columns are kept. The file opens
+directly in QGIS, DuckDB, and GeoPandas.
+
+The input must pass the same GID check as `check`. Bad input is refused and no
+file is written. `--out` must end in `.parquet`. Candidate domains need
+`--allow-candidate-crs`.
+
+```zsh
+gsq export cells.csv --domain ID -o cells.parquet
+gsq export cells.csv --domain ID -o cells.parquet --kepler cells.kepler.json --color population
+```
+
+`--kepler` writes a Kepler.gl map config with one GeoJSON layer on `geometry`.
+Load the Parquet file in Kepler.gl with the dataset name equal to the file name
+without `.parquet` (for example `cells`), then import the config. `--color`
+colors the layer by that column and needs `--kepler`.
+
 ## Errors and output safety
 
 Usage errors exit with status 2. Data and validation errors exit with status 1
@@ -121,3 +141,13 @@ diperlukan. Domain kandidat KH, MM, TH, TL, dan VN wajib memakai
 GID yang tidak valid untuk `--domain`, GID kembar, level yang bercampur, dan
 selisih total kolom bila `--source` dan `--value` diberikan. Exit code 0 berarti
 tidak ada masalah, 1 berarti ada masalah.
+
+`export` menulis sel ke GeoParquet. Setiap baris jadi satu poligon di kolom
+`geometry` (WKB, WGS84). Semua kolom lain tetap ada. File ini bisa langsung
+dibuka di QGIS, DuckDB, dan GeoPandas. Input wajib lolos cek GID yang sama
+dengan `check`. Input yang buruk ditolak dan tidak ada file yang ditulis.
+`--out` harus berakhiran `.parquet`.
+
+`--kepler` menulis konfigurasi peta Kepler.gl dengan satu layer GeoJSON di
+kolom `geometry`. Nama dataset di Kepler.gl adalah nama file tanpa `.parquet`.
+`--color` mewarnai layer menurut kolom itu dan butuh `--kepler`.
