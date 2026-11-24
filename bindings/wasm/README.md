@@ -6,8 +6,10 @@ Status: the codec, packing, topology, detector, cell geometry, rollup, and deck.
 
 ## Use
 
+The `"geosquare-engine"` import works after the npm package is published. Until then, in this repo, import from the build output instead: `./pkg/geosquare_wasm.js`.
+
 ```js
-import init, { encode, decode, pack, unpack, kRing, detectTable } from "geosquare-engine";
+import init, { encode, decode, pack, unpack, kRing, detectTable } from "./pkg/geosquare_wasm.js"; // after npm publish: "geosquare-engine"
 
 await init(); // call once, before any other function
 
@@ -164,8 +166,10 @@ Status: codec, packing, topologi, detector, geometri sel, rollup, dan layer deck
 
 ## Pakai
 
+Import `"geosquare-engine"` baru bisa dipakai setelah paket npm dipublikasikan. Sampai saat itu, di repo ini, import dari hasil build: `./pkg/geosquare_wasm.js`.
+
 ```js
-import init, { encode, decode, pack, unpack, kRing, detectTable } from "geosquare-engine";
+import init, { encode, decode, pack, unpack, kRing, detectTable } from "./pkg/geosquare_wasm.js"; // setelah publish npm: "geosquare-engine"
 
 await init(); // sekali saja, sebelum fungsi lain dipanggil
 

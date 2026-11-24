@@ -13,7 +13,7 @@ Read the [quick start](docs/quickstart.md) to run your first example in a few mi
 - **Correct rollups.** Weighted means and NULL handling follow the spec. See [data and aggregation](https://github.com/geosquareai/geosquare-v2/blob/main/docs/data-and-aggregation.md).
 - **Strict input.** Bad values raise an error. Nothing is rounded or cut silently.
 
-Trade-offs: H3 and S2 cover the whole globe. GeoSquare covers the 11 ASEAN domains. Geohash cells are about twice as wide as they are tall. Admin boundaries suit official reports better than grid cells.
+Trade-offs: [H3](https://github.com/geosquareai/geosquare-v2/blob/main/docs/comparison.md#6-h3) and [S2](https://github.com/geosquareai/geosquare-v2/blob/main/docs/comparison.md#5-s2) cover the whole globe. GeoSquare covers the 11 ASEAN domains. [Geohash cells](https://github.com/geosquareai/geosquare-v2/blob/main/docs/comparison.md#4-asean-result) are about twice as wide as they are tall. Admin boundaries suit official reports better than grid cells.
 
 Only 6 domains are released: BN, ID, LA, MY, PH, and SG. KH, MM, TH, TL, and VN are candidate domains. Candidate use needs an explicit opt-in flag. See [CRS status](#crs-status).
 
@@ -42,7 +42,7 @@ Load it in DuckDB:
 LOAD 'build/osx_arm64/geosquare_v2.duckdb_extension';
 ```
 
-Start DuckDB with `duckdb -unsigned` for a local build. Linux users can also install a published build. See [the DuckDB README](bindings/duckdb/README.md).
+Start DuckDB with `duckdb -unsigned` for a local build. Linux users can also install a published build. See [Install in the DuckDB README](bindings/duckdb/README.md#install).
 
 ### Browser and npm
 
@@ -125,7 +125,7 @@ The CRS code is in `core/src/projection.rs` (Lambert Conic Conformal 2SP and Tra
 Mercator), `core/src/domain.rs` (the 11 domains from registry 2.0.0), and `core/src/geo.rs`
 (point to cell, cell to WGS84 polygon). The reference is PROJ 9.5.1 via pyproj 3.7.1.
 
-Measured on 300 spread-out points inside each boundary. The explicit pipelines match pinned PROJ for ID, LA, and PH.
+The explicit pipelines match pinned PROJ for ID, LA, and PH.
 
 Six domains are released under the GeoSquare support policy. Five domains remain candidate-only. Candidate CRS use must be explicit.
 

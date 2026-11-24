@@ -84,7 +84,7 @@ cells         529
 that covers the polygon.
 
 Candidate domains need one extra argument. `point_to_cell('VN', ...)` without it fails with
-`domain VN is not released`. Add `true` only for technical work. It does not make the domain released:
+`domain VN is not released for lon/lat: pass the explicit candidate opt-in for technical use`. Add `true` only for technical work. It does not make the domain released:
 
 ```sql
 SELECT point_to_cell('VN', 107.868144, 15.981051, 5, true).gid AS vn;
