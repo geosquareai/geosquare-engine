@@ -108,7 +108,11 @@ test("bad rules and values throw instead of returning a number", () => {
   assert.throws(() => rollupToLevel(bad, 10, { v: { rule: "sum" } }), /finite numbers or null/);
 });
 
-test("levelForZoom maps zoom to level 12, 11, 10 or 9", () => {
-  assert.deepEqual([16, 15, 14, 13, 12, 11, 3].map(levelForZoom), [12, 12, 11, 10, 10, 9, 9]);
+test("levelForZoom only returns levels the pyramid holds (12, 10, 8)", () => {
+  // zoom 14 and up: 12; zoom 11 to 13: 10; zoom 10 and below: 8 (no level 11 or 9 in the pyramid)
+  assert.deepEqual([18, 14, 13, 11, 10, 3].map(levelForZoom), [12, 12, 10, 10, 8, 8]);
+  for (const zoom of [0, 5, 9, 10, 11, 12, 13, 14, 20]) {
+    assert.ok([12, 10, 8].includes(levelForZoom(zoom)), `zoom ${zoom}`);
+  }
   assert.throws(() => levelForZoom(NaN), /finite number/);
 });

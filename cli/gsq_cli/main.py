@@ -8,12 +8,16 @@ writes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import pathlib
+import shutil
 import struct
 import sys
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import duckdb
@@ -588,6 +592,282 @@ def run_export(args: argparse.Namespace) -> int:
         con.close()
 
 
+PYRAMID_BASE = 12
+# Coarser pyramid levels. Partition level is level - 5 (pyramid spec section 4). Fan-in is the
+# number of base cells under one parent cell at that level (spec section 6.2).
+PYRAMID_FAN_IN = {10: 100, 8: 10000}
+PYRAMID_RULES = {"sum", "weighted_mean", "median", "max", "min"}
+
+
+def cell_dataset_manifest(path: str) -> dict[str, Any]:
+    """Read the manifest of the base cell dataset. Pyramid input must be one (pyramid spec section 5)."""
+
+    folder = pathlib.Path(path)
+    if not folder.is_dir():
+        raise CLIError(
+            f"pyramid input must be a cell dataset folder with manifest 1.1, not a file: {path}. "
+            "Spec section 5 copies the grid fields and source from the base manifest, and a CSV or "
+            "Parquet file has none. Write it as a dataset first: write_cell_dataset(..., manifest_version := '1.1')."
+        )
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        raise CLIError(f"{path} has no manifest.json; pyramid needs a cell dataset folder")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CLIError(f"could not read {manifest_path}: {exc}") from exc
+    if manifest.get("manifest_version") != "1.1":
+        raise CLIError(
+            f"pyramid needs manifest 1.1 (spec section 5), {path} has {manifest.get('manifest_version')!r}"
+        )
+    return manifest
+
+
+def parse_value(text: str) -> tuple[str, str, str | None]:
+    """Parse NAME=RULE or NAME=weighted_mean:WEIGHT into (name, rule, weight)."""
+
+    name, sep, spec = text.partition("=")
+    if not sep or not name or not spec:
+        raise UsageError(f"--value needs NAME=RULE, got {text!r}")
+    rule, _, weight = spec.partition(":")
+    if rule not in PYRAMID_RULES:
+        raise UsageError(f"{name}: unknown space_aggregation {rule!r}; use sum, weighted_mean, median, max or min")
+    if rule == "weighted_mean" and not weight:
+        raise UsageError(f"{name}: weighted_mean needs a weight, use {name}=weighted_mean:WEIGHT")
+    if rule != "weighted_mean" and weight:
+        raise UsageError(f"{name}: only weighted_mean takes a weight")
+    return name, rule, weight or None
+
+
+def rollup_sql(name: str, rule: str, weight: str | None) -> str:
+    """One parent value over the base rows of a group (spec pyramid section 6.1)."""
+
+    col = sql_identifier(name)
+    if rule == "sum" or rule == "max" or rule == "min":
+        return f"{rule}({col})"
+    if rule == "median":
+        # Null when fewer than 3 children have a value.
+        return f"CASE WHEN count({col}) >= 3 THEN median({col}) END"
+    w = "1.0" if weight == "area" else sql_identifier(weight)
+    usable = f"{col} IS NOT NULL AND {w} IS NOT NULL"
+    return (
+        f"sum({col} * {w}) FILTER (WHERE {usable}) / "
+        f"NULLIF(sum({w}) FILTER (WHERE {usable}), 0)"
+    )
+
+
+def encode_element(value: Any) -> str:
+    """One element of a content-hash row (dataset-metadata 3.1). Shortcut: gid and doubles only."""
+
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise CLIError(f"content hash rejects {value}")
+        return repr(value)
+    raise CLIError(f"content hash has no encoding for {type(value).__name__}")
+
+
+def content_sha256(rows: list[tuple[Any, ...]]) -> str:
+    """SHA-256 over the sorted encoded rows, one line feed after each row (dataset-metadata 3.1)."""
+
+    encoded = sorted("[" + ",".join(encode_element(v) for v in row) + "]" for row in rows)
+    digest = hashlib.sha256()
+    for line in encoded:
+        digest.update(line.encode("utf-8") + b"\n")
+    return digest.hexdigest()
+
+
+def digest_of_hashes(hashes: list[tuple[str, str]]) -> str:
+    """Digest of file hashes, ordered by path (pyramid spec section 6.3)."""
+
+    digest = hashlib.sha256()
+    for _, value in sorted(hashes, key=lambda item: item[0].encode("utf-8")):
+        digest.update(value.encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def pyramid_check_inputs(con: duckdb.DuckDBPyConnection, values, share: str | None) -> None:
+    """Refuse values that would not roll up or hash correctly. Runs on gsq_input."""
+
+    problems: list[str] = []
+    for name, _, weight in values:
+        col = sql_identifier(name)
+        bad = con.execute(
+            f"SELECT count(*) FILTER (WHERE {col} IS NOT NULL AND TRY_CAST({col} AS DOUBLE) IS NULL), "
+            f"count(*) FILTER (WHERE NOT isfinite(TRY_CAST({col} AS DOUBLE))) FROM gsq_input"
+        ).fetchone()
+        if bad[0]:
+            problems.append(f"{name}: {bad[0]} value(s) are not numbers")
+        if bad[1]:
+            problems.append(f"{name}: {bad[1]} value(s) are NaN or infinite")
+        if weight and weight != "area":
+            negative = con.execute(
+                f"SELECT count(*) FROM gsq_input WHERE TRY_CAST({sql_identifier(weight)} AS DOUBLE) < 0"
+            ).fetchone()[0]
+            if negative:
+                problems.append(f"{weight}: {negative} negative weight(s)")
+    if share:
+        col = sql_identifier(share)
+        bad = con.execute(
+            f"SELECT count(*) FROM gsq_input WHERE {col} IS NULL OR TRY_CAST({col} AS DOUBLE) IS NULL "
+            f"OR TRY_CAST({col} AS DOUBLE) < 0 OR TRY_CAST({col} AS DOUBLE) > 1"
+        ).fetchone()[0]
+        if bad:
+            problems.append(f"{share}: {bad} share value(s) are null or outside [0, 1]")
+    if problems:
+        raise CLIError("input failed gsq pyramid checks:\n  " + "\n  ".join(problems))
+
+
+def write_level(
+    con: duckdb.DuckDBPyConnection, table: str, level: int, names: list[str], share: str | None, staging: pathlib.Path
+) -> dict[str, Any]:
+    """Write one level as partition files under level=<L>/gid_prefix=<p>/part-00000.parquet."""
+
+    partition = level - 5
+    columns = ["gid", *names, *([share] if share else [])]
+    select = ", ".join(sql_identifier(c) for c in columns)
+    prefixes = [r[0] for r in con.execute(
+        f"SELECT DISTINCT left(gid, {partition}) FROM {table} ORDER BY 1").fetchall()]
+    files: list[dict[str, Any]] = []
+    for prefix in prefixes:
+        relative = f"level={level}/gid_prefix={prefix}/part-00000.parquet"
+        target = staging / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        where = f"WHERE left(gid, {partition}) = {sql_string(prefix)} ORDER BY gid"
+        con.execute(f"COPY (SELECT {select} FROM {table} {where}) TO {sql_string(str(target))} (FORMAT parquet)")
+        # Hash what is on disk, not the table, so the manifest describes the written file.
+        rows = con.execute(f"SELECT {select} FROM read_parquet({sql_string(str(target))}) ORDER BY gid").fetchall()
+        entry = {
+            "gid_prefix": prefix,
+            "path": relative,
+            "row_count": len(rows),
+            "gid_min": rows[0][0],
+            "gid_max": rows[-1][0],
+            # Value hash covers gid and the value columns; the share column has its own hash.
+            "content_sha256": content_sha256([r[: 1 + len(names)] for r in rows]),
+            "share_sha256": content_sha256([(r[0], r[-1]) for r in rows]) if share else None,
+        }
+        files.append(entry)
+    return {
+        "level": level,
+        "partition_level": partition,
+        "row_count": sum(f["row_count"] for f in files),
+        "content_sha256": digest_of_hashes([(f["path"], f["content_sha256"]) for f in files]),
+        "files": files,
+    }
+
+
+def run_pyramid(args: argparse.Namespace) -> int:
+    base = cell_dataset_manifest(args.input)
+    domain = args.domain.upper()
+    if base.get("domain_code") != domain:
+        raise UsageError(f"--domain {domain} does not match the dataset domain {base.get('domain_code')}")
+    values = [parse_value(text) for text in args.value]
+    if not values:
+        raise UsageError("pyramid needs at least one --value NAME=RULE")
+    names = [name for name, _, _ in values]
+    if len(set(names)) != len(names):
+        raise UsageError("each --value column may be given once")
+    summed = {name for name, rule, _ in values if rule == "sum"}
+    semantics = {field["name"]: field.get("semantics") for field in base.get("value_fields", [])}
+    for name, _, weight in values:
+        if weight and weight != "area" and weight not in summed:
+            raise UsageError(f"{name}: weight {weight} must be a column declared with sum")
+        if weight and weight != "area" and semantics.get(weight) not in ("COUNT", "TOTAL"):
+            raise UsageError(f"{name}: weight {weight} must be a COUNT or TOTAL column (spec section 8, item 11)")
+    out = pathlib.Path(args.out)
+    if out.exists():
+        raise CLIError(f"output already exists: {out}")
+    if not out.parent.is_dir():
+        raise CLIError(f"output directory does not exist: {out.parent}")
+    if args.share_column and args.share_column in names:
+        raise UsageError("the share column cannot also be a value column")
+
+    con = connect(args.extension)
+    try:
+        columns = create_input_table(con, args.input)
+        requested = [args.gid_column, *names, *([args.share_column] if args.share_column else [])]
+        require_columns(columns, requested)
+        report = gid_report(con, domain, args.gid_column)
+        problems = check_problems(report)
+        if report["levels"] != [PYRAMID_BASE]:
+            problems.append(f"pyramid base must be level {PYRAMID_BASE}, found {report['levels']}")
+        if problems:
+            raise CLIError("input failed gsq check:\n  " + "\n  ".join(problems))
+        pyramid_check_inputs(con, values, args.share_column)
+
+        gid = sql_identifier(args.gid_column)
+        cast = ", ".join(f"CAST({sql_identifier(n)} AS DOUBLE) AS {sql_identifier(n)}" for n in names)
+        share_select = f", CAST({sql_identifier(args.share_column)} AS DOUBLE) AS {sql_identifier(args.share_column)}" if args.share_column else ""
+        con.execute(
+            f"CREATE OR REPLACE TEMP TABLE gsq_base AS SELECT CAST({gid} AS VARCHAR) AS gid, {cast}{share_select} FROM gsq_input"
+        )
+        base_rows = con.execute(f"SELECT count(*) FROM gsq_base").fetchone()[0]
+
+        staging = pathlib.Path(tempfile.mkdtemp(prefix=".pyramid-", dir=out.parent))
+        try:
+            levels = [write_level(con, "gsq_base", PYRAMID_BASE, names, args.share_column, staging)]
+            for level, fan_in in PYRAMID_FAN_IN.items():
+                parent_sql = f"left(gid, {level}) AS gid"
+                aggregates = ", ".join(
+                    f"{rollup_sql(name, rule, weight)} AS {sql_identifier(name)}" for name, rule, weight in values
+                )
+                share_agg = (
+                    f", sum({sql_identifier(args.share_column)}) / {fan_in} AS {sql_identifier(args.share_column)}"
+                    if args.share_column else ""
+                )
+                con.execute(
+                    f"CREATE OR REPLACE TEMP TABLE gsq_level_{level} AS SELECT {parent_sql}, {aggregates}{share_agg} "
+                    f"FROM gsq_base GROUP BY 1"
+                )
+                levels.append(write_level(con, f"gsq_level_{level}", level, names, args.share_column, staging))
+
+            base_level = levels[0]
+            columns_meta = [
+                {
+                    "name": name,
+                    "parquet_type": "double",
+                    "space_aggregation": rule,
+                    "space_weight": weight,
+                }
+                for name, rule, weight in values
+            ]
+            manifest = {
+                "pyramid_version": "1.0",
+                "grid_system": base["grid_system"],
+                "grid_version": base["grid_version"],
+                "domain_code": base["domain_code"],
+                "profile_version": base["profile_version"],
+                "registry_version": base["registry_version"],
+                "source": {
+                    "dataset_id": pathlib.Path(args.input).resolve().name,
+                    "manifest_version": base["manifest_version"],
+                    "base_level": PYRAMID_BASE,
+                    "row_count": base_rows,
+                    "content_sha256": base_level["content_sha256"],
+                },
+                "share_column": args.share_column,
+                "columns": columns_meta,
+                "levels": levels,
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "created_by": f"gsq pyramid {__version__}",
+            }
+            with open(staging / "pyramid.json", "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2)
+            os.replace(staging, out)
+        except BaseException:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        files = sum(len(level["files"]) for level in levels)
+        print(f"wrote {out}: {len(levels)} levels, {files} files, base rows {base_rows}")
+        return 0
+    finally:
+        con.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gsq", description="GeoSquare engine command-line tool")
     parser.add_argument("--version", action="version", version=__version__)
@@ -650,6 +930,17 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--value", help="column to total in both files (with --source)")
     check.add_argument("--json", action="store_true", help="print a JSON report")
     check.set_defaults(func=run_check)
+
+    pyramid = sub.add_parser("pyramid", help="write a cell pyramid: levels 12, 10 and 8 for a map")
+    pyramid.add_argument("input", help="base level 12 cell dataset folder with manifest 1.1")
+    pyramid.add_argument("--extension", dest="command_extension")
+    pyramid.add_argument("--domain", required=True, help="domain of the GIDs, e.g. ID")
+    pyramid.add_argument("-o", "--out", required=True, help="new folder to write, e.g. out/pyramid")
+    pyramid.add_argument("--gid-column", default="gid")
+    pyramid.add_argument("--value", action="append", default=[], metavar="NAME=RULE",
+                         help="value column and its rule: sum, max, min, median, or weighted_mean:WEIGHT (repeatable)")
+    pyramid.add_argument("--share-column", help="edge share column, a number in [0, 1]")
+    pyramid.set_defaults(func=run_pyramid)
     return parser
 
 

@@ -116,6 +116,45 @@ Load the Parquet file in Kepler.gl with the dataset name equal to the file name
 without `.parquet` (for example `cells`), then import the config. `--color`
 colors the layer by that column and needs `--kepler`.
 
+### Cell pyramid
+
+`pyramid` writes a base level 12 cell dataset as a pyramid: levels 12, 10 and 8. A map
+reads the level that fits its zoom and only the files on screen. The output is
+static files plus `pyramid.json`, the index.
+
+The input is a cell dataset folder with manifest 1.1. The grid fields, `profile_version`,
+`registry_version` and `manifest_version` are copied from its `manifest.json`. A raw CSV or
+Parquet file is refused, because it has no manifest to copy (spec section 5).
+
+```zsh
+gsq pyramid dataset12/ --domain ID -o out/pyramid \
+  --value population=sum --value unemployment=weighted_mean:population \
+  --value flood_m=max --share-column share_in_aoi
+```
+
+- `--value NAME=RULE` declares a value column. Rules: `sum`, `max`, `min`, `median`
+  (needs 3 values, else null), and `weighted_mean:WEIGHT`. The weight must be a
+  `sum` column with COUNT or TOTAL semantics in the dataset manifest, or `area`
+  (every cell weighs the same). Spec section 8, item 11.
+- Coarser levels group the base rows by parent GID. A parent value is the rule
+  applied to its children. Nulls are skipped.
+- `--share-column` holds the share of each cell inside the area, a number in
+  [0, 1]. A parent share is the sum of its children's shares divided by 100 (level
+  10) or 10,000 (level 8).
+- `-o` must be a new folder. The write goes to a temporary folder first, then gets
+  renamed. A failed run leaves no folder behind.
+
+Spec notes (from `docs/cell-pyramid.md` on geosquare-v2 PR #33):
+
+- `source.dataset_id` is the dataset folder name. The base manifest has no dataset id field.
+- Every value column is written as `double`.
+- `share_sha256` is `null` when there is no `--share-column`.
+- Files are written one per non-empty partition, and each is read back to hash it.
+  Speed and file size on national data are not measured yet.
+- Later work: a cache for the browser layer; conformance vectors for pyramid (spec section 11, item 11).
+  The tests use a plain-Python oracle for now.
+
+</content>
 ## Errors and output safety
 
 Usage errors exit with status 2. Data and validation errors exit with status 1
@@ -151,3 +190,22 @@ dengan `check`. Input yang buruk ditolak dan tidak ada file yang ditulis.
 `--kepler` menulis konfigurasi peta Kepler.gl dengan satu layer GeoJSON di
 kolom `geometry`. Nama dataset di Kepler.gl adalah nama file tanpa `.parquet`.
 `--color` mewarnai layer menurut kolom itu dan butuh `--kepler`.
+
+### Piramida sel
+
+`pyramid` menulis tabel level 12 sebagai piramida: level 12, 10, dan 8. Peta
+membaca level yang cocok dengan zoom, dan hanya file yang ada di layar. Hasilnya
+berupa file statis dan `pyramid.json` sebagai indeks. Contoh perintah ada di
+bagian Inggris di atas.
+
+- `--value NAME=RULE` mendaftar kolom nilai. Aturan: `sum`, `max`, `min`,
+  `median` (butuh 3 nilai, kalau tidak hasilnya kosong), dan `weighted_mean:BOBOT`.
+  Bobot harus kolom `sum`, atau `area`.
+- Level yang lebih kasar mengelompokkan baris level 12 per GID induk. Nilai induk
+  dihitung dari anaknya. Nilai kosong dilewati.
+- `--share-column` berisi bagian sel yang ada di dalam area, angka 0 sampai 1.
+  Share induk adalah jumlah share anaknya dibagi 100 (level 10) atau 10.000 (level 8).
+- Input harus folder dataset sel dengan manifest 1.1. Grid dan `manifest_version` disalin dari
+  `manifest.json`. File CSV atau Parquet ditolak, karena tidak punya manifest.
+- `-o` harus folder baru. Hasilnya ditulis dulu ke folder sementara. Kalau gagal,
+  tidak ada folder yang tertinggal.

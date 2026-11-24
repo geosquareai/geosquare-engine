@@ -51,7 +51,7 @@ for i, (dt, opts, nodata) in enumerate(cases):
         for r in range(r0, r1):
             for col in range(c0, c1):
                 x, y = f.xy(r, col)  # pixel centre
-                if not (bbox[0] - res <= x <= bbox[2] + res and bbox[1] - res <= y <= bbox[3] + res):
+                if not (bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]):
                     continue
                 v = a[r, col]
                 if nodata is not None and v == nodata:

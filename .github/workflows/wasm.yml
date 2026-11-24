@@ -51,6 +51,10 @@ jobs:
         working-directory: bindings/wasm
         run: npm run build
 
+      - name: Install test dependencies (deck.gl devDependencies)
+        working-directory: bindings/wasm
+        run: npm install --no-audit --no-fund
+
       - name: Run tests against spec 2.0 vectors
         working-directory: bindings/wasm
         run: npm test

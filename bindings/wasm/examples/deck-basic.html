@@ -1,0 +1,29 @@
+<!doctype html>
+<!-- Example: GeoSquare cells on a deck.gl map. Serve this folder with a local web server. -->
+<html>
+<body style="margin:0">
+<script type="importmap">
+{ "imports": {
+  "@deck.gl/core": "https://esm.sh/@deck.gl/core@9.4.2",
+  "@deck.gl/layers": "https://esm.sh/@deck.gl/layers@9.4.2",
+  "geosquare-engine": "../pkg/geosquare_wasm.js",
+  "geosquare-engine/deck": "../js/deck.mjs",
+  "geosquare-engine/rollup": "../js/rollup.mjs"
+} }
+</script>
+<script type="module">
+import { Deck } from "@deck.gl/core";
+import init, { pointToCell } from "geosquare-engine";
+import { GeoSquareLayer } from "geosquare-engine/deck";
+
+await init();
+// Three level-12 cells near Jakarta, with a value each. Domain 1 is Indonesia.
+const rows = [0, 1, 2].map((i) => ({ gid: pointToCell(1, 106.8 + i * 0.001, -6.2, 12, false), value: i + 1 }));
+new Deck({
+  initialViewState: { longitude: 106.8, latitude: -6.2, zoom: 14 },
+  controller: true,
+  layers: [new GeoSquareLayer({ id: "cells", data: rows, domainId: 1, getFillColor: [230, 90, 40, 170] })],
+});
+</script>
+</body>
+</html>

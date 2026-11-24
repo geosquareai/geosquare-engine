@@ -59,7 +59,7 @@ import { levelForZoom, rollupToLevel } from "geosquare-engine/rollup";
 
 await init(); // sekali saja, sebelum rollup dipanggil
 
-const level = levelForZoom(map.getZoom()); // zoom 15+ -> 12, 14 -> 11, 12-13 -> 10, 11 ke bawah -> 9
+const level = levelForZoom(map.getZoom()); // zoom 14 ke atas -> 12, 11-13 -> 10, 10 ke bawah -> 8
 const out = rollupToLevel(rows, level, {
   penduduk: { rule: "sum" },
   pengangguran: { rule: "weighted_mean", weight: "penduduk" },
@@ -77,4 +77,30 @@ const out = rollupToLevel(rows, level, {
 - NULL dilewati, tidak dihitung 0. Induk tanpa nilai valid hasilnya `null`.
 - `median` butuh minimal 3 nilai.
 - Input yang salah melempar error: aturan tidak dikenal, nilai bukan angka hingga, level lebih halus dari baris.
-- `levelForZoom` memakai ambang perkiraan (sel sekitar 10 px). Level tidak dibatasi ke level dataset; batasi sendiri dengan `Math.min`.
+- `levelForZoom` hanya mengembalikan level yang ada di pyramid (12, 10, 8). Zoom 14 ke atas: 12.
+  Zoom 11 sampai 13: 10. Zoom 10 ke bawah: 8. Ini jawaban untuk spec pyramid bagian 11 nomor 8.
+  Ambang ini perkiraan dan belum dituning di peta nyata. Level tidak dibatasi ke level dataset; batasi sendiri dengan `Math.min`.
+
+## Layer deck.gl (`geosquare-engine/deck`)
+
+`GeoSquareLayer` dipakai seperti `H3HexagonLayer`. Berikan baris dengan `gid` dan nilai.
+Layer membuat poligon sel dari core Rust. deck.gl adalah peer dependency, jadi
+aplikasi harus memasangnya sendiri (`@deck.gl/core` dan `@deck.gl/layers`, versi 9.4 atau lebih baru).
+
+```js
+import { Deck } from "@deck.gl/core";
+import init, { pointToCell } from "geosquare-engine";
+import { GeoSquareLayer } from "geosquare-engine/deck";
+
+await init();
+const rows = [{ gid: pointToCell(1, 106.8, -6.2, 12, false), value: 3 }];
+new Deck({ initialViewState: { longitude: 106.8, latitude: -6.2, zoom: 14 }, controller: true,
+  layers: [new GeoSquareLayer({ id: "cells", data: rows, domainId: 1 })] });
+```
+
+- `domainId`: wajib. Domain registry dari GID, misalnya 1 untuk Indonesia.
+- `zoom` dan `aggregation`: isi keduanya atau tidak sama sekali. Dengan keduanya, baris digabung ke
+  level untuk zoom itu, dengan aturan seperti `{ rule: "sum" }`. Tanpa keduanya, tiap baris jadi satu sel.
+- `getGid`, `getValue`, `getFillColor`, `maxSegmentLengthM`: bisa diubah. Default warna adalah warna tetap.
+- Contoh lengkap: `examples/deck-basic.html`. Jalankan dengan server web lokal.
+- Shortcut: poligon dihitung ulang setiap kali layer dirender. Tidak ada cache per GID.
