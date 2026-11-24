@@ -1,6 +1,6 @@
 [package]
 name = "geosquare-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "GeoSquare V2 grid core: GID codec, Int64 packing, topology, and column detection (spec 2.0)."
