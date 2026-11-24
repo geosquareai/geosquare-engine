@@ -597,9 +597,30 @@ PYRAMID_BASE = 12
 # number of base cells under one parent cell at that level (spec section 6.2).
 PYRAMID_FAN_IN = {10: 100, 8: 10000}
 PYRAMID_RULES = {"sum", "weighted_mean", "median", "max", "min"}
-# shortcut: copies the constants of core/src/domain.rs. A test checks they match that file.
-PYRAMID_PROFILE_VERSION = "2.2.0-explicit-datum"
-PYRAMID_REGISTRY_VERSION = "2.0.0"
+
+
+def cell_dataset_manifest(path: str) -> dict[str, Any]:
+    """Read the manifest of the base cell dataset. Pyramid input must be one (pyramid spec section 5)."""
+
+    folder = pathlib.Path(path)
+    if not folder.is_dir():
+        raise CLIError(
+            f"pyramid input must be a cell dataset folder with manifest 1.1, not a file: {path}. "
+            "Spec section 5 copies the grid fields and source from the base manifest, and a CSV or "
+            "Parquet file has none. Write it as a dataset first: write_cell_dataset(..., manifest_version := '1.1')."
+        )
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.is_file():
+        raise CLIError(f"{path} has no manifest.json; pyramid needs a cell dataset folder")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CLIError(f"could not read {manifest_path}: {exc}") from exc
+    if manifest.get("manifest_version") != "1.1":
+        raise CLIError(
+            f"pyramid needs manifest 1.1 (spec section 5), {path} has {manifest.get('manifest_version')!r}"
+        )
+    return manifest
 
 
 def parse_value(text: str) -> tuple[str, str, str | None]:
@@ -740,7 +761,10 @@ def write_level(
 
 
 def run_pyramid(args: argparse.Namespace) -> int:
+    base = cell_dataset_manifest(args.input)
     domain = args.domain.upper()
+    if base.get("domain_code") != domain:
+        raise UsageError(f"--domain {domain} does not match the dataset domain {base.get('domain_code')}")
     values = [parse_value(text) for text in args.value]
     if not values:
         raise UsageError("pyramid needs at least one --value NAME=RULE")
@@ -748,9 +772,12 @@ def run_pyramid(args: argparse.Namespace) -> int:
     if len(set(names)) != len(names):
         raise UsageError("each --value column may be given once")
     summed = {name for name, rule, _ in values if rule == "sum"}
+    semantics = {field["name"]: field.get("semantics") for field in base.get("value_fields", [])}
     for name, _, weight in values:
         if weight and weight != "area" and weight not in summed:
             raise UsageError(f"{name}: weight {weight} must be a column declared with sum")
+        if weight and weight != "area" and semantics.get(weight) not in ("COUNT", "TOTAL"):
+            raise UsageError(f"{name}: weight {weight} must be a COUNT or TOTAL column (spec section 8, item 11)")
     out = pathlib.Path(args.out)
     if out.exists():
         raise CLIError(f"output already exists: {out}")
@@ -810,14 +837,14 @@ def run_pyramid(args: argparse.Namespace) -> int:
             ]
             manifest = {
                 "pyramid_version": "1.0",
-                "grid_system": "geosquare",
-                "grid_version": "v2",
-                "domain_code": domain,
-                "profile_version": PYRAMID_PROFILE_VERSION,
-                "registry_version": PYRAMID_REGISTRY_VERSION,
+                "grid_system": base["grid_system"],
+                "grid_version": base["grid_version"],
+                "domain_code": base["domain_code"],
+                "profile_version": base["profile_version"],
+                "registry_version": base["registry_version"],
                 "source": {
-                    "dataset_id": args.dataset_id or pathlib.Path(args.input).stem,
-                    "manifest_version": None,
+                    "dataset_id": pathlib.Path(args.input).resolve().name,
+                    "manifest_version": base["manifest_version"],
                     "base_level": PYRAMID_BASE,
                     "row_count": base_rows,
                     "content_sha256": base_level["content_sha256"],
@@ -905,7 +932,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.set_defaults(func=run_check)
 
     pyramid = sub.add_parser("pyramid", help="write a cell pyramid: levels 12, 10 and 8 for a map")
-    pyramid.add_argument("input", help="base level 12 CSV or Parquet file")
+    pyramid.add_argument("input", help="base level 12 cell dataset folder with manifest 1.1")
     pyramid.add_argument("--extension", dest="command_extension")
     pyramid.add_argument("--domain", required=True, help="domain of the GIDs, e.g. ID")
     pyramid.add_argument("-o", "--out", required=True, help="new folder to write, e.g. out/pyramid")
@@ -913,7 +940,6 @@ def build_parser() -> argparse.ArgumentParser:
     pyramid.add_argument("--value", action="append", default=[], metavar="NAME=RULE",
                          help="value column and its rule: sum, max, min, median, or weighted_mean:WEIGHT (repeatable)")
     pyramid.add_argument("--share-column", help="edge share column, a number in [0, 1]")
-    pyramid.add_argument("--dataset-id", help="dataset id for pyramid.json (default: input file name)")
     pyramid.set_defaults(func=run_pyramid)
     return parser
 

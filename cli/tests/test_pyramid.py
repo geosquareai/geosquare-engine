@@ -1,11 +1,11 @@
 """gsq pyramid: every coarser level must equal a rollup of the base level with the declared rules.
 
-The oracle is plain Python on the base rows. It does not use the writer's SQL.
+The base is a cell dataset folder with manifest 1.1 (pyramid spec section 5). The oracle is plain
+Python on the base rows. It does not use the writer's SQL.
 """
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import os
@@ -18,6 +18,7 @@ import pytest
 CLI_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = CLI_ROOT.parent
 DEFAULT_EXTENSION = REPO_ROOT / "bindings/duckdb/build/osx_arm64/geosquare_v2.duckdb_extension"
+SEMANTICS = '{"pop": "COUNT", "rate": "RATE", "flood": "CATEGORICAL", "share_in_aoi": "COUNT"}'
 sys.path.insert(0, str(CLI_ROOT))
 
 from gsq_cli.main import content_sha256  # noqa: E402
@@ -31,6 +32,14 @@ def extension() -> Path:
     return path
 
 
+def duck(ext: Path):
+    import duckdb
+
+    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    con.execute(f"LOAD '{ext}'")
+    return con
+
+
 def run_pyramid(*args: str, ext: Path) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(CLI_ROOT)
@@ -41,35 +50,57 @@ def run_pyramid(*args: str, ext: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def base_cells(ext: Path) -> list[str]:
-    """Distinct level-12 GIDs on a 40 x 40 grid of points at about 50 m spacing in Jakarta."""
+def base_cells(ext: Path, level: int = 12) -> list[str]:
+    """Distinct GIDs on a 40 x 40 grid of points about 50 m apart in Jakarta, at one level."""
 
-    import duckdb
-
-    con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-    con.execute(f"LOAD '{ext}'")
+    con = duck(ext)
     rows = con.execute(
-        "SELECT DISTINCT point_to_cell('ID', 106.80 + i * 0.0005, -6.20 - j * 0.0005, 12).gid "
+        f"SELECT DISTINCT point_to_cell('ID', 106.80 + i * 0.0005, -6.20 - j * 0.0005, {level}).gid "
         "FROM range(40) r(i), range(40) s(j)"
     ).fetchall()
     return sorted(r[0] for r in rows)
 
 
-def write_base(path: Path, gids: list[str]) -> dict[str, dict[str, float | None]]:
-    """Write a base CSV with deterministic values. Returns the rows by GID for the oracle."""
+def base_values(gids: list[str]) -> dict[str, dict[str, float | None]]:
+    """Deterministic values for each GID. Returns the rows by GID for the oracle."""
 
     data: dict[str, dict[str, float | None]] = {}
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(["gid", "pop", "rate", "flood", "share_in_aoi"])
-        for n, gid in enumerate(gids):
-            pop = float(1 + n % 5)
-            rate = None if n % 6 == 0 else float((n * 7) % 11)
-            flood = float((n * 3) % 9) / 2
-            share = 0.25 if n % 7 == 0 else 1.0
-            data[gid] = {"pop": pop, "rate": rate, "flood": flood, "share": share}
-            writer.writerow([gid, pop, "" if rate is None else rate, flood, share])
+    for n, gid in enumerate(gids):
+        rate = None if n % 6 == 0 else float((n * 7) % 11)
+        share = 0.25 if n % 7 == 0 else 1.0
+        data[gid] = {
+            "pop": float(1 + n % 5),
+            "rate": rate,
+            "flood": float((n * 3) % 9) / 2,
+            "share": share,
+        }
     return data
+
+
+def write_dataset(ext: Path, folder: Path, data: dict[str, dict[str, float | None]],
+                  level_gids: bool = True, manifest_version: str = "1.1", domain: str = "ID") -> Path:
+    """Write the base rows as a flat cell dataset with manifest 1.1 (or another version)."""
+
+    con = duck(ext)
+    staged = folder.parent / f"{folder.name}.rows.parquet"
+    con.execute("CREATE TEMP TABLE base (gid VARCHAR, pop DOUBLE, rate DOUBLE, flood DOUBLE, share_in_aoi DOUBLE)")
+    con.executemany(
+        "INSERT INTO base VALUES (?, ?, ?, ?, ?)",
+        [(gid, v["pop"], v["rate"], v["flood"], v["share"]) for gid, v in data.items()],
+    )
+    con.execute(f"COPY base TO '{staged}' (FORMAT parquet)")
+    con.execute(
+        f"SELECT * FROM write_cell_dataset('SELECT * FROM read_parquet(''{staged}'')', ?, layout := 'flat', "
+        f"domain_code := '{domain}', manifest_version := '{manifest_version}', fill_nulls := false, value_semantics := ?)",
+        [str(folder), SEMANTICS],
+    ).fetchall()
+    staged.unlink()
+    return folder
+
+
+def base_dataset(tmp_path: Path, ext: Path) -> tuple[Path, dict[str, dict[str, float | None]]]:
+    base = base_values(base_cells(ext))
+    return write_dataset(ext, tmp_path / "base12", base), base
 
 
 def median(values: list[float]) -> float:
@@ -99,35 +130,34 @@ def oracle(base: dict[str, dict[str, float | None]], level: int) -> dict[str, di
 
 
 def read_level(root: Path, level: int, columns: list[str]) -> dict[str, dict[str, float | None]]:
-    import duckdb
-
+    con = duck(Path(os.environ.get("GSQ_EXTENSION", DEFAULT_EXTENSION)))
     out: dict[str, dict[str, float | None]] = {}
-    files = sorted((root / f"level={level}").glob("gid_prefix=*/part-00000.parquet"))
-    con = duckdb.connect()
-    for file in files:
+    for file in sorted((root / f"level={level}").glob("gid_prefix=*/part-00000.parquet")):
         for row in con.execute(f"SELECT * FROM read_parquet('{file}')").fetchall():
             out[row[0]] = dict(zip(columns, row[1:]))
     return out
 
 
-def test_coarse_levels_equal_declared_rollup(tmp_path: Path) -> None:
-    ext = extension()
-    gids = base_cells(ext)
-    assert len(gids) > 500
-    source = tmp_path / "base.csv"
-    base = write_base(source, gids)
-    out = tmp_path / "pyramid"
-    result = run_pyramid(
-        str(source), "--domain", "ID", "-o", str(out),
+def run_ok(base: Path, out: Path, ext: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+    return run_pyramid(
+        str(base), "--domain", "ID", "-o", str(out),
         "--value", "pop=sum", "--value", "rate=weighted_mean:pop",
-        "--value", "flood=max", "--share-column", "share_in_aoi",
+        "--value", "flood=max", "--share-column", "share_in_aoi", *extra,
         ext=ext,
     )
+
+
+def test_coarse_levels_equal_declared_rollup(tmp_path: Path) -> None:
+    ext = extension()
+    base_path, base = base_dataset(tmp_path, ext)
+    assert len(base) > 500
+    out = tmp_path / "pyramid"
+    result = run_ok(base_path, out, ext)
     assert result.returncode == 0, result.stderr
 
     manifest = json.loads((out / "pyramid.json").read_text(encoding="utf-8"))
     assert [lv["level"] for lv in manifest["levels"]] == [12, 10, 8]
-    assert manifest["source"]["row_count"] == len(gids)
+    assert manifest["source"]["row_count"] == len(base)
     for lv in manifest["levels"]:
         assert lv["row_count"] == sum(f["row_count"] for f in lv["files"])
 
@@ -145,37 +175,54 @@ def test_coarse_levels_equal_declared_rollup(tmp_path: Path) -> None:
                     assert actual == pytest.approx(value, rel=1e-12, abs=1e-12), (level, parent, name)
 
 
-def test_rejects_non_numeric_value(tmp_path: Path) -> None:
+def test_source_copies_the_base_manifest(tmp_path: Path) -> None:
     ext = extension()
-    gids = base_cells(ext)[:20]
-    source = tmp_path / "base.csv"
-    write_base(source, gids)
-    text = source.read_text(encoding="utf-8").replace(",1.0,", ",abc,", 1)
-    source.write_text(text, encoding="utf-8")
-    result = run_pyramid(str(source), "--domain", "ID", "-o", str(tmp_path / "p"), "--value", "pop=sum", ext=ext)
+    base_path, _ = base_dataset(tmp_path, ext)
+    out = tmp_path / "pyramid"
+    assert run_ok(base_path, out, ext).returncode == 0
+    base = json.loads((base_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest = json.loads((out / "pyramid.json").read_text(encoding="utf-8"))
+    assert manifest["source"]["manifest_version"] == "1.1"
+    assert manifest["source"]["dataset_id"] == "base12"
+    for key in ("grid_system", "grid_version", "domain_code", "profile_version", "registry_version"):
+        assert manifest[key] == base[key], key
+
+
+def test_refuses_raw_csv_with_the_spec_rule(tmp_path: Path) -> None:
+    ext = extension()
+    csv = tmp_path / "base.csv"
+    csv.write_text("gid,pop\n" + f"{base_cells(ext)[0]},1.0\n", encoding="utf-8")
+    result = run_pyramid(str(csv), "--domain", "ID", "-o", str(tmp_path / "p"), "--value", "pop=sum", ext=ext)
     assert result.returncode == 1
-    assert "not numbers" in result.stderr
+    assert "cell dataset folder" in result.stderr and "section 5" in result.stderr
     assert not (tmp_path / "p").exists()
 
 
-def test_rejects_mixed_levels(tmp_path: Path) -> None:
+def test_refuses_manifest_other_than_1_1(tmp_path: Path) -> None:
     ext = extension()
-    gids = base_cells(ext)[:20]
-    source = tmp_path / "base.csv"
-    write_base(source, gids)
-    with open(source, "a", encoding="utf-8") as handle:
-        handle.write(f"{gids[0][:10]},1.0,1.0,1.0,1.0\n")
-    result = run_pyramid(str(source), "--domain", "ID", "-o", str(tmp_path / "p"), "--value", "pop=sum", ext=ext)
+    folder = write_dataset(ext, tmp_path / "old", base_values(base_cells(ext)), manifest_version="1.0")
+    result = run_pyramid(str(folder), "--domain", "ID", "-o", str(tmp_path / "p"), "--value", "pop=sum", ext=ext)
     assert result.returncode == 1
-    assert "pyramid base must be level 12" in result.stderr or "mixed levels" in result.stderr
+    assert "manifest 1.1" in result.stderr
 
 
-def test_profile_constants_match_core() -> None:
-    from gsq_cli.main import PYRAMID_PROFILE_VERSION, PYRAMID_REGISTRY_VERSION
+def test_refuses_weight_that_is_not_count_or_total(tmp_path: Path) -> None:
+    ext = extension()
+    base_path, _ = base_dataset(tmp_path, ext)
+    result = run_pyramid(
+        str(base_path), "--domain", "ID", "-o", str(tmp_path / "p"),
+        "--value", "rate=sum", "--value", "pop=weighted_mean:rate", ext=ext,
+    )
+    assert result.returncode == 2
+    assert "COUNT or TOTAL" in result.stderr
 
-    source = (REPO_ROOT / "core/src/domain.rs").read_text(encoding="utf-8")
-    assert f'PROFILE_VERSION: &str = "{PYRAMID_PROFILE_VERSION}"' in source
-    assert f'REGISTRY_VERSION: &str = "{PYRAMID_REGISTRY_VERSION}"' in source
+
+def test_refuses_base_level_other_than_12(tmp_path: Path) -> None:
+    ext = extension()
+    folder = write_dataset(ext, tmp_path / "l10", base_values(base_cells(ext, level=10)))
+    result = run_pyramid(str(folder), "--domain", "ID", "-o", str(tmp_path / "p"), "--value", "pop=sum", ext=ext)
+    assert result.returncode == 1
+    assert "pyramid base must be level 12" in result.stderr
 
 
 def test_content_hash_matches_conformance_vectors() -> None:
