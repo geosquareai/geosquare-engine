@@ -1,6 +1,6 @@
 //! Upkeep of catalog-less Iceberg cell datasets.
 //!
-//! `expire_snapshots(path, retain_last := 1, older_than := NULL, orphan_age_hours := 24,
+//! `expire_snapshots(path, retain_last := 2, older_than := NULL, orphan_age_hours := 24,
 //! dry_run := true)`: drop old snapshots from the table metadata and delete the files only
 //! they used (data files, manifests, manifest lists, older metadata files). Dry run is the
 //! default: the call reports what it would delete and deletes nothing. Pass
@@ -82,7 +82,7 @@ fn ts_param(p: &Params, name: &str) -> Result<Option<i64>, E> {
 
 pub fn plan_expire(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
-    let retain = p.int("retain_last").unwrap_or(1);
+    let retain = p.int("retain_last").unwrap_or(2);
     if retain < 1 {
         return Err("retain_last must be at least 1".into());
     }
