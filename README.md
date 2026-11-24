@@ -11,6 +11,8 @@ Status: Phase 1 is done. Phase 3 CRS work now uses explicit datum operations. Al
 | `points.json` and `projected.json` vectors | Pass. Released domains work by default; candidate domains require explicit opt-in | `vectors/spec-2.0/` |
 | DuckDB extension (C API, DuckDB 1.4 to 2.0): grid functions, polyfill, cell datasets (flat, partitioned, Iceberg) | Done | `bindings/duckdb/` |
 | `gsq` command-line tool: detect, rollup, join, check, and geometry export | Done | `cli/` |
+| `gsq pyramid`: cell levels 12, 10, 8 with static files and `pyramid.json` | Done. Follows `docs/cell-pyramid.md` in geosquare-v2 | `cli/` |
+| deck.gl layer `GeoSquareLayer` and zoom rollup in the browser | Done. Peer dependency deck.gl | `bindings/wasm/js/deck.mjs` |
 | Signed registry verification | Done. Checks SHA-256, Ed25519 signature, and trusted key | `bindings/duckdb/README.md` |
 | Postgres, BigQuery bindings | Planned | - |
 
@@ -89,6 +91,11 @@ The full guide is in [`docs/`](docs/README.md):
 Status: Fase 1 selesai. Bagian CRS Fase 3 memakai datum operation yang tertulis. Enam domain sudah released. Lima domain masih candidate dan butuh opt-in jelas. Lihat bagian "CRS status" di atas.
 
 Tabel status ada di atas.
+
+Fase 5 menambah tiga hal. `gsq pyramid` menulis piramida sel (level 12, 10, dan 8) untuk peta.
+`GeoSquareLayer` untuk deck.gl memberi rollup sesuai zoom di browser. `read_raster` sekarang hanya
+mengembalikan piksel yang titik tengahnya ada di dalam `bbox`. Detail ada di `cli/README.md` dan
+`bindings/wasm/README.md`.
 
 ## Fungsi repo ini
 

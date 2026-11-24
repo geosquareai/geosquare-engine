@@ -78,3 +78,27 @@ const out = rollupToLevel(rows, level, {
 - `median` butuh minimal 3 nilai.
 - Input yang salah melempar error: aturan tidak dikenal, nilai bukan angka hingga, level lebih halus dari baris.
 - `levelForZoom` memakai ambang perkiraan (sel sekitar 10 px). Level tidak dibatasi ke level dataset; batasi sendiri dengan `Math.min`.
+
+## Layer deck.gl (`geosquare-engine/deck`)
+
+`GeoSquareLayer` dipakai seperti `H3HexagonLayer`. Berikan baris dengan `gid` dan nilai.
+Layer membuat poligon sel dari core Rust. deck.gl adalah peer dependency, jadi
+aplikasi harus memasangnya sendiri (`@deck.gl/core` dan `@deck.gl/layers`, versi 9.4 atau lebih baru).
+
+```js
+import { Deck } from "@deck.gl/core";
+import init, { pointToCell } from "geosquare-engine";
+import { GeoSquareLayer } from "geosquare-engine/deck";
+
+await init();
+const rows = [{ gid: pointToCell(1, 106.8, -6.2, 12, false), value: 3 }];
+new Deck({ initialViewState: { longitude: 106.8, latitude: -6.2, zoom: 14 }, controller: true,
+  layers: [new GeoSquareLayer({ id: "cells", data: rows, domainId: 1 })] });
+```
+
+- `domainId`: wajib. Domain registry dari GID, misalnya 1 untuk Indonesia.
+- `zoom` dan `aggregation`: isi keduanya atau tidak sama sekali. Dengan keduanya, baris digabung ke
+  level untuk zoom itu, dengan aturan seperti `{ rule: "sum" }`. Tanpa keduanya, tiap baris jadi satu sel.
+- `getGid`, `getValue`, `getFillColor`, `maxSegmentLengthM`: bisa diubah. Default warna adalah warna tetap.
+- Contoh lengkap: `examples/deck-basic.html`. Jalankan dengan server web lokal.
+- Shortcut: poligon dihitung ulang setiap kali layer dirender. Tidak ada cache per GID.
