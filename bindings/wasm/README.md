@@ -46,3 +46,35 @@ const ring = cellPolygonWgs84(1, gid, 25000, false);
 - `cellPolygonWgs84(domainId, gid, maxSegmentLengthM, allowCandidateCrs)` returns a closed array of `[longitude, latitude]` pairs.
 - `domainId`, coordinates, level, and segment length are checked JavaScript `Number` values. Invalid, non-finite, fractional, or out-of-range values throw.
 - Released domains use `false` for `allowCandidateCrs`. Candidate domains are refused unless that final argument is explicitly `true`.
+
+## Rollup zoom (`geosquare-engine/rollup`)
+
+Gabung baris dari level halus ke sel induk di level yang lebih kasar. Dipakai untuk peta
+yang di-zoom jauh. Parent dihitung oleh `parent` dari core Rust, jadi aturan grid tidak
+disalin ke JS.
+
+```js
+import init from "geosquare-engine";
+import { levelForZoom, rollupToLevel } from "geosquare-engine/rollup";
+
+await init(); // sekali saja, sebelum rollup dipanggil
+
+const level = levelForZoom(map.getZoom()); // zoom 15+ -> 12, 14 -> 11, 12-13 -> 10, 11 ke bawah -> 9
+const out = rollupToLevel(rows, level, {
+  penduduk: { rule: "sum" },
+  pengangguran: { rule: "weighted_mean", weight: "penduduk" },
+  harga_m2: { rule: "median" },
+  kedalaman: { rule: "max" },
+});
+// out: [{ gid, penduduk, pengangguran, ... }], satu baris per GID induk, urut GID
+```
+
+- `rows`: `[{ gid, kolom: angka | null }]`. Baris boleh di level mana saja yang lebih halus dari `level`.
+- Aturan: `sum`, `weighted_mean`, `median`, `max`, `min`. Sama dengan rollup DuckDB.
+- `majority_weighted` (kategori, bobot terbesar) direncanakan. Belum ada di server, jadi belum ada di sini. Aturan tidak dikenal melempar error.
+- `weight` berisi nama kolom, atau `"area"` (bobot 1 per sel, karena sel di satu level punya luas sama).
+- `weighted_mean` wajib punya `weight`. `sum`, `median`, `max`, `min` tidak boleh punya `weight`.
+- NULL dilewati, tidak dihitung 0. Induk tanpa nilai valid hasilnya `null`.
+- `median` butuh minimal 3 nilai.
+- Input yang salah melempar error: aturan tidak dikenal, nilai bukan angka hingga, level lebih halus dari baris.
+- `levelForZoom` memakai ambang perkiraan (sel sekitar 10 px). Level tidak dibatasi ke level dataset; batasi sendiri dengan `Math.min`.

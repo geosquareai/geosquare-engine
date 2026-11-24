@@ -5,12 +5,18 @@
   "license": "Apache-2.0",
   "type": "module",
   "main": "pkg/geosquare_wasm.js",
+  "exports": {
+    ".": "./pkg/geosquare_wasm.js",
+    "./rollup": "./js/rollup.mjs",
+    "./pkg/*": "./pkg/*"
+  },
   "types": "pkg/geosquare_wasm.d.ts",
   "files": [
     "pkg/geosquare_wasm.js",
     "pkg/geosquare_wasm.d.ts",
     "pkg/geosquare_wasm_bg.wasm",
     "pkg/geosquare_wasm_bg.wasm.d.ts",
+    "js/rollup.mjs",
     "README.md"
   ],
   "engines": {
