@@ -13,7 +13,7 @@ c.execute(f"LOAD '{ext}'; LOAD iceberg")
 p = f"{d}/t"
 cells = lambda x: f"polygon_to_cells(''ID'', ''POLYGON (({x} -6.22, {x + 0.02} -6.22, {x + 0.02} -6.20, {x} -6.20, {x} -6.22))'', 12, min_coverage := 0.99)"
 steps = [
-    f"SELECT * FROM write_cell_dataset('SELECT packed_id, 1.0 AS v FROM {cells(106.80)}', '{p}', layout := 'iceberg', partition_level := 7)",
+    f"SELECT * FROM write_cell_dataset('SELECT packed_id, 1.0 AS v FROM {cells(106.80)}', '{p}', layout := 'iceberg', partition_level := 7, value_semantics := 'COUNT')",
     f"SELECT * FROM write_cell_dataset('SELECT packed_id, 2.0 AS v FROM {cells(106.83)}', '{p}', layout := 'iceberg', mode := 'append')",
     f"SELECT * FROM write_cell_dataset('SELECT packed_id, v * 10 AS v FROM read_cell_dataset(''{p}'')', '{p}', layout := 'iceberg', mode := 'overwrite')",
     f"SELECT * FROM write_cell_dataset('SELECT packed_id, v, v + 1 AS w FROM read_cell_dataset(''{p}'')', '{p}', layout := 'iceberg', mode := 'overwrite')",

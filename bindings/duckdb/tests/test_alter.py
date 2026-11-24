@@ -15,6 +15,7 @@ cells = lambda x: f"polygon_to_cells('ID', 'POLYGON (({x} -6.22, {x + 0.03} -6.2
 c.execute(f"CREATE TABLE base AS SELECT packed_id, (packed_id % 97)::DOUBLE AS people, (packed_id % 7)::DOUBLE / 10 AS hazard, (packed_id % 5)::BIGINT AS n FROM {cells(106.80)}")
 c.execute("""SELECT * FROM write_cell_dataset('SELECT * FROM base', ?, layout := 'iceberg', partition_level := 7,
   aggregation_rule := '{"people": "sum", "hazard": "mean", "n": "sum"}', units := '{"people": "people"}',
+  value_semantics := '{"people": "COUNT", "n": "COUNT"}',
   column_descriptions := '{"people": "People count", "hazard": "Hazard index"}')""", [p]).fetchall()
 snap_before = c.execute("SELECT max(snapshot_id) FROM iceberg_snapshots(?)", [p]).fetchone()[0]
 before = c.execute("SELECT sum(people), sum(hazard), count(*) FROM read_cell_dataset(?)", [p]).fetchone()
@@ -32,7 +33,7 @@ AREA = "POLYGON ((106.805 -6.215, 106.825 -6.215, 106.825 -6.195, 106.805 -6.195
 q = c.execute("SELECT sum(pop * coverage_ratio), sum(score) FROM query_cell_dataset(?, geometry := ?)", [p, AREA]).fetchone()
 q0 = c.execute("SELECT sum(people * coverage_ratio) FROM query_cell_dataset(?, geometry := ?, snapshot_id := ?)", [p, AREA, snap_before]).fetchone()
 assert math.isclose(q[0], q0[0]) and q[1] == 0, (q, q0)
-roll = c.execute("SELECT sum(pop) FROM query_cell_dataset(?, geometry := ?, rollup_level := 9)", [p, AREA]).fetchone()[0]
+roll = c.execute("SELECT sum(pop) FROM query_cell_dataset(?, geometry := ?, rollup_level := 9, rollup_rule := '{\"hazard\": \"none\", \"score\": \"none\"}')", [p, AREA]).fetchone()[0]
 assert math.isclose(roll, q[0]), (roll, q)
 meta = {x[0]: x for x in c.execute("SELECT * FROM cell_dataset_columns(?)", [p]).fetchall()}
 assert set(meta) == {"pop", "hazard", "score"} and meta["pop"][3:6] == ("sum", "people", "People count") and meta["hazard"][3] == "mean", meta

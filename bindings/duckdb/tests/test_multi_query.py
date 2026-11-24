@@ -13,16 +13,19 @@ c.execute(f"LOAD '{ext}'")
 cells = lambda wkt, level=12: f"polygon_to_cells('ID', '{wkt}', {level})"
 A = "POLYGON ((106.79 -6.22, 106.83 -6.22, 106.83 -6.18, 106.79 -6.18, 106.79 -6.22))"
 B = "POLYGON ((106.81 -6.21, 106.85 -6.21, 106.85 -6.17, 106.81 -6.17, 106.81 -6.21))"  # overlaps A partly
-c.execute(f"SELECT * FROM write_cell_dataset('SELECT packed_id, (packed_id % 97)::DOUBLE AS people, (packed_id % 5)::DOUBLE AS pop FROM {cells(A).replace(chr(39), chr(39)*2)}', '{d}/people', layout := 'iceberg', aggregation_rule := 'sum')").fetchall()
-c.execute(f"SELECT * FROM write_cell_dataset('SELECT packed_id, (packed_id % 7)::DOUBLE / 10 AS hazard, (packed_id % 3)::DOUBLE AS pop FROM {cells(B).replace(chr(39), chr(39)*2)}', '{d}/data_name=hazard_v1', layout := 'flat', aggregation_rule := '{{\"hazard\": \"mean\", \"pop\": \"sum\"}}')").fetchall()
-c.execute(f"SELECT * FROM write_cell_dataset('SELECT left(gid, 9) AS gid, sum(people) AS people FROM read_cell_dataset(''{d}/people'') GROUP BY 1', '{d}/people_1km', layout := 'flat', domain_code := 'ID', aggregation_rule := 'sum')").fetchall()
+c.execute(f"SELECT * FROM write_cell_dataset('SELECT packed_id, (packed_id % 97)::DOUBLE AS people, (packed_id % 5)::DOUBLE AS pop FROM {cells(A).replace(chr(39), chr(39)*2)}', '{d}/people', layout := 'iceberg', aggregation_rule := 'sum', value_semantics := 'COUNT')").fetchall()
+c.execute(f"SELECT * FROM write_cell_dataset('SELECT packed_id, (packed_id % 7)::DOUBLE / 10 AS hazard, (packed_id % 3)::DOUBLE AS pop FROM {cells(B).replace(chr(39), chr(39)*2)}', '{d}/data_name=hazard_v1', layout := 'flat', aggregation_rule := '{{\"hazard\": \"mean\", \"pop\": \"sum\"}}', value_semantics := '{{\"hazard\": \"MEASUREMENT\", \"pop\": \"COUNT\"}}')").fetchall()
+c.execute(f"SELECT * FROM write_cell_dataset('SELECT left(gid, 9) AS gid, sum(people) AS people FROM read_cell_dataset(''{d}/people'') GROUP BY 1', '{d}/people_1km', layout := 'flat', domain_code := 'ID', aggregation_rule := 'sum', value_semantics := 'COUNT')").fetchall()
 Q = "POLYGON ((106.80 -6.215, 106.84 -6.215, 106.84 -6.175, 106.80 -6.175, 106.80 -6.215))"
 paths = [f"{d}/people", f"{d}/data_name=hazard_v1"]
+# hazard is a MEASUREMENT: a rollup needs its parent rule. The test compares the same rollup on both
+# sides, so any rule will do; max keeps hazard in the result.
+RU = ", rollup_rule := '{\"hazard\": \"max\"}'"
 
 def close(a, b):
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
 
-for roll, extra in (("", "coverage_ratio"), (", rollup_level := 9", "coverage_ratio")):
+for roll, extra in (("", "coverage_ratio"), (", rollup_level := 9" + RU, "coverage_ratio")):
     got = c.execute(f"SELECT gid, people, hazard, people__pop, hazard_v1__pop, {extra} FROM query_cell_datasets(?, geometry := ? {roll})", [paths, Q]).fetchall()
     one = lambda p, cols: {r[0]: r[1:] for r in c.execute(f"SELECT gid, {cols} FROM query_cell_dataset(?, geometry := ? {roll})", [p, Q]).fetchall()}
     a, b = one(paths[0], f"people, pop, {extra}"), one(paths[1], f"hazard, pop, {extra}")
@@ -39,6 +42,6 @@ except duckdb.Error as e:
     assert "rollup_level" in str(e), e
 r = c.execute("SELECT sum(people__people), sum(people_1km__people) FROM query_cell_datasets(?, bbox := [106.70, -6.30, 106.95, -6.10], rollup_level := 9, max_candidate_limit := 1000000)", [[paths[0], f"{d}/people_1km"]]).fetchone()
 assert close(r[0], r[1]), r
-g = c.execute("SELECT cell_geometry FROM query_cell_datasets(?, geometry := ?, rollup_level := 9, with_geometry := 'geojson') LIMIT 1", [paths, Q]).fetchone()[0]
+g = c.execute("SELECT cell_geometry FROM query_cell_datasets(?, geometry := ?, rollup_level := 9, rollup_rule := '{\"hazard\": \"max\"}', with_geometry := 'geojson') LIMIT 1", [paths, Q]).fetchone()[0]
 assert g.startswith('{"type":"Polygon"'), g
 print("multi-dataset query OK")
