@@ -121,3 +121,75 @@ def test_missing_extension_path_is_usage_error(tmp_path: Path) -> None:
     result_env = result
     assert result_env.returncode == 2
     assert "GSQ_EXTENSION" in result_env.stderr
+
+
+def test_check_clean_file_exits_zero(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    write_csv(source, [{"gid": gid, "value": 1} for gid in GIDS])
+    result = run_gsq("check", str(source), "--domain", "ID", "--json", extension_path=extension())
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["ok"] is True
+    assert report["problems"] == []
+    assert report["levels"] == [9]
+
+
+def test_check_reports_bad_gid_duplicate_and_mixed_levels(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    write_csv(
+        source,
+        [
+            {"gid": GIDS[0], "value": 1},
+            {"gid": GIDS[0], "value": 1},
+            {"gid": "NOTAGID!", "value": 2},
+            {"gid": "H2X545V3", "value": 3},
+        ],
+    )
+    result = run_gsq("check", str(source), "--domain", "ID", "--json", extension_path=extension())
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert report["ok"] is False
+    assert report["invalid_gids"] == [[3, "NOTAGID!"]]
+    assert report["duplicate_gids"] == [[GIDS[0], 2]]
+    assert report["levels"] == [8, 9]
+    assert len(report["problems"]) == 3
+
+
+def test_check_source_total_mismatch_fails(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    other = tmp_path / "source.csv"
+    write_csv(source, [{"gid": gid, "value": 1} for gid in GIDS])
+    write_csv(other, [{"gid": gid, "value": 2} for gid in GIDS])
+    ext = extension()
+    result = run_gsq("check", str(source), "--domain", "ID", "--source", str(other), "--value", "value", extension_path=ext)
+    assert result.returncode == 1, result.stdout
+    assert "value total differs from source by -3.0" in result.stdout
+    result = run_gsq("check", str(source), "--domain", "ID", "--source", str(source), "--value", "value", extension_path=ext)
+    assert result.returncode == 0, result.stdout
+
+
+def test_check_empty_file_fails(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    source.write_text("gid,value\n", encoding="utf-8")
+    result = run_gsq("check", str(source), "--domain", "ID", extension_path=extension())
+    assert result.returncode == 1
+    assert "no rows with a GID value" in result.stdout
+
+
+def test_check_without_gid_column_is_error(tmp_path: Path) -> None:
+    source = tmp_path / "cells.csv"
+    write_csv(source, [{"packed_id": 1, "value": 2}])
+    result = run_gsq("check", str(source), "--domain", "ID", extension_path=extension())
+    assert result.returncode == 1
+    assert "unknown column(s): gid" in result.stderr
+
+
+def test_check_parquet_input(tmp_path: Path) -> None:
+    import duckdb
+
+    source = tmp_path / "cells.parquet"
+    rows = ", ".join(f"('{gid}', 1)" for gid in GIDS)
+    duckdb.connect().execute(f"COPY (SELECT * FROM (VALUES {rows}) t(gid, value)) TO '{source}' (FORMAT PARQUET)")
+    result = run_gsq("check", str(source), "--domain", "ID", "--json", extension_path=extension())
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["rows"] == 3

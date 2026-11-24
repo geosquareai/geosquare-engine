@@ -76,6 +76,26 @@ KH, MM, TH, TL, and VN are candidate CRS domains. They require
 `--allow-candidate-crs`, which is passed explicitly to the extension and does
 not change their support status.
 
+### Check a file before upload
+
+`check` reads a CSV or Parquet file with a `gid` column and reports:
+
+- GIDs that are not valid for `--domain`. Row numbers count data rows from 1.
+- GIDs that appear more than once.
+- More than one grid level.
+- With `--source` and `--value`, a difference between the column totals of
+  the two files.
+
+`--domain` is required because a bare GID does not name its domain.
+
+```zsh
+gsq check cells.csv --domain ID
+gsq check cells.csv --domain ID --source source.csv --value population --json
+```
+
+The command exits 0 when no problem is found and 1 when it finds one. An empty
+file counts as a problem. `--json` prints the full report on stdout.
+
 ## Errors and output safety
 
 Usage errors exit with status 2. Data and validation errors exit with status 1
@@ -96,3 +116,8 @@ geometri dilakukan oleh ekstensi DuckDB, bukan dihitung ulang di Python.
 `to-geo` memakai WGS84 secara default; gunakan `--crs grid` bila koordinat grid
 diperlukan. Domain kandidat KH, MM, TH, TL, dan VN wajib memakai
 `--allow-candidate-crs`.
+
+`check` memeriksa file CSV atau Parquet sebelum upload. Perintah ini melaporkan
+GID yang tidak valid untuk `--domain`, GID kembar, level yang bercampur, dan
+selisih total kolom bila `--source` dan `--value` diberikan. Exit code 0 berarti
+tidak ada masalah, 1 berarti ada masalah.
