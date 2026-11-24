@@ -13,7 +13,7 @@ c.execute(f"LOAD '{ext}'")
 p = f"{d}/t"
 c.execute("""SELECT * FROM write_cell_dataset('SELECT packed_id, 1.0 AS one FROM polygon_to_cells(''ID'',
   ''POLYGON ((106.78 -6.24, 106.88 -6.24, 106.88 -6.14, 106.78 -6.14, 106.78 -6.24))'', 12)', ?, layout := 'iceberg',
-  aggregation_rule := 'sum')""", [p]).fetchall()
+  aggregation_rule := 'sum', value_semantics := 'COUNT')""", [p]).fetchall()
 lon, lat = 106.8272, -6.1754
 side = c.execute("SELECT cell_side_m(12)").fetchone()[0]
 # true area of a cell near the point (the grid cell is 50 m in the grid plane, ~2525 m2 here)
