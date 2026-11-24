@@ -344,7 +344,7 @@ for raster-to-cell conversion in SQL.
 `compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset with one file per
 partition and keeps its metadata.
 
-`expire_snapshots(path, retain_last := 1, older_than := NULL, orphan_age_hours := 24, dry_run := false)`
+`expire_snapshots(path, retain_last := 2, older_than := NULL, orphan_age_hours := 24, dry_run := false)`
 drops old Iceberg snapshots and deletes the files only they used (see
 [docs/write-guide.md](docs/write-guide.md#clean-up-old-snapshots-iceberg)).
 
@@ -421,3 +421,8 @@ Beberapa nama fungsi berbeda dari binding Python/Wasm karena bentrok dengan Duck
 `decode` → `gid_to_canonical`, `unpack` → `packed_to_gid` / `unpack_int64`, `version` → `geosquare_engine_version`);
 daftarnya di bagian "Names compared with the Python and Wasm bindings".
 Batasan dan cara uji ada di bagian Limits dan Tests di atas.
+
+### expire_snapshots: default retain_last sekarang 2
+
+Default `retain_last` sekarang 2, sebelumnya 1. Jadi snapshot terbaru dan satu snapshot
+sebelumnya tetap disimpan. Untuk hanya menyimpan snapshot terbaru, tulis `retain_last := 1`.

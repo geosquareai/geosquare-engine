@@ -221,8 +221,8 @@ SELECT * FROM expire_snapshots('/data/w_ice', dry_run := false);
 
 Every write keeps the previous snapshots and their files, so a table rewritten often grows.
 `expire_snapshots` keeps the current snapshot and the last `retain_last` ones (and any newer
-than `older_than`), writes new metadata without the others, and deletes the files only they
-used. Files no metadata refers to (left by a failed or running write) are deleted only when
+than `older_than`). The default `retain_last` is 2, so the current snapshot and the one before
+it stay. It writes new metadata without the others, and deletes the files only they used. Files no metadata refers to (left by a failed or running write) are deleted only when
 older than `orphan_age_hours` (default 24), so a write in progress is safe. Dry run is the
 default: the call only reports what it would delete. Pass `dry_run := false` to delete. Older
 snapshots are no longer readable after a real run.

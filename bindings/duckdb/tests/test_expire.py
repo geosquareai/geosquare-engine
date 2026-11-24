@@ -29,12 +29,12 @@ for f in (young, old):
 os.utime(old, (time.time() - 3 * 86400, time.time() - 3 * 86400))
 
 num = lambda r: tuple(int(x) for x in r[:5]) + tuple(r[5:])
-r = num(c.execute("SELECT * FROM expire_snapshots(?, dry_run := true)", [p]).fetchone())
+r = num(c.execute("SELECT * FROM expire_snapshots(?, retain_last := 1, dry_run := true)", [p]).fetchone())
 assert r[0] == 1 and r[1] == 3 and r[6] == "true" and len(files()) == n0 + 2, r
-# the default is a dry run: it reports the plan and deletes nothing
+# the default is a dry run and keeps two snapshots: it reports the plan and deletes nothing
 d0 = num(c.execute("SELECT * FROM expire_snapshots(?)", [p]).fetchone())
-assert d0[6] == "true" and d0[1] == 3 and len(files()) == n0 + 2, d0
-r = num(c.execute("SELECT * FROM expire_snapshots(?, dry_run := false)", [p]).fetchone())
+assert d0[6] == "true" and d0[0] == 2 and d0[1] == 2 and len(files()) == n0 + 2, d0
+r = num(c.execute("SELECT * FROM expire_snapshots(?, retain_last := 1, dry_run := false)", [p]).fetchone())
 kept, expired, deleted, nbytes, orphans_kept = r[:5]
 assert (kept, expired, orphans_kept) == (1, 3, 1) and deleted > 0 and nbytes > 0, r
 after = c.execute("SELECT count(*), sum(v) FROM read_cell_dataset(?)", [p]).fetchone()
