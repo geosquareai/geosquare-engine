@@ -44,8 +44,10 @@ with tempfile.TemporaryDirectory() as tmp:
     data_file = copy / "data" / "part-00000.parquet"
     changed = Path(tmp) / "changed.parquet"
     con.execute(
-        f"COPY (SELECT gid, population, CASE WHEN gid = (SELECT min(gid) FROM read_parquet('{data_file}')) "
-        f"THEN 999.5 ELSE depth_m END AS depth_m, zone FROM read_parquet('{data_file}')) "
+        # Pick the first gid by ORDER BY, not min(): DuckDB 1.5.0 returns a truncated min() for
+        # VARCHAR read from Parquet, which matched no row and left the file unchanged.
+        f"COPY (SELECT gid, population, CASE WHEN gid = (SELECT gid FROM read_parquet('{data_file}') "
+        f"ORDER BY gid LIMIT 1) THEN 999.5 ELSE depth_m END AS depth_m, zone FROM read_parquet('{data_file}')) "
         f"TO '{changed}' (FORMAT PARQUET)"
     )
     shutil.move(str(changed), str(data_file))
