@@ -46,19 +46,12 @@ test("max and min skip NULL values", () => {
   assert.equal(out.cat, 1);
 });
 
-test("majority_weighted picks the category with the largest summed weight", () => {
-  // cat 1: weight 2 + 1 = 3. cat 2: weight 3 + 5 = 8. c3 is skipped (NULL weight).
-  const [out] = rollupToLevel(rows, 10, { cat: { rule: "majority_weighted", weight: "w" } });
-  assert.equal(out.cat, 2);
-});
-
-test("majority_weighted returns NULL on a tie", () => {
-  const tied = [
-    { gid: c0, cat: 1, w: 1 },
-    { gid: c1, cat: 2, w: 1 },
-  ];
-  const [out] = rollupToLevel(tied, 10, { cat: { rule: "majority_weighted", weight: "w" } });
-  assert.equal(out.cat, null);
+test("majority_weighted is not a rule yet and throws", () => {
+  // Planned: the server has no such rule, so the browser must not offer it.
+  assert.throws(
+    () => rollupToLevel(rows, 10, { cat: { rule: "majority_weighted", weight: "w" } }),
+    /unknown rule majority_weighted/,
+  );
 });
 
 test("a parent with one child returns that child's value, and median is NULL", () => {

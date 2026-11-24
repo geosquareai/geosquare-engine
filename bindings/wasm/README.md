@@ -64,17 +64,17 @@ const out = rollupToLevel(rows, level, {
   penduduk: { rule: "sum" },
   pengangguran: { rule: "weighted_mean", weight: "penduduk" },
   harga_m2: { rule: "median" },
-  guna_lahan: { rule: "majority_weighted", weight: "luas" },
   kedalaman: { rule: "max" },
 });
 // out: [{ gid, penduduk, pengangguran, ... }], satu baris per GID induk, urut GID
 ```
 
 - `rows`: `[{ gid, kolom: angka | null }]`. Baris boleh di level mana saja yang lebih halus dari `level`.
-- Aturan: `sum`, `weighted_mean`, `median`, `max`, `min`, `majority_weighted`. Sama dengan rollup DuckDB.
+- Aturan: `sum`, `weighted_mean`, `median`, `max`, `min`. Sama dengan rollup DuckDB.
+- `majority_weighted` (kategori, bobot terbesar) direncanakan. Belum ada di server, jadi belum ada di sini. Aturan tidak dikenal melempar error.
 - `weight` berisi nama kolom, atau `"area"` (bobot 1 per sel, karena sel di satu level punya luas sama).
-- `weighted_mean` dan `majority_weighted` wajib punya `weight`. `sum`, `median`, `max`, `min` tidak boleh punya `weight`.
+- `weighted_mean` wajib punya `weight`. `sum`, `median`, `max`, `min` tidak boleh punya `weight`.
 - NULL dilewati, tidak dihitung 0. Induk tanpa nilai valid hasilnya `null`.
-- `median` butuh minimal 3 nilai. `majority_weighted` hasilnya `null` kalau seri.
+- `median` butuh minimal 3 nilai.
 - Input yang salah melempar error: aturan tidak dikenal, nilai bukan angka hingga, level lebih halus dari baris.
 - `levelForZoom` memakai ambang perkiraan (sel sekitar 10 px). Level tidak dibatasi ke level dataset; batasi sendiri dengan `Math.min`.

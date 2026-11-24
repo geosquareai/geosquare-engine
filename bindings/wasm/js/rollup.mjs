@@ -3,8 +3,8 @@
 // follow the DuckDB rollup in bindings/duckdb/src/dataset.rs, so browser and server agree.
 import { decode, parent } from "../pkg/geosquare_wasm.js";
 
-const RULES = new Set(["sum", "weighted_mean", "median", "max", "min", "majority_weighted"]);
-const NEEDS_WEIGHT = new Set(["weighted_mean", "majority_weighted"]);
+const RULES = new Set(["sum", "weighted_mean", "median", "max", "min"]);
+const NEEDS_WEIGHT = new Set(["weighted_mean"]);
 
 /**
  * Grid level for a map zoom (plan/11, section 5b): zoom 15+ gives level 12, zoom 14 gives 11,
@@ -27,12 +27,11 @@ export function levelForZoom(zoom) {
  * - `rows`: `[{ gid, [column]: number | null | undefined }]`. Rows may be at any level at or
  *   below `level`. Null or undefined values are skipped, never counted as 0.
  * - `rules`: `{ [column]: { rule, weight? } }`. `rule` is one of `sum`, `weighted_mean`,
- *   `median`, `max`, `min`, `majority_weighted`. `weight` is a column name, or `"area"` for
+ *   `median`, `max`, `min`. `weight` is a column name, or `"area"` for
  *   equal weight 1 (all cells at one level have the same area). Weighted rules need a weight.
  *   Other rules take none.
  *
  * A parent with no usable value is `null`. `median` needs at least 3 values, and
- * `majority_weighted` returns `null` on a tie.
  */
 export function rollupToLevel(rows, level, rules) {
   if (!Number.isInteger(level) || level < 0) throw new Error(`level must be a whole number, got ${level}`);
@@ -55,7 +54,9 @@ export function rollupToLevel(rows, level, rules) {
 function checkRules(rules) {
   for (const [column, { rule, weight } = {}] of Object.entries(rules)) {
     if (column === "gid") throw new Error('"gid" cannot be a value column');
-    if (!RULES.has(rule)) throw new Error(`column ${column}: unknown rule ${rule}`);
+    if (!RULES.has(rule)) {
+      throw new Error(`column ${column}: unknown rule ${rule}; use sum, weighted_mean, median, max or min`);
+    }
     if (NEEDS_WEIGHT.has(rule) && weight === undefined) throw new Error(`column ${column}: ${rule} needs a weight`);
     if (!NEEDS_WEIGHT.has(rule) && weight !== undefined) throw new Error(`column ${column}: ${rule} takes no weight`);
   }
@@ -111,23 +112,6 @@ function aggregate(group, column, { rule, weight }) {
       const sorted = items.map((item) => item.value).sort((a, b) => a - b);
       const mid = sorted.length >> 1;
       return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-    }
-    case "majority_weighted": {
-      const totals = new Map();
-      for (const { value, w } of items) totals.set(value, (totals.get(value) ?? 0) + w);
-      let best = null;
-      let bestWeight = 0;
-      let tied = false;
-      for (const [value, total] of totals) {
-        if (total > bestWeight) {
-          best = value;
-          bestWeight = total;
-          tied = false;
-        } else if (total === bestWeight && total > 0) {
-          tied = true;
-        }
-      }
-      return tied ? null : best;
     }
     default:
       throw new Error(`unknown rule ${rule}`);
