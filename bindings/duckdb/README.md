@@ -339,7 +339,7 @@ an Iceberg table's columns without rewriting data. `list_cell_datasets(prefix)`,
 `mode := 'upsert'` rewrites only the partitions an update touches.
 
 `read_raster(path, bbox := [...])` streams the pixels of a GeoTIFF/COG (local or S3, range reads)
-for raster-to-cell conversion in SQL.
+for raster-to-cell conversion in SQL. Only pixel centres inside `bbox` are returned.
 
 `compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset with one file per
 partition and keeps its metadata.

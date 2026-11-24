@@ -1,5 +1,5 @@
 //! `read_raster(path, bbox := [min_lon, min_lat, max_lon, max_lat])`: the pixels of a tiled
-//! GeoTIFF / Cloud Optimized GeoTIFF in lon/lat (EPSG:4326) inside a box, one row per valid
+//! GeoTIFF / Cloud Optimized GeoTIFF in lon/lat (EPSG:4326) whose centre lies inside a box, one row per valid
 //! pixel: `lon`, `lat` (pixel centre) and `value`. Only the tiles the box touches are read
 //! (range requests on S3), so a raster of several GB is cheap to sample by area.
 //!
@@ -412,6 +412,7 @@ pub struct Bind {
     raster: Raster,
     window: (u64, u64, u64, u64),
     tiles: Vec<usize>,
+    bbox: [f64; 4],
 }
 
 /// (next tile in the list, decoded current tile (index, samples), next row, next column).
@@ -489,6 +490,7 @@ impl VTab for ReadRaster {
             raster,
             window,
             tiles,
+            bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
         })
     }
 
@@ -537,9 +539,16 @@ impl VTab for ReadRaster {
                     break;
                 }
                 let v = data[((row - ty * r.tile_h) * r.tile_w + (col - tx * r.tile_w)) as usize];
-                if v.is_finite() && r.nodata.is_none_or(|nd| v != nd) {
-                    lon.push(r.x0 + (col as f64 + 0.5) * r.sx);
-                    lat.push(r.y0 - (row as f64 + 0.5) * r.sy);
+                let (x, y) = (
+                    r.x0 + (col as f64 + 0.5) * r.sx,
+                    r.y0 - (row as f64 + 0.5) * r.sy,
+                );
+                // The window is widened to whole pixels; only centres inside the box are returned.
+                let [min_x, min_y, max_x, max_y] = b.bbox;
+                let inside = x >= min_x && x <= max_x && y >= min_y && y <= max_y;
+                if inside && v.is_finite() && r.nodata.is_none_or(|nd| v != nd) {
+                    lon.push(x);
+                    lat.push(y);
                     val.push(v);
                 }
                 if col + 1 < col_hi {

@@ -236,10 +236,17 @@ SELECT count(*) FROM iceberg_snapshots('/data/w_ice');
 ## From a raster (GeoTIFF / COG)
 
 `read_raster(path, bbox := [min_lon, min_lat, max_lon, max_lat])` returns the valid pixels of
-a tiled single-band GeoTIFF in EPSG:4326 inside the box (`lon`, `lat` of the pixel centre,
+a tiled single-band GeoTIFF in EPSG:4326 whose centre is inside the box (`lon`, `lat` of the pixel centre,
 `value`; nodata skipped). Only the tiles the box touches are read, with range requests on
 S3, so a multi-GB COG is sampled by area. The mean of the pixels whose centre lies in a cell
-is the method the hazard tables use:
+is the method the hazard tables use.
+
+Clip to the area of interest first. Some exports (for example Google Earth Engine) hold values near 0
+outside the area, not NoData. The box keeps only pixels inside it. A non-rectangular area needs a filter
+on the cell list too. Shortcut: no polygon clip in SQL yet, use the box or a cell list; upgrade when a
+polygon-shaped area is needed.
+
+Mean of the pixels per cell, as the hazard tables are built:
 
 ```sql
 -- not run in tests: needs a COG on S3
