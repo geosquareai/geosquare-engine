@@ -104,9 +104,10 @@ def detector_options(args: argparse.Namespace) -> str:
 
 def detect_rows(con: duckdb.DuckDBPyConnection, query: str, args: argparse.Namespace) -> list[tuple[Any, ...]]:
     options = detector_options(args)
-    sql = f"SELECT * FROM detect_table(?{options})"
+    # Inline the query: DuckDB 2.x rejects a bound parameter as a table function argument.
+    sql = f"SELECT * FROM detect_table({sql_string(query)}{options})"
     try:
-        return con.execute(sql, [query]).fetchall()
+        return con.execute(sql).fetchall()
     except Exception as exc:
         raise CLIError(f"detection failed: {exc}") from exc
 
@@ -180,10 +181,10 @@ def require_columns(columns: Iterable[str], requested: Iterable[str]) -> None:
         raise CLIError(f"unknown column(s): {', '.join(missing)}")
 
 
-def detector_for_query(con: duckdb.DuckDBPyConnection, query: str, column: str) -> tuple[str, float, list[Any]]:
-    detection_query = f"SELECT {sql_identifier(column)} FROM ({query}) AS gsq_detect_input"
+def detector_for_query(con: duckdb.DuckDBPyConnection, relation: str, column: str) -> tuple[str, float, list[Any]]:
+    detection_query = f"SELECT {sql_identifier(column)} FROM {relation}"
     try:
-        row = con.execute("SELECT * FROM detect_table(?)", [detection_query]).fetchone()
+        row = con.execute(f"SELECT * FROM detect_table({sql_string(detection_query)})").fetchone()
     except Exception as exc:
         raise CLIError(f"could not validate {column}: {exc}") from exc
     if row is None:
@@ -334,6 +335,96 @@ def run_to_geo(args: argparse.Namespace) -> int:
         con.close()
 
 
+def check_problems(report: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    if report["rows"] == 0:
+        problems.append("no rows with a GID value")
+    for row_no, gid in report["invalid_gids"]:
+        problems.append(f"invalid GID at row {row_no}: {gid if gid is not None else 'NULL'}")
+    for gid, count in report["duplicate_gids"]:
+        problems.append(f"duplicate GID {gid}: {count} rows")
+    if len(report["levels"]) > 1:
+        problems.append(f"mixed levels: {report['levels']}")
+    totals = report["totals"]
+    if totals and totals["difference"] != 0 and abs(totals["difference"]) > 1e-9 * max(1.0, abs(totals["source_total"])):
+        problems.append(
+            f"{totals['column']} total differs from source by {totals['difference']}: "
+            f"input {totals['input_total']}, source {totals['source_total']}"
+        )
+    return problems
+
+
+def column_total(con: duckdb.DuckDBPyConnection, table: str, column: str) -> float:
+    try:
+        row = con.execute(f"SELECT coalesce(sum(CAST({sql_identifier(column)} AS DOUBLE)), 0) FROM {table}").fetchone()
+    except Exception as exc:
+        raise CLIError(f"could not sum {column} in {table}: {exc}") from exc
+    return float(row[0])
+
+
+def run_check(args: argparse.Namespace) -> int:
+    domain = args.domain.upper()
+    if args.value and not args.source:
+        raise UsageError("--value needs --source")
+    if args.source and not args.value:
+        raise UsageError("--source needs --value")
+    con = connect(args.extension)
+    try:
+        try:
+            # Probe the domain once: the engine raises for an unknown domain, and per-row TRY would hide it.
+            con.execute(f"SELECT gid_to_canonical({sql_string(domain)}, 'H2X545V39')").fetchall()
+        except Exception as exc:
+            raise UsageError(f"unknown domain {domain}: {exc}") from exc
+        columns = create_input_table(con, args.input)
+        require_columns(columns, [args.gid_column])
+        gid = sql_identifier(args.gid_column)
+        con.execute(
+            "CREATE OR REPLACE TEMP TABLE gsq_check AS SELECT row_number() OVER () AS row_no, "
+            f"CAST({gid} AS VARCHAR) AS gid, "
+            f"TRY(gid_to_canonical({sql_string(domain)}, CAST({gid} AS VARCHAR))) AS cell FROM gsq_input"
+        )
+        report: dict[str, Any] = {
+            "input": args.input,
+            "gid_column": args.gid_column,
+            "domain": domain,
+            "rows": con.execute("SELECT count(*) FROM gsq_check").fetchone()[0],
+            "levels": [r[0] for r in con.execute(
+                "SELECT DISTINCT cell.level FROM gsq_check WHERE cell IS NOT NULL ORDER BY 1").fetchall()],
+            "invalid_gids": [list(r) for r in con.execute(
+                "SELECT row_no, gid FROM gsq_check WHERE cell IS NULL ORDER BY row_no").fetchall()],
+            "duplicate_gids": [list(r) for r in con.execute(
+                "SELECT gid, count(*) FROM gsq_check WHERE gid IS NOT NULL "
+                "GROUP BY gid HAVING count(*) > 1 ORDER BY gid").fetchall()],
+            "totals": None,
+        }
+        if args.source:
+            source_columns = create_input_table(con, args.source, "gsq_source")
+            require_columns(columns, [args.value])
+            require_columns(source_columns, [args.value])
+            input_total = column_total(con, "gsq_input", args.value)
+            source_total = column_total(con, "gsq_source", args.value)
+            report["totals"] = {
+                "column": args.value,
+                "input_total": input_total,
+                "source": args.source,
+                "source_total": source_total,
+                "difference": input_total - source_total,
+            }
+        problems = check_problems(report)
+        report["problems"] = problems
+        report["ok"] = not problems
+        if args.json:
+            print(json.dumps(report, separators=(",", ":")))
+        else:
+            print(f"{args.input}: {report['rows']} rows, domain {domain}, levels {report['levels']}")
+            for problem in problems:
+                print(f"  {problem}")
+            print("OK" if report["ok"] else f"{len(problems)} problem(s) found")
+        return 0 if report["ok"] else 1
+    finally:
+        con.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gsq", description="GeoSquare engine command-line tool")
     parser.add_argument("--version", action="version", version=__version__)
@@ -375,6 +466,16 @@ def build_parser() -> argparse.ArgumentParser:
     geo.add_argument("--crs", choices=("EPSG:4326", "grid"), default="EPSG:4326")
     geo.add_argument("--allow-candidate-crs", action="store_true")
     geo.set_defaults(func=run_to_geo)
+
+    check = sub.add_parser("check", help="check GID quality before upload")
+    check.add_argument("input")
+    check.add_argument("--extension", dest="command_extension")
+    check.add_argument("--domain", required=True, help="domain of the GIDs, e.g. ID")
+    check.add_argument("--gid-column", default="gid")
+    check.add_argument("--source", help="source CSV or Parquet to compare column totals with")
+    check.add_argument("--value", help="column to total in both files (with --source)")
+    check.add_argument("--json", action="store_true", help="print a JSON report")
+    check.set_defaults(func=run_check)
     return parser
 
 
