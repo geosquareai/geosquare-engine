@@ -7,17 +7,16 @@ const RULES = new Set(["sum", "weighted_mean", "median", "max", "min"]);
 const NEEDS_WEIGHT = new Set(["weighted_mean"]);
 
 /**
- * Grid level for a map zoom (plan/11, section 5b): zoom 15+ gives level 12, zoom 14 gives 11,
- * zoom 12 to 13 gives 10, and zoom 11 or lower gives 9.
- * shortcut: thresholds are approximate for Indonesia, about 10 px per cell side, upgrade by
- * tuning on real maps. The result is not clamped to the dataset level; the caller does that.
+ * Pyramid level for a map zoom (plan/11, section 5b; spec pyramid section 11, item 8). Only the
+ * levels the pyramid holds are returned: 12 (zoom 14 and up), 10 (zoom 11 to 13), 8 (zoom 10 and below).
+ * shortcut: thresholds are approximate for Indonesia, not tuned on real maps; upgrade by tuning on
+ * real maps. The result is not clamped to the dataset level; the caller does that.
  */
 export function levelForZoom(zoom) {
   if (!Number.isFinite(zoom)) throw new Error("zoom must be a finite number");
-  if (zoom >= 15) return 12;
-  if (zoom >= 14) return 11;
-  if (zoom >= 12) return 10;
-  return 9;
+  if (zoom >= 14) return 12;
+  if (zoom >= 11) return 10;
+  return 8;
 }
 
 /**
