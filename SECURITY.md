@@ -6,8 +6,9 @@ Do not open a public issue for a security problem.
 
 Report it privately through GitHub security advisories:
 
-1. Open the [Security tab](https://github.com/geosquareai/geosquare-engine/security) of this repository.
-2. Choose "Report a vulnerability".
+1. Open a new advisory directly: [report a vulnerability](https://github.com/geosquareai/geosquare-engine/security/advisories/new).
+   Or open the [Security tab](https://github.com/geosquareai/geosquare-engine/security) and choose "Report a vulnerability".
+2. Fill in the form.
 3. Describe the problem, the steps to reproduce it, and the versions you tested.
 
 We work with you on a fix before any public disclosure.
