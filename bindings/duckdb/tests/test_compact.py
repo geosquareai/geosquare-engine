@@ -52,4 +52,15 @@ for layout in ("iceberg", "partitioned", "flat"):
         left = glob.glob(f"{p}/data/**/*.parquet", recursive=True)
         assert len(left) == c.execute("SELECT count(DISTINCT left(gid, 5)) FROM read_cell_dataset(?)", [p]).fetchone()[0], left
         assert data() == before[0]
+# compaction keeps NULL numbers as NULL (it used to write them as 0)
+for layout in ("partitioned", "iceberg"):
+    p = f"{d}/nulls_{layout}"
+    q = ("SELECT packed_id, CASE WHEN packed_id % 4 = 0 THEN NULL ELSE (packed_id % 7)::DOUBLE END AS hazard "
+         "FROM polygon_to_cells('ID', 'POLYGON ((106.78 -6.24, 106.84 -6.24, 106.84 -6.20, 106.78 -6.20, 106.78 -6.24))', 12)")
+    c.execute("SELECT * FROM write_cell_dataset(?, ?, layout := ?, partition_level := 7, fill_nulls := false)", [q, p, layout]).fetchall()
+    nulls = lambda: c.execute("SELECT count(*) FILTER (WHERE hazard IS NULL) FROM read_cell_dataset(?)", [p]).fetchone()[0]
+    before = nulls()
+    assert before > 0, (layout, before)
+    c.execute("SELECT * FROM compact_cell_dataset(?)", [p]).fetchall()
+    assert nulls() == before, (layout, before, nulls())
 print("compact OK", d)

@@ -694,7 +694,8 @@ fn compact(
             coverage: object(manifest.get("coverage")),
             ..Default::default()
         },
-        fill_nulls: true,
+        // Keep NULLs: compaction must not change values. 'fill_nulls: true' wrote them as 0.
+        fill_nulls: false,
         rollup_level: None,
         space_aggregation: None,
         space_weight: None,
