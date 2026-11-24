@@ -37,6 +37,25 @@ test("zoom rollup folds children into the parent cell with the given rule", () =
   assert.deepEqual(out[0].polygon, gs.cellPolygonWgs84(1, PARENT, 25000, false));
 });
 
+test("weighted rollup reads the weight column from the rows", () => {
+  // Values 10, 20, NULL, 40 with weights 1, 3, 5, 7. The NULL row is skipped, with its weight.
+  // (10*1 + 20*3 + 40*7) / (1 + 3 + 7) = 350 / 11
+  const weighted = kids.slice(0, 4).map((gid, i) => ({
+    gid,
+    value: [10, 20, null, 40][i],
+    population: [1, 3, 5, 7][i],
+  }));
+  const [cell] = cellPolygons(weighted, {
+    domainId: 1,
+    getGid: byGid(),
+    getValue: valueOf,
+    zoom: 12,
+    aggregation: { rule: "weighted_mean", weight: "population" },
+    maxSegmentLengthM: 25000,
+  });
+  assert.ok(Math.abs(cell.value - 350 / 11) < 1e-12, `got ${cell.value}`);
+});
+
 test("zoom and aggregation must come together", () => {
   assert.throws(() => cellPolygons(rows, { domainId: 1, getGid: byGid(), getValue: valueOf, zoom: 12 }), /set together/);
 });

@@ -23,7 +23,7 @@ export function cellPolygons(rows, options) {
   if (!Number.isInteger(domainId)) throw new Error("domainId must be a whole number, the registry domain of the GIDs");
   if ((zoom == null) !== (aggregation == null)) throw new Error("zoom and aggregation must be set together");
 
-  let items = rows.map((row) => ({ gid: getGid(row), value: getValue(row) }));
+  let items = rows.map((row) => ({ ...row, gid: getGid(row), value: getValue(row) }));
   if (zoom != null) {
     const finest = Math.min(...items.map((item) => decode(item.gid).level));
     const level = Math.min(levelForZoom(zoom), finest);
