@@ -803,7 +803,7 @@ fn cell_geometry(
 }
 
 /// Outline of a cell (open ring) in the grid CRS or in lon/lat.
-fn cell_ring(
+pub(crate) fn cell_ring(
     d: &'static domain::Domain,
     c: Cell,
     crs: &str,

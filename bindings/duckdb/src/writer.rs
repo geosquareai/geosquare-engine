@@ -15,6 +15,8 @@ use crate::{
     dataset::{self, join, MANIFEST_FILE, MANIFEST_KEY, PREFIX_INDEX_FILE},
     grid::{domain_by_code, level_u8},
     iceberg::{self, DataFile, Field, ManifestFile},
+    manifest11::{self, FieldIn, FileSpec},
+    metadata::PerColumn,
     sql::{self, ident, lit, Lease, Params, Plan, E},
     storage::{is_local, local, S3Params, Storage},
 };
@@ -94,6 +96,14 @@ pub struct Options {
     /// metadata is kept unless this write passes other values.
     prev: Option<(Json, Json)>,
     s3: S3Params,
+    /// `manifest_version` as given (`1.0` or `1.1`). None keeps the version of the dataset
+    /// being appended to or overwritten, else 1.0.
+    manifest_version: Option<String>,
+    /// The manifest version this write produces, set by `write` from the parameter, the
+    /// dataset being replaced, and the default.
+    version: String,
+    /// Governance and lineage parameters (manifest 1.1).
+    gov: manifest11::Params,
 }
 
 /// Data files per Iceberg manifest (see write_iceberg).
@@ -123,11 +133,20 @@ fn s3_params(p: &Params) -> S3Params {
 pub fn plan_write(p: &Params) -> Result<Plan, E> {
     let query = p.pos_text(0, "query")?;
     let path = p.pos_text(1, "path")?;
-    if (p.text("space_aggregation").is_some() || p.text("space_weight").is_some())
-        && p.int("rollup_level").is_none()
-    {
-        return Err("space_aggregation and space_weight need rollup_level".into());
+    if let Some(v) = p.text("manifest_version") {
+        if v != "1.0" && v != "1.1" {
+            return Err(format!("manifest_version must be '1.0' or '1.1'; received {v:?}").into());
+        }
     }
+    let gov = manifest11::Params {
+        owner: p.text("owner"),
+        source_name: p.text("source_name"),
+        license: p.text("license"),
+        share_policy: p.text("share_policy"),
+        refresh: p.text("refresh"),
+        derived_from: p.text("derived_from"),
+    };
+    manifest11::check_params(&gov)?;
     let o = Options {
         layout: p
             .text("layout")
@@ -162,6 +181,9 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
             .unwrap_or_else(|| "auto".into())
             .to_ascii_lowercase(),
         extra: crate::metadata::Extra::from_params(p)?,
+        manifest_version: p.text("manifest_version"),
+        version: "1.0".into(),
+        gov,
         s3: s3_params(p),
     };
     if !matches!(o.identity.as_str(), "query" | "compact") {
@@ -700,6 +722,9 @@ fn compact(
         space_weight: None,
         value_semantics_given: false,
         prev: None,
+        manifest_version: None,
+        version: "1.0".into(),
+        gov: Default::default(),
         s3: s3.clone(),
     };
     let query = format!("SELECT * FROM read_cell_dataset({})", lit(&root));
@@ -864,16 +889,8 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
     })
 }
 
-/// The cell-dataset manifest (geosquare-v2 contract, manifest_version 1.0).
-fn manifest(
-    st: &Staged,
-    o: &Options,
-    partitioning: Vec<String>,
-    row_count: i64,
-) -> Result<Json, E> {
-    let query_profile =
-        o.identity == "query" && st.has("packed_id") && st.has("x_idx") && st.has("y_idx");
-    let col = |n: &str| if query_profile { json!(n) } else { Json::Null };
+/// The value fields of the manifest: the `value_fields` parameter, else one per column.
+fn value_fields(st: &Staged, o: &Options) -> Result<Json, E> {
     // value_semantics / aggregation_rule: one value for every numeric column, or a JSON
     // object per column, e.g. {"population": "COUNT", "score": "MEASUREMENT"}.
     let per_column =
@@ -928,6 +945,25 @@ fn manifest(
             "the dataset needs at least one value column besides gid/packed_id/x_idx/y_idx".into(),
         );
     }
+    Ok(value_fields)
+}
+
+/// The cell-dataset manifest: manifest 1.0, or 1.1 when `facts` is given.
+fn manifest(
+    st: &Staged,
+    o: &Options,
+    value_fields: Json,
+    partitioning: Vec<String>,
+    row_count: i64,
+    facts: Option<&manifest11::Facts>,
+) -> Result<Json, E> {
+    let query_profile =
+        o.identity == "query" && st.has("packed_id") && st.has("x_idx") && st.has("y_idx");
+    let col = |n: &str| if query_profile { json!(n) } else { Json::Null };
+    let per_column_aggregation = o
+        .aggregation_rule
+        .as_deref()
+        .is_some_and(|t| t.trim_start().starts_with('{'));
     let parse = |name: &str, text: &Option<String>, default: Json| -> Result<Json, E> {
         match text {
             Some(t) => {
@@ -936,7 +972,9 @@ fn manifest(
             None => Ok(default),
         }
     };
-    let semantics = if sem_map.is_none() && is_numeric_semantics(&o.value_semantics) {
+    let semantics = if !o.value_semantics.trim_start().starts_with('{')
+        && is_numeric_semantics(&o.value_semantics)
+    {
         json!(o.value_semantics)
     } else {
         Json::Null
@@ -978,7 +1016,7 @@ fn manifest(
             "created_at": iso_now(),
             "created_by": format!("geosquare_v2 duckdb extension {}", env!("CARGO_PKG_VERSION")),
             "generator": "write_cell_dataset",
-            "aggregation_rule": if agg_map.is_some() { Json::Null } else { json!(o.aggregation_rule) },
+            "aggregation_rule": if per_column_aggregation { Json::Null } else { json!(o.aggregation_rule) },
             "value_semantics": semantics,
             "notes": o.notes
         }
@@ -987,6 +1025,12 @@ fn manifest(
         inherit(&mut m, prev, o);
     }
     crate::metadata::apply(&mut m, &o.extra)?;
+    if let Some(f) = facts {
+        let prev = o.prev.as_ref().map(|(p, _)| p);
+        let governance = manifest11::governance(&o.gov, o.extra.title.as_deref(), prev);
+        let derived = manifest11::derived_from(&o.gov, prev)?;
+        manifest11::apply(&mut m, f, governance, derived);
+    }
     Ok(m)
 }
 
@@ -1164,6 +1208,7 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
                 }
             }
         }
+        o.version = resolve_version(&o, &root)?;
         let o = &o;
         // Stage (read the whole input) before clearing the target: the input may read the
         // dataset being overwritten (update / delete by rewriting it).
@@ -1176,6 +1221,19 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
             None => query,
         };
         let st = stage(&lease, query, o)?;
+        if o.is_v11() {
+            // Refuse bad rules, types, domains and values before the target is cleared.
+            if !st.domain.crs_released() {
+                return Err(format!(
+                    "manifest 1.1 needs a released domain: {} is not released for lon/lat",
+                    st.domain.code
+                )
+                .into());
+            }
+            let vf = value_fields(&st, o)?;
+            manifest11::resolve_fields(&field_inputs(&vf, o)?)?;
+            check_finite(&lease, &st)?;
+        }
         if o.layout != "iceberg" {
             prepare_target(&lease, &root, o, &store)?;
         }
@@ -1187,6 +1245,177 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
     })();
     let _ = sql::exec_on(&lease, &format!("DROP TABLE IF EXISTS {stage_name}"));
     result
+}
+
+impl Options {
+    /// Whether this write produces manifest 1.1.
+    fn is_v11(&self) -> bool {
+        self.version == manifest11::VERSION
+    }
+}
+
+/// Refuse NaN and infinity in float value columns. Manifest 1.1 records their statistics and
+/// hashes, which cannot represent them. Runs before the target is cleared.
+fn check_finite(lease: &Lease, st: &Staged) -> Result<(), E> {
+    let floats: Vec<&str> = st
+        .columns
+        .iter()
+        .filter(|(c, t)| {
+            !IDENTITY.contains(&c.as_str())
+                && c != "uri"
+                && matches!(t.to_ascii_uppercase().as_str(), "FLOAT" | "DOUBLE")
+        })
+        .map(|(c, _)| c.as_str())
+        .collect();
+    if floats.is_empty() {
+        return Ok(());
+    }
+    let counts: Vec<String> = floats
+        .iter()
+        .map(|c| {
+            let col = ident(c);
+            format!("count(*) FILTER (WHERE isnan({col}) OR isinf({col}))")
+        })
+        .collect();
+    let r = one_row(
+        lease,
+        &format!("SELECT {} FROM {}", counts.join(", "), stage_table()),
+    )?;
+    for (name, n) in floats.iter().zip(&r) {
+        if num(n) > 0 {
+            return Err(format!(
+                "column {name}: NaN or infinity cannot be recorded in manifest 1.1; set those values to NULL first"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The manifest version of a dataset, from its manifest (1.0 when it names none).
+fn manifest_version_of(m: &Json) -> String {
+    m.get("manifest_version")
+        .and_then(Json::as_str)
+        .unwrap_or("1.0")
+        .to_string()
+}
+
+/// The manifest version a write produces: the `manifest_version` parameter, else the version of
+/// the dataset being appended to or overwritten, else 1.0. Refuses the combinations manifest 1.1
+/// does not support yet: upsert, and appending to or from a table of the other version.
+fn resolve_version(o: &Options, root: &str) -> Result<String, E> {
+    let prev = o.prev.as_ref().map(|(m, _)| manifest_version_of(m));
+    let version = o
+        .manifest_version
+        .clone()
+        .or_else(|| prev.clone())
+        .unwrap_or_else(|| "1.0".into());
+    if version != "1.1"
+        && o.rollup_level.is_none()
+        && (o.space_aggregation.is_some() || o.space_weight.is_some())
+    {
+        return Err(
+            "space_aggregation and space_weight need rollup_level (or manifest_version := '1.1')"
+                .into(),
+        );
+    }
+    match (version.as_str(), o.mode.as_str(), prev.as_deref()) {
+        ("1.1", "upsert", _) => Err(format!(
+            "{root}: mode 'upsert' is not available for manifest 1.1 yet; use mode := 'append' or 'overwrite'"
+        )
+        .into()),
+        ("1.1", "append", Some("1.0")) => Err(format!(
+            "{root} is manifest 1.0: upgrade it with mode := 'overwrite' and manifest_version := '1.1'"
+        )
+        .into()),
+        ("1.0", "append" | "upsert", Some("1.1")) => Err(format!(
+            "{root} is manifest 1.1: appending as 1.0 would drop its hashes and statistics; keep \
+             manifest_version 1.1, or overwrite"
+        )
+        .into()),
+        _ => Ok(version),
+    }
+}
+
+/// The inputs manifest 1.1 needs for each value field: its type and semantics, and the rule and
+/// weight. A parameter wins over the value stored in the manifest the field came from.
+fn field_inputs<'a>(vf: &'a Json, o: &Options) -> Result<Vec<FieldIn<'a>>, E> {
+    let rules = PerColumn::parse(o.space_aggregation.clone(), "space_aggregation")?;
+    let weights = PerColumn::parse(o.space_weight.clone(), "space_weight")?;
+    // Like the other metadata, the rule and weight of a field being appended to or overwritten
+    // are kept unless this write gives them.
+    let kept = |name: &str, key: &str| -> Option<String> {
+        o.prev
+            .as_ref()?
+            .0
+            .get("value_fields")?
+            .as_array()?
+            .iter()
+            .find(|f| f.get("name").and_then(Json::as_str) == Some(name))?
+            .get(key)?
+            .as_str()
+            .map(str::to_string)
+    };
+    let fields: &[Json] = vf.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    Ok(fields
+        .iter()
+        .map(|f| {
+            let name = f.get("name").and_then(Json::as_str).unwrap_or("");
+            let text = |key: &str| f.get(key).and_then(Json::as_str).map(str::to_string);
+            FieldIn {
+                name,
+                parquet_type: f.get("parquet_type").and_then(Json::as_str).unwrap_or(""),
+                numeric: f.get("logical_type").and_then(Json::as_str) == Some("numeric"),
+                semantics: if o.value_semantics_given {
+                    text("semantics").unwrap_or_else(|| "CATEGORICAL".into())
+                } else {
+                    kept(name, "semantics")
+                        .or_else(|| text("semantics"))
+                        .unwrap_or_else(|| "CATEGORICAL".into())
+                },
+                rule: rules
+                    .get(name)
+                    .map(str::to_string)
+                    .or_else(|| text("space_aggregation"))
+                    .or_else(|| kept(name, "space_aggregation")),
+                weight: weights
+                    .get(name)
+                    .map(str::to_string)
+                    .or_else(|| text("space_weight"))
+                    .or_else(|| kept(name, "space_weight")),
+            }
+        })
+        .collect())
+}
+
+/// The manifest 1.1 facts of this write, or None for manifest 1.0. `files` are the data files
+/// the write creates. When appending, the dataset's manifest is the base the facts extend.
+fn facts11(
+    lease: &Lease,
+    st: &Staged,
+    o: &Options,
+    vf: &Json,
+    files: Vec<FileSpec>,
+) -> Result<Option<manifest11::Facts>, E> {
+    if !o.is_v11() {
+        return Ok(None);
+    }
+    let fields = field_inputs(vf, o)?;
+    let base = o
+        .prev
+        .as_ref()
+        .map(|(m, _)| m)
+        .filter(|_| o.mode == "append");
+    manifest11::facts(
+        lease,
+        &stage_table(),
+        st.domain,
+        &fields,
+        files,
+        base,
+        write_threads(),
+    )
+    .map(Some)
 }
 
 /// Columns written to contract folders: everything, or gid + values for 'compact'.
@@ -1208,7 +1437,13 @@ fn write_flat(
     o: &Options,
 ) -> Result<Vec<Vec<Option<String>>>, E> {
     let stage = stage_table();
-    let m = manifest(st, o, vec![], st.rows)?;
+    let vf = value_fields(st, o)?;
+    let file = FileSpec {
+        path: "data/part-00000.parquet".into(),
+        predicate: "TRUE".into(),
+    };
+    let facts = facts11(lease, st, o, &vf, vec![file])?;
+    let m = manifest(st, o, vf, vec![], st.rows, facts.as_ref())?;
     ensure_dir(&join(root, "data"))?;
     sql::exec_on(
         lease,
@@ -1256,16 +1491,6 @@ fn write_partitioned(
     let stage = stage_table();
     let mut staging = Staging::new(root)?;
     let l = partition_level(st, o)?;
-    let m = manifest(
-        st,
-        o,
-        vec![
-            "domain_code".into(),
-            "level".into(),
-            format!("gid_prefix:{l}"),
-        ],
-        st.rows,
-    )?;
     let prefixes: Vec<String> = rows(
         lease,
         &format!("SELECT DISTINCT left(gid, {l}) FROM {stage} ORDER BY 1"),
@@ -1274,12 +1499,31 @@ fn write_partitioned(
     .filter_map(|r| r.into_iter().next().flatten())
     .collect();
     let mut jobs = Vec::with_capacity(prefixes.len());
+    let mut specs = Vec::with_capacity(prefixes.len());
     for p in &prefixes {
         let (lo, hi) = topology::descendant_range(st.domain.id, codec::decode(p)?, st.level)?;
         let rel = format!("data/gid_prefix={p}/part-00000.parquet");
         ensure_dir(&join(root, &format!("data/gid_prefix={p}")))?;
+        specs.push(FileSpec {
+            path: rel.clone(),
+            predicate: format!("packed_id BETWEEN {lo} AND {hi}"),
+        });
         jobs.push((lo, hi, staging.path(&join(root, &rel), &rel)?));
     }
+    let vf = value_fields(st, o)?;
+    let facts = facts11(lease, st, o, &vf, specs)?;
+    let m = manifest(
+        st,
+        o,
+        vf,
+        vec![
+            "domain_code".into(),
+            "level".into(),
+            format!("gid_prefix:{l}"),
+        ],
+        st.rows,
+        facts.as_ref(),
+    )?;
     let (columns, options) = (folder_columns(st, o), parquet_options(o, &m, ""));
     sql::par_map(jobs, write_threads(), |l, (lo, hi, target)| {
         sql::exec_on(
@@ -1858,25 +2102,19 @@ fn write_iceberg(
         prev.as_ref()
             .map_or(0, |(_, m)| summary_i64(m, "total-records"))
     };
-    let cell_manifest = manifest(
-        st,
-        o,
-        vec![
-            "domain_code".into(),
-            "level".into(),
-            format!("iceberg:truncate({width},packed_id)"),
-        ],
-        prev_total - replaced_rows + staged_rows,
-    )?;
-
     // Data files: one sorted file per partition, written by DuckDB (staged locally for S3).
     let mut staging = Staging::new(root)?;
     let mut jobs = Vec::with_capacity(parts.len());
+    let mut specs = Vec::with_capacity(parts.len());
     for (i, pt) in parts.iter().enumerate() {
         let rel = format!(
             "data/{}={pt}/{write_uuid}-{i:05}.parquet",
             iceberg::PARTITION_FIELD
         );
+        specs.push(FileSpec {
+            path: rel.clone(),
+            predicate: format!("packed_id >= {pt} AND packed_id < {}", pt + width),
+        });
         let file = staging.path(&join(root, &rel), &rel)?;
         ensure_dir(&join(
             root,
@@ -1884,6 +2122,20 @@ fn write_iceberg(
         ))?;
         jobs.push((*pt, rel, file));
     }
+    let vf = value_fields(st, o)?;
+    let facts = facts11(lease, st, o, &vf, specs)?;
+    let cell_manifest = manifest(
+        st,
+        o,
+        vf,
+        vec![
+            "domain_code".into(),
+            "level".into(),
+            format!("iceberg:truncate({width},packed_id)"),
+        ],
+        prev_total - replaced_rows + staged_rows,
+        facts.as_ref(),
+    )?;
     let copy_options = parquet_options(
         o,
         &cell_manifest,
@@ -2435,6 +2687,16 @@ fn alter(
             .and_then(|t| serde_json::from_str(t).ok())
     };
     let mut manifest = prop(&meta, MANIFEST_KEY).ok_or("the table has no cell manifest")?;
+    if manifest_version_of(&manifest) == manifest11::VERSION
+        && (!drop.is_empty() || !add.is_empty() || !rename.is_empty())
+    {
+        return Err(
+            "manifest 1.1 tables take no column changes yet: their content hashes are read \
+                    by column name, so a renamed or dropped column cannot be checked. Rewrite the \
+                    table with mode := 'overwrite' to change its columns"
+                .into(),
+        );
+    }
     let mut info = prop(&meta, crate::metadata::INFO_KEY).unwrap_or_else(|| json!({}));
     if let Some(vf) = manifest
         .get_mut("value_fields")
@@ -2553,6 +2815,10 @@ fn update_metadata(
             let mut manifest = prop(&meta, MANIFEST_KEY)
                 .ok_or("the table has no cell manifest (geosquare.manifest)")?;
             md::apply(&mut manifest, extra)?;
+            // A 1.1 manifest keeps the dataset title in governance too.
+            if let (Some(title), "1.1") = (&extra.title, manifest_version_of(&manifest).as_str()) {
+                manifest["governance"]["title"] = json!(title);
+            }
             let info = md::info(prop(&meta, INFO_KEY).as_ref(), &manifest, extra);
             let now = now_ms();
             let obj = meta.as_object_mut().ok_or("metadata is not an object")?;
@@ -2624,6 +2890,16 @@ fn update_metadata(
                 .manifest
                 .clone()
                 .ok_or("the dataset has no manifest.json")?;
+            if manifest_version_of(&manifest) == manifest11::VERSION {
+                // Only manifest.json would change; the Parquet files keep the old copy, and the
+                // Python reader requires the two to match.
+                return Err(
+                    "update_cell_metadata cannot change a manifest 1.1 folder: the Parquet \
+                            files would keep the old manifest. Rewrite the folder with mode := \
+                            'overwrite' (the metadata is kept), or write a new dataset"
+                        .into(),
+                );
+            }
             md::apply(&mut manifest, extra)?;
             let prev: Option<Json> = sql::query_text_on(
                 &lease,

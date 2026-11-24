@@ -15,6 +15,7 @@ Parquet and Iceberg. Every SQL block here runs in `tests/test_docs_examples.py` 
 | merge files / repartition, keep metadata | `compact_cell_dataset(path [, partition_level])` | same |
 | drop old snapshots and their files | - | `expire_snapshots(path, retain_last := N, dry_run := false)` |
 | change the partition level | `mode := 'overwrite', partition_level := ...` | same (new partition spec) |
+| record statistics, parent rules, extent, governance and file hashes (opt-in) | `manifest_version := '1.1'`, see [manifest-1.1.md](manifest-1.1.md) | same |
 
 A dataset holds one row per cell (unique `packed_id`), one domain and one level. The writer
 sorts by `packed_id`, adds missing identity columns (`gid`, `x_idx`, `y_idx`), writes 0 for

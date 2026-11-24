@@ -16,6 +16,7 @@ mod icefast;
 mod inspect;
 mod lines;
 mod maintenance;
+mod manifest11;
 mod metadata;
 mod polyfill;
 mod raster;
@@ -174,6 +175,13 @@ unsafe fn register_dataset_functions(
                 ("rollup_level", Int),
                 ("space_aggregation", Text),
                 ("space_weight", Text),
+                ("manifest_version", Text),
+                ("owner", Text),
+                ("source_name", Text),
+                ("license", Text),
+                ("share_policy", Text),
+                ("refresh", Text),
+                ("derived_from", Text),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),
