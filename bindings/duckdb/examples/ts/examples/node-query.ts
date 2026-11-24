@@ -8,7 +8,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { type Area, GeosquareCells } from '../src/node';
 
-const PEOPLE = process.env.GEOSQUARE_DATASET ?? 's3://geosquare-data/apps-data/data_v2/data_name=50m_people_v2023';
+const PEOPLE = process.env.GEOSQUARE_DATASET ?? 's3://geosquare-data/apps-data/data_v2/data_name=people_v2023';
 const [areaArg, ...cols] = process.argv.slice(2);
 if (!areaArg) {
   console.error('usage: node-query.ts <area.geojson | WKT | xmin,ymin,xmax,ymax> [column ...]');

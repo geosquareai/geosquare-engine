@@ -159,6 +159,7 @@ enum Field {
     Str(Vec<String>),
     I64(Vec<i64>),
     I32(Vec<i32>),
+    F64(Vec<f64>),
 }
 
 fn finish_struct(out: &mut dyn WritableVector, valid: &[bool], fields: Vec<Field>) {
@@ -179,6 +180,10 @@ fn finish_struct(out: &mut dyn WritableVector, valid: &[bool], fields: Vec<Field
                 .iter()
                 .enumerate()
                 .for_each(|(i, x)| put_i32(&mut c, i, *x)),
+            Field::F64(v) => v
+                .iter()
+                .enumerate()
+                .for_each(|(i, x)| put_f64(&mut c, i, *x)),
         }
         for (i, ok) in valid.iter().enumerate() {
             if !ok {
@@ -787,7 +792,24 @@ fn cell_geometry(
     fmt: &str,
     allow_candidate_crs: bool,
 ) -> Result<String, Box<dyn Error>> {
-    let ring: Vec<(f64, f64)> = match crs.trim().to_ascii_uppercase().as_str() {
+    let ring = cell_ring(d, c, crs, allow_candidate_crs)?;
+    match fmt.trim().to_ascii_lowercase().as_str() {
+        "wkt" => Ok(geom::to_wkt(&[ring])),
+        "geojson" => Ok(geom::to_geojson(&[ring])),
+        other => {
+            Err(format!("geometry_format must be 'wkt' or 'geojson'; received {other:?}").into())
+        }
+    }
+}
+
+/// Outline of a cell (open ring) in the grid CRS or in lon/lat.
+fn cell_ring(
+    d: &'static domain::Domain,
+    c: Cell,
+    crs: &str,
+    allow_candidate_crs: bool,
+) -> Result<Vec<(f64, f64)>, Box<dyn Error>> {
+    Ok(match crs.trim().to_ascii_uppercase().as_str() {
         "GRID" | "PROJECTED" => {
             let b = geo::cell_bounds(d, c)?;
             vec![
@@ -807,13 +829,79 @@ fn cell_geometry(
                 format!("output_crs must be 'grid' or 'EPSG:4326'; received {other:?}").into(),
             )
         }
-    };
-    match fmt.trim().to_ascii_lowercase().as_str() {
-        "wkt" => Ok(geom::to_wkt(&[ring])),
-        "geojson" => Ok(geom::to_geojson(&[ring])),
-        other => {
-            Err(format!("geometry_format must be 'wkt' or 'geojson'; received {other:?}").into())
+    })
+}
+
+/// A closed one-ring polygon as little-endian WKB (ISO, 2D).
+pub fn polygon_wkb(ring: &[(f64, f64)]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(13 + 16 * (ring.len() + 1));
+    b.push(1u8);
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    let closed = ring.first() != ring.last();
+    b.extend_from_slice(&((ring.len() + closed as usize) as u32).to_le_bytes());
+    for (x, y) in ring.iter().chain(ring.first().filter(|_| closed)) {
+        b.extend_from_slice(&x.to_le_bytes());
+        b.extend_from_slice(&y.to_le_bytes());
+    }
+    b
+}
+
+/// cell_to_wkb(packed_id [, output_crs]) / cell_to_wkb(domain_code, gid [, output_crs]) -> BLOB
+/// (lon/lat by default). DuckDB spatial: ST_GeomFromWKB(cell_to_wkb(...)).
+pub struct CellToWkb;
+impl VScalar for CellToWkb {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let ncols = input.num_columns();
+        let by_packed = col_type(input, 0) == LogicalTypeId::Bigint;
+        let crs_col = if by_packed { 1 } else { 2 };
+        let crs = if ncols > crs_col {
+            strings(input, crs_col, n)
+        } else {
+            vec![Some("EPSG:4326".into()); n]
+        };
+        let cells: Vec<Option<(&'static domain::Domain, Cell)>> = if by_packed {
+            prims::<i64>(input, 0, n)
+                .into_iter()
+                .map(|p| {
+                    p.map(|p| {
+                        let (id, c) = packing::unpack(p)?;
+                        Ok::<_, Box<dyn Error>>((crate::grid::domain_by_id(id as i32)?, c))
+                    })
+                    .transpose()
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            let (d, g) = (domains(input, 0, n)?, strings(input, 1, n));
+            d.into_iter()
+                .zip(g)
+                .map(|(d, g)| match (d, g) {
+                    (Some(d), Some(g)) => Ok(Some((d, codec::decode(&g)?))),
+                    _ => Ok::<_, Box<dyn Error>>(None),
+                })
+                .collect::<Result<_, _>>()?
+        };
+        let mut v = out.flat_vector();
+        for i in 0..n {
+            match (cells[i], &crs[i]) {
+                (Some((d, c)), Some(crs)) => {
+                    let wkb = polygon_wkb(&cell_ring(d, c, crs, false)?);
+                    v.insert(i, wkb.as_slice());
+                }
+                _ => v.set_null(i),
+            }
         }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Bigint], type_id(LogicalTypeId::Blob)),
+            sig(&[Bigint, Varchar], type_id(LogicalTypeId::Blob)),
+            sig(&[Varchar, Varchar], type_id(LogicalTypeId::Blob)),
+            sig(&[Varchar, Varchar, Varchar], type_id(LogicalTypeId::Blob)),
+        ]
     }
 }
 
@@ -953,6 +1041,138 @@ impl VScalar for EngineVersion {
     }
 }
 
+// ---------- GeoSquare v1 grid ----------
+
+/// v1_gid_to_cell(domain_code, gid_v1, level) -> the v2 cell holding the centre of a v1 cell
+pub struct V1GidToCell;
+impl VScalar for V1GidToCell {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (d, g, lvl) = (
+            domains(input, 0, n)?,
+            strings(input, 1, n),
+            prims::<i32>(input, 2, n),
+        );
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (d[i], &g[i], lvl[i]) {
+                (Some(d), Some(g), Some(l)) => {
+                    let (lon, lat) = crate::v1::center(g)?;
+                    Some((d, geo::point_to_cell(d, lon, lat, level_u8(l)?)?))
+                }
+                _ => None,
+            });
+        }
+        finish_cells(out, rows)
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar, Varchar, Integer], struct_type(CELL_FIELDS))]
+    }
+}
+
+/// v1_gid_center(gid_v1) -> STRUCT(lon DOUBLE, lat DOUBLE)
+pub struct V1GidCenter;
+impl VScalar for V1GidCenter {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let g = strings(input, 0, n);
+        let (mut valid, mut lon, mut lat) = (vec![false; n], vec![0.0; n], vec![0.0; n]);
+        for i in 0..n {
+            if let Some(g) = &g[i] {
+                let (x, y) = crate::v1::center(g)?;
+                (valid[i], lon[i], lat[i]) = (true, x, y);
+            }
+        }
+        finish_struct(out, &valid, vec![Field::F64(lon), Field::F64(lat)]);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(
+            &[Varchar],
+            struct_type(&[("lon", Double), ("lat", Double)]),
+        )]
+    }
+}
+
+/// v1_gid_to_geometry(gid_v1 [, format]) -> the v1 cell box in lon/lat, WKT (default) or GeoJSON
+pub struct V1GidToGeometry;
+impl VScalar for V1GidToGeometry {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let g = strings(input, 0, n);
+        let fmt = if input.num_columns() > 1 {
+            strings(input, 1, n)
+        } else {
+            vec![Some("wkt".into()); n]
+        };
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&g[i], &fmt[i]) {
+                (Some(g), Some(f)) => {
+                    let ring = crate::v1::ring(g)?;
+                    Some(match f.trim().to_ascii_lowercase().as_str() {
+                        "wkt" => geom::to_wkt(&[ring]),
+                        "geojson" => geom::to_geojson(&[ring]),
+                        other => {
+                            return Err(format!(
+                                "format must be 'wkt' or 'geojson'; received {other:?}"
+                            )
+                            .into())
+                        }
+                    })
+                }
+                _ => None,
+            });
+        }
+        let mut v = out.flat_vector();
+        for (i, r) in rows.iter().enumerate() {
+            match r {
+                Some(s) => v.insert(i, s.as_str()),
+                None => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Varchar], type_id(Varchar)),
+            sig(&[Varchar, Varchar], type_id(Varchar)),
+        ]
+    }
+}
+
+/// lonlat_to_v1_gid(longitude, latitude, level_v1) -> v1 gid (level 12 = 50 m, 9 = 1 km)
+pub struct LonLatToV1Gid;
+impl VScalar for LonLatToV1Gid {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (lon, lat, lvl) = (
+            prims::<f64>(input, 0, n),
+            prims::<f64>(input, 1, n),
+            prims::<i32>(input, 2, n),
+        );
+        let mut v = out.flat_vector();
+        for i in 0..n {
+            match (lon[i], lat[i], lvl[i]) {
+                (Some(x), Some(y), Some(l)) => {
+                    let level = usize::try_from(l)
+                        .map_err(|_| format!("v1 level must be positive; received {l}"))?;
+                    v.insert(i, crate::v1::from_lonlat(x, y, level)?.as_str());
+                }
+                _ => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Double, Double, Integer], type_id(Varchar))]
+    }
+}
+
 /// Register every scalar function.
 ///
 /// Engine names that clash with DuckDB are not registered, so results never depend
@@ -977,7 +1197,12 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<DescendantRange>("descendant_range")?;
     con.register_scalar_function::<ParseUri>("parse_uri")?;
     con.register_scalar_function::<CellToGeometry>("cell_to_geometry")?;
+    con.register_scalar_function::<CellToWkb>("cell_to_wkb")?;
     con.register_scalar_function::<VerifyRegistry>("verify_registry")?;
     con.register_scalar_function::<EngineVersion>("geosquare_engine_version")?;
+    con.register_scalar_function::<V1GidToCell>("v1_gid_to_cell")?;
+    con.register_scalar_function::<V1GidCenter>("v1_gid_center")?;
+    con.register_scalar_function::<V1GidToGeometry>("v1_gid_to_geometry")?;
+    con.register_scalar_function::<LonLatToV1Gid>("lonlat_to_v1_gid")?;
     Ok(())
 }

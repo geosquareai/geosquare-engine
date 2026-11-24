@@ -51,7 +51,7 @@ jobs:
         working-directory: bindings/duckdb
         env:
           DUCKDB_VERSIONS: ${{ matrix.duckdb }}
-          TESTS: tests/test_vectors.py tests/test_registry.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py tests/test_legacy_profile.py
+          TESTS: tests/test_vectors.py tests/test_registry.py tests/test_datasets.py tests/test_iceberg_planned.py tests/test_fill_nulls.py tests/test_docs_examples.py tests/test_multi_db.py tests/test_detect.py tests/test_legacy_profile.py tests/test_rate_rollup.py tests/test_content_hash.py
         run: tests/run_versions.sh
 
       - name: S3 writes against an emulator
@@ -80,6 +80,13 @@ jobs:
         with:
           targets: wasm32-unknown-emscripten
 
+      - name: Install Rust nightly with rust-src (Wasm builds rebuild std)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-11-18
+          targets: wasm32-unknown-emscripten
+          components: rust-src
+
       - name: Set up Emscripten 6.0.9
         uses: emscripten-core/setup-emsdk@v16
         with:
@@ -98,7 +105,7 @@ jobs:
         working-directory: bindings/duckdb
         run: |
           ./build.sh
-          ./build_wasm.sh
+          WASM_TOOLCHAIN=nightly-2026-11-18 PLATFORM=all ./build_wasm.sh
 
       - name: Browser test
         working-directory: bindings/duckdb

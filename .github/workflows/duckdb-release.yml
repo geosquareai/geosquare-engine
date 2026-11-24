@@ -86,27 +86,40 @@ jobs:
           path: bindings/duckdb/dist/${{ matrix.platform }}
 
   wasm:
-    name: Build wasm_eh
+    name: Build wasm_eh, wasm_mvp, wasm_threads
     runs-on: ubuntu-22.04
     defaults:
       run:
         working-directory: bindings/duckdb
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      # std is rebuilt (panic=abort, and atomics for wasm_threads): nightly with rust-src.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-11-18
           targets: wasm32-unknown-emscripten
+          components: rust-src
       - uses: emscripten-core/setup-emsdk@v16
         with:
           version: 6.0.9
       - name: Build
         run: |
-          ./build_wasm.sh
-          mkdir -p dist/wasm_eh && cp build/wasm_eh/geosquare_v2.duckdb_extension.wasm dist/wasm_eh/
+          WASM_TOOLCHAIN=nightly-2026-11-18 PLATFORM=all ./build_wasm.sh
+          for p in wasm_eh wasm_mvp wasm_threads; do
+            mkdir -p dist/$p && cp build/$p/geosquare_v2.duckdb_extension.wasm dist/$p/
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: ext-wasm_eh
           path: bindings/duckdb/dist/wasm_eh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-wasm_mvp
+          path: bindings/duckdb/dist/wasm_mvp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-wasm_threads
+          path: bindings/duckdb/dist/wasm_threads
 
   test:
     name: Test every DuckDB release and DuckDB-Wasm
@@ -129,9 +142,11 @@ jobs:
           path: bindings/duckdb/dist
       - name: Vectors and datasets on each DuckDB version
         run: |
-          mkdir -p build/linux_amd64 build/wasm_eh
+          mkdir -p build/linux_amd64
           cp dist/ext-linux_amd64/geosquare_v2.duckdb_extension build/linux_amd64/
-          cp dist/ext-wasm_eh/geosquare_v2.duckdb_extension.wasm build/wasm_eh/
+          for p in wasm_eh wasm_mvp wasm_threads; do
+            mkdir -p build/$p && cp dist/ext-$p/geosquare_v2.duckdb_extension.wasm build/$p/
+          done
           if [ "$DUCKDB_VERSIONS" = auto ]; then
             VERSIONS=$(python -c "import json,urllib.request;d=json.load(urllib.request.urlopen('https://pypi.org/pypi/duckdb/json'));k=lambda v:tuple(map(int,v.split('.')));print(' '.join(v for v in sorted((v for v,f in d['releases'].items() if f and all(p.isdigit() for p in v.split('.'))),key=k) if k(v)>=(1,4,0)))")
           else
@@ -182,5 +197,9 @@ jobs:
           PREFIX: ${{ vars.EXTENSION_REPO_PREFIX }}
         run: |
           if [ -z "$BUCKET" ]; then echo "EXTENSION_REPO_BUCKET is not set; skipping"; exit 0; fi
-          aws s3 sync repo "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/octet-stream --exclude index.json
+          aws s3 sync repo "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/octet-stream --exclude index.json --exclude "*.wasm"
+          # Wasm builds gzip-compressed with Content-Encoding: gzip (browsers decompress them)
+          mkdir repo_wasm_gz
+          (cd repo && find . -name '*.wasm' | while read -r f; do mkdir -p "../repo_wasm_gz/$(dirname "$f")"; gzip -9 -n -c "$f" > "../repo_wasm_gz/$f"; done)
+          aws s3 sync repo_wasm_gz "s3://$BUCKET/${PREFIX:+$PREFIX/}" --content-type application/wasm --content-encoding gzip
           aws s3 cp repo/index.json "s3://$BUCKET/${PREFIX:+$PREFIX/}index.json" --content-type application/json

@@ -72,8 +72,15 @@ pub fn par_map<T: Send, R: Send>(
     let pool = current_pool().ok_or("geosquare_v2: no internal connections for this database")?;
     let n = items.len();
     let threads = threads.clamp(1, n.max(1));
-    if threads == 1 || cfg!(target_family = "wasm") {
-        // No threads in DuckDB-Wasm: run in order on this thread.
+    // No threads in DuckDB-Wasm: run in order on this thread (and link no thread code).
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (pool, n, threads);
+        let l = lease()?;
+        return items.into_iter().map(|item| f(&l, item)).collect();
+    }
+    #[cfg(not(target_family = "wasm"))]
+    if threads == 1 {
         let l = lease()?;
         return items.into_iter().map(|item| f(&l, item)).collect();
     }
@@ -121,7 +128,7 @@ pub fn par_map<T: Send, R: Send>(
 }
 
 /// Run `f` with `pool` as this thread's current pool (restoring the previous one).
-fn with_pool<R>(pool: &Arc<Pool>, f: impl FnOnce() -> R) -> R {
+pub fn with_pool<R>(pool: &Arc<Pool>, f: impl FnOnce() -> R) -> R {
     let prev = CURRENT.with(|c| c.replace(Some(pool.clone())));
     let out = f();
     CURRENT.with(|c| *c.borrow_mut() = prev);
@@ -266,6 +273,9 @@ pub enum Kind {
     Bool,
     Float,
     FloatList,
+    TextList,
+    /// ANY: a VARCHAR or a list of VARCHAR (read as Param::Text or Param::List).
+    TextOrList,
 }
 
 impl Kind {
@@ -282,6 +292,13 @@ impl Kind {
                     duckdb_destroy_logical_type(&mut child);
                     l
                 }
+                Kind::TextList => {
+                    let mut child = duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+                    let l = duckdb_create_list_type(child);
+                    duckdb_destroy_logical_type(&mut child);
+                    l
+                }
+                Kind::TextOrList => duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_ANY),
             }
         }
     }
@@ -310,6 +327,34 @@ impl Kind {
                         for i in 0..n {
                             let c = duckdb_get_list_child(v, i);
                             items.push(Kind::Float.read(c));
+                        }
+                        Param::List(items)
+                    }
+                    Kind::TextOrList => {
+                        let mut t = duckdb_get_value_type(v);
+                        let id = duckdb_get_type_id(t);
+                        let _ = &mut t; // borrowed from the value: not destroyed here
+                        if id == DUCKDB_TYPE_DUCKDB_TYPE_LIST {
+                            let n = duckdb_get_list_size(v);
+                            let mut items = Vec::with_capacity(n as usize);
+                            for i in 0..n {
+                                let c = duckdb_get_list_child(v, i);
+                                items.push(Kind::Text.read(c));
+                            }
+                            Param::List(items)
+                        } else {
+                            let s = duckdb_get_varchar(v);
+                            let t = take_cstr(s);
+                            duckdb_free(s as *mut c_void);
+                            Param::Text(t)
+                        }
+                    }
+                    Kind::TextList => {
+                        let n = duckdb_get_list_size(v);
+                        let mut items = Vec::with_capacity(n as usize);
+                        for i in 0..n {
+                            let c = duckdb_get_list_child(v, i);
+                            items.push(Kind::Text.read(c));
                         }
                         Param::List(items)
                     }
@@ -594,6 +639,13 @@ impl Drop for Running {
 unsafe fn start(sql: &str) -> Result<Running, E> {
     unsafe {
         let lease = lease()?;
+        // A streamed result runs ahead of the consumer only by this much; the default (~1 MB)
+        // keeps remote scans almost sequential, which is slow on S3/HTTP latency.
+        let buffer = std::env::var("GEOSQUARE_V2_STREAM_BUFFER").unwrap_or_else(|_| "256MB".into());
+        let _ = exec_on(
+            &lease,
+            &format!("SET streaming_buffer_size = {}", lit(&buffer)),
+        );
         let c = CString::new(sql)?;
         let mut run = Running {
             _lease: None,
@@ -646,8 +698,10 @@ unsafe extern "C" fn proxy_init(info: duckdb_init_info) {
                         }
                     })
                     .collect();
+                // No column wanted (count(*)): one constant, so the inner scan reads nothing
+                // it does not need; only the output's columns are copied.
                 let sql = if cols.is_empty() {
-                    sql.clone()
+                    format!("SELECT 0::BIGINT AS gs_row FROM ({sql}) AS gs_proj")
                 } else {
                     format!("SELECT {} FROM ({sql}) AS gs_proj", cols.join(", "))
                 };
@@ -819,7 +873,8 @@ unsafe extern "C" fn proxy_function(info: duckdb_function_info, output: duckdb_d
                     return Ok(());
                 }
                 let n = duckdb_data_chunk_get_size(chunk) as usize;
-                let cols = duckdb_data_chunk_get_column_count(chunk);
+                let cols = duckdb_data_chunk_get_column_count(chunk)
+                    .min(duckdb_data_chunk_get_column_count(output));
                 for c in 0..cols {
                     let src = duckdb_data_chunk_get_vector(chunk, c);
                     let dst = duckdb_data_chunk_get_vector(output, c);

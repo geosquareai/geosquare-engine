@@ -2,8 +2,8 @@
 
 A loadable DuckDB extension for the GeoSquare V2 grid (spec 2.0). It wraps the Rust core in
 `core/` through the DuckDB C extension API, so **one binary loads in DuckDB 1.4 to 2.0**
-(tested on 1.4.0, 1.4.5, 1.5.0, 1.5.6 and 2.0.0). The same code builds for DuckDB-Wasm
-(`wasm_eh`) for use in the browser.
+(tested on 1.4.0, 1.4.5, 1.5.0, 1.5.6 and 2.0.0). The same code builds for the three
+DuckDB-Wasm bundles (`wasm_eh`, `wasm_mvp`, `wasm_threads`) for use in the browser.
 
 SQL names follow `geosquare-v2` and the engine bindings. It is not related to the V1
 extension `geosquare_grid_duckdb`.
@@ -11,7 +11,8 @@ extension `geosquare_grid_duckdb`.
 ## Install
 
 Published repository (public, CORS enabled) with builds for every DuckDB release from 1.4.0
-to 2.0.0: `linux_amd64` and `linux_arm64` (glibc 2.28+), `wasm_eh` (DuckDB-Wasm):
+to 2.0.0: `linux_amd64` and `linux_arm64` (glibc 2.28+), and for DuckDB-Wasm `wasm_eh`,
+`wasm_mvp` and `wasm_threads`:
 
 ```sql
 SET allow_unsigned_extensions = true;   -- the build is not signed by DuckDB
@@ -59,9 +60,25 @@ SELECT geosquare_engine_version();
 
 ```zsh
 source <emsdk>/emsdk_env.sh      # Emscripten 6.0.9, as in DuckDB's extension CI
-rustup target add wasm32-unknown-emscripten
-./build_wasm.sh                  # -> build/wasm_eh/geosquare_v2.duckdb_extension.wasm
+rustup toolchain install nightly --component rust-src --target wasm32-unknown-emscripten
+PLATFORM=all ./build_wasm.sh     # -> build/{wasm_eh,wasm_mvp,wasm_threads}/geosquare_v2.duckdb_extension.wasm
 ```
+
+One build per DuckDB-Wasm bundle; DuckDB picks the file of its bundle's platform
+(`PRAGMA platform`):
+
+| DuckDB-Wasm bundle | platform | notes |
+|---|---|---|
+| `eh` (1.4/1.5 packages), `base` (2.0) | `wasm_eh` | current browsers |
+| `mvp` (1.4/1.5 packages) | `wasm_mvp` | browsers without Wasm exception handling |
+| `coi` (1.4/1.5), `threads` (2.0) | `wasm_threads` | cross-origin isolated pages (COOP/COEP) |
+
+Rust std is rebuilt with `panic=abort` (no unwinding imports, so the module also links into
+the `mvp` bundle), and with atomics for `wasm_threads` (shared memory); local files and
+threads are left out of every Wasm build (the browser reads over HTTP). In the threads
+bundles DuckDB's own `parquet` extension currently fails to load from extensions.duckdb.org
+(it is not built with shared memory), so datasets cannot be read there yet; the grid
+functions work.
 
 ```js
 const db = new duckdb.AsyncDuckDB(logger, worker);   // @duckdb/duckdb-wasm, "base" bundle
@@ -72,9 +89,11 @@ await c.query("LOAD 'https://<host>/geosquare_v2.duckdb_extension.wasm'");
 await c.query("SELECT count(*) FROM query_cell_dataset('https://<host>/population', bbox := [106.8, -6.3, 106.9, -6.2])");
 ```
 
-Tested with DuckDB-Wasm `1.33.1-dev118.0` (DuckDB v2.0.0, platform `wasm_eh`) in Node and
-in headless Chromium 154: grid functions, polyfill, and reading flat, partitioned and
-Iceberg datasets over HTTP give the same results as native DuckDB (`tests/wasm/run.sh`).
+Tested in headless Chromium (`tests/wasm/run.sh`) with DuckDB-Wasm `1.33.1-dev118.0`
+(DuckDB v2.0.0: `base`, `threads`) and `1.32.0` (DuckDB v1.4.3: `mvp`, `eh`, `coi`): grid
+functions, polyfill, roll-ups, radius, several datasets, and flat, partitioned and Iceberg
+datasets over HTTP give the same results as native DuckDB (datasets: not in the threads
+bundles, see above).
 Over plain HTTP, folders cannot be listed, so the reader uses `manifest.json`,
 `data/part-00000.parquet`, the partition index `gid_prefixes.json` (written by
 `write_cell_dataset`) and `metadata/version-hint.text`. Iceberg tables are scanned with
@@ -104,6 +123,9 @@ Writing is meant for the backend.
 | `line_to_cells(domain_code, wkt, level, source_crs := ..., max_candidate_limit := ...)` | table: same cell columns + `length_ratio` (share of the whole line inside the cell, as in v2) |
 | `packed_to_gid(packed_id)` | `VARCHAR` gid of a packed id |
 | `detect_table(query, domain_code := ..., level := ..., max_rows := 100000)` | table: `column, kind, status, reason, valid_ratio, domain_codes, domain_ids, levels, invalid_examples` (spec 2.0 section 14; x_idx/y_idx as one pair; `max_rows` rows are read, 0 = all) |
+| `v1_gid_to_cell(domain_code, gid_v1, level)` | the v2 cell holding the centre of a GeoSquare v1 cell, same `STRUCT` as `point_to_cell` |
+| `v1_gid_center(gid_v1)` / `v1_gid_to_geometry(gid_v1 [, format])` | `STRUCT(lon, lat)` / the v1 cell box in lon/lat as WKT or GeoJSON |
+| `lonlat_to_v1_gid(longitude, latitude, level_v1)` | `VARCHAR` v1 gid (v1 level 12 = 50 m, 9 = 1 km), identical to `@geosquare/grid` `lonLatToGid` |
 
 The six released domains are `BN`, `ID`, `LA`, `MY`, `PH`, and `SG`. `point_to_cell` and WGS84 `cell_to_geometry` reject candidate domains by default. Pass `true` as the final `allow_candidate_crs` argument for technical candidate use. The candidate domains are `KH`, `MM`, `TH`, `TL`, and `VN`.
 
@@ -300,6 +322,39 @@ emulator (`tests/test_s3.py`); pyiceberg reads the result.
 Lines follow `geosquare_v2.line_to_cells` (identical on test lines); a segment lying exactly on
 an internal cell edge goes to the cell on its high side (spec 2.0 half-open rule), so the
 ratios of a line always sum to 1, whereas the Shapely oracle can count such a segment twice.
+
+`radius_m` with a `POINT` queries a circle (true distance); `with_geometry := 'wkb'` and
+`cell_to_wkb(...)` give WKB outlines for DuckDB spatial (vector tiles: see docs).
+
+`snapshot_id := <id>` / `as_of := <timestamp>` on `read_cell_dataset`, `query_cell_dataset` and
+`query_cell_datasets` read an older Iceberg snapshot.
+
+Remote reads stream through an internal connection with a 256 MB read-ahead buffer
+(`GEOSQUARE_V2_STREAM_BUFFER`, e.g. `1GB`); DuckDB's ~1 MB default made S3 scans nearly
+sequential.
+
+`alter_cell_dataset(path, rename_columns := ..., drop_columns := ..., add_columns := ...)` changes
+an Iceberg table's columns without rewriting data. `list_cell_datasets(prefix)`,
+`validate_cell_dataset(path)` and `cell_dataset_stats(path [, exact := true])` inspect datasets;
+`mode := 'upsert'` rewrites only the partitions an update touches.
+
+`read_raster(path, bbox := [...])` streams the pixels of a GeoTIFF/COG (local or S3, range reads)
+for raster-to-cell conversion in SQL.
+
+`compact_cell_dataset(path, partition_level := <current>)` rewrites a dataset with one file per
+partition and keeps its metadata.
+
+`expire_snapshots(path, retain_last := 1, older_than := NULL, orphan_age_hours := 24, dry_run := false)`
+drops old Iceberg snapshots and deletes the files only they used (see
+[docs/write-guide.md](docs/write-guide.md#clean-up-old-snapshots-iceberg)).
+
+`query_cell_datasets([path, ...], ...)` (or `query_cell_dataset([path, ...], ...)`) queries several
+datasets over one area and joins them per cell (same parameters as `query_cell_dataset`, plus `fill_nulls`).
+
+`read_cell_dataset` / `query_cell_dataset` take `rollup_level := L` for one row per level-L
+ancestor cell (1 km = 9, 10 km = 7), each value column aggregated by its manifest
+`aggregation_rule` and weighted by `coverage_ratio`; `rollup_rule` overrides the rule. See
+[docs/query-examples.md](docs/query-examples.md#aggregates-and-roll-ups).
 
 `read_cell_dataset` / `query_cell_dataset` take `with_geometry := 'wkt' | 'geojson'` (and
 `geometry_crs := 'EPSG:4326'` (default) `| 'grid'`) to add each cell's outline as a

@@ -157,10 +157,95 @@ ORDER BY gid;
 Self-intersecting polygons are repaired (even-odd, like `shapely.make_valid`) before the
 cells are computed.
 
+## Radius, WKB and vector tiles
+
+`radius_m` turns a `POINT` into a circle of that radius (true distance on the Earth, 64
+vertices), then behaves like a polygon: `coverage_ratio`, `rollup_level`, several datasets.
+
+```sql
+-- people within 1 km of an outlet, and per 1 km cell
+SELECT sum(population * coverage_ratio) AS population
+FROM query_cell_dataset('/data/pop_ice', geometry := 'POINT (106.8272 -6.1754)', radius_m := 1000);
+SELECT gid, population, coverage_ratio
+FROM query_cell_dataset('/data/pop_ice', geometry := 'POINT (106.8272 -6.1754)', radius_m := 1000, rollup_level := 9);
+```
+
+`with_geometry := 'wkb'` returns the cell outline as WKB (`BLOB`, lon/lat), and
+`cell_to_wkb(packed_id [, output_crs])` / `cell_to_wkb(domain_code, gid [, output_crs])` does
+the same per cell, for DuckDB spatial (`ST_GeomFromWKB`) or GeoParquet/GeoArrow consumers.
+
+```sql
+SELECT gid, population, octet_length(cell_geometry) AS wkb_bytes
+FROM query_cell_dataset('/data/pop_ice', bbox := [106.82, -6.18, 106.83, -6.17], with_geometry := 'wkb')
+LIMIT 3;
+SELECT octet_length(cell_to_wkb(packed_id)) FROM read_cell_dataset('/data/pop_ice') LIMIT 1;
+```
+
+Vector tiles (MVT) for a web map come from DuckDB spatial on top of the WKB output:
+
+```sql
+-- not run in tests: needs INSTALL spatial (network)
+INSTALL spatial; LOAD spatial;
+SET VARIABLE tile_wkt = (SELECT ST_AsText(ST_Transform(ST_TileEnvelope(14, 13053, 8473),
+                                          'EPSG:3857', 'EPSG:4326', always_xy := true)));
+SELECT ST_AsMVT({'geometry': ST_AsMVTGeom(ST_Transform(ST_GeomFromWKB(cell_geometry), 'EPSG:4326', 'EPSG:3857', always_xy := true),
+                                          ST_Extent(ST_TileEnvelope(14, 13053, 8473))),
+                 'gid': gid, 'population': population}, 'cells') AS tile
+FROM query_cell_dataset('/data/pop_ice', geometry := getvariable('tile_wkt'), with_geometry := 'wkb');
+```
+
 ## Aggregates and roll-ups
 
-A level-L ancestor's gid is the first L characters of the gid, so roll-ups are a
-`GROUP BY left(gid, L)`: level 9 = 1 km, 7 = 10 km, 6 = 50 km, 5 = 100 km.
+A level-L ancestor's gid is the first L characters of the gid: level 9 = 1 km, 7 = 10 km,
+6 = 50 km, 5 = 100 km. `rollup_level := L` returns one row per level-L cell directly. Each
+value column is aggregated by its parent rule, the spec 2.0 `space_aggregation` (dataset
+metadata, section 4). Its weight is `space_weight`. A manifest 1.1 dataset stores both. For
+other datasets, pass them as parameters. `rollup_rule` and `space_weight` override the
+manifest, one word for every column or `{"column": "..."}`. Allowed rules by semantics:
+
+- COUNT, TOTAL: `sum`
+- MEASUREMENT: `weighted_mean` (needs a weight), `median` (3 children or NULL), `max`, `min`
+- DENSITY: `weighted_mean` by `area`
+- RATE: `weighted_mean` (needs a weight, its denominator)
+- ORDINAL: `max`, `min`
+- `none`: the column is left out of the rollup
+
+A column with no rule and no default is an error, so a value is never averaged silently. A
+rollup value with no child data stays NULL. It is not filled with 0. `coverage_ratio` (an
+area query) multiplies every weight. `rollup_rule` and `space_weight` need `rollup_level`.
+
+A RATE is a weighted mean: `space_weight` names its denominator, for example
+`space_weight := '{"rate": "people"}'`. The parent rate is the sum of rate x people over the
+sum of people.
+
+```sql
+-- 1 km overview of an area, with the 1 km outlines
+SELECT gid, population, workers, cell_count, coverage_ratio, cell_geometry
+FROM query_cell_dataset('/data/pop_ice',
+  geometry := 'POLYGON ((106.80 -6.20, 106.84 -6.20, 106.84 -6.16, 106.80 -6.16, 106.80 -6.20))',
+  rollup_level := 9, with_geometry := 'geojson');
+
+-- 10 km overview of the whole dataset: population is a COUNT, so it sums
+SELECT gid, population, cell_count
+FROM read_cell_dataset('/data/pop_part', rollup_level := 7);
+```
+
+Several datasets over one area in one call: `query_cell_datasets([path, ...], ...)` (or
+`query_cell_dataset` with a list of paths) takes
+the parameters of `query_cell_dataset` and returns one row per cell (or per `rollup_level`
+cell) with the value columns of every dataset. A column name that two datasets share is
+prefixed with the dataset folder (`pop_flat__population`); a cell missing from a dataset has
+0 in its columns (`fill_nulls := false` keeps NULL). Datasets at different levels need
+`rollup_level`.
+
+```sql
+SELECT gid, pop_ice__population, pop_part__population, coverage_ratio
+FROM query_cell_datasets(['/data/pop_ice', '/data/pop_part'],
+  geometry := 'POLYGON ((106.80 -6.20, 106.84 -6.20, 106.84 -6.16, 106.80 -6.16, 106.80 -6.20))',
+  rollup_level := 9);
+```
+
+The same by hand is a `GROUP BY left(gid, L)` (pick the aggregate per column yourself):
 
 ```sql
 -- 1 km totals inside an area, with the 1 km cell outline as GeoJSON (lon/lat)
@@ -265,6 +350,33 @@ FROM read_cell_dataset('/data/pop_flat') AS a
 JOIN read_cell_dataset('/data/pop_ice') AS b USING (packed_id);
 ```
 
+## GeoSquare v1 gids
+
+Data keyed by v1 gids (the degree grid of GeoSquare Horizon v1, `@geosquare/grid`) moves to
+the v2 grid through the centre of each v1 cell. `v1_gid_to_cell` gives the v2 cell holding
+it; several v1 50 m cells can fall into one v2 50 m cell, so aggregate per v2 cell. A v1
+cell larger than the target level covers many v2 cells: use its outline with
+`polygon_to_cells`.
+
+```sql
+-- v1 gid of a point, its centre and box
+SELECT lonlat_to_v1_gid(106.8272, -6.1754, 12) AS gid_v1,
+       v1_gid_center(lonlat_to_v1_gid(106.8272, -6.1754, 12)) AS centre,
+       v1_gid_to_geometry(lonlat_to_v1_gid(106.8272, -6.1754, 12)) AS box;
+
+-- rows keyed by v1 50 m gids onto v2 50 m cells (summed per v2 cell)
+CREATE TABLE outlets_v1 AS
+SELECT lonlat_to_v1_gid(106.80 + i * 0.0007, -6.20 + i * 0.0005, 12) AS gid_v1, 10.0 * i AS sales
+FROM range(1, 30) t(i);
+SELECT v1_gid_to_cell('ID', gid_v1, 12).packed_id AS packed_id, sum(sales) AS sales
+FROM outlets_v1 GROUP BY 1 ORDER BY 1;
+
+-- the v2 50 m cells under one v1 1 km cell, with their share of it
+SELECT gid, coverage_ratio
+FROM polygon_to_cells('ID', v1_gid_to_geometry(lonlat_to_v1_gid(106.8272, -6.1754, 9)), 12)
+LIMIT 5;
+```
+
 ## Writing
 
 The full guide (insert, update/upsert, delete, schema and partition changes) is
@@ -315,9 +427,17 @@ options below.
 ## Iceberg snapshots and time travel
 
 Each write is a snapshot; the newest one is found through `metadata/version-hint.text`.
+`snapshot_id := <id>` or `as_of := <timestamp>` (the newest snapshot at or before it) reads
+an older snapshot in `read_cell_dataset`, `query_cell_dataset` and `query_cell_datasets`.
+Snapshots removed by `expire_snapshots` cannot be read any more.
 
 ```sql
 LOAD iceberg;
+SET VARIABLE first_id = (SELECT min_by(snapshot_id, sequence_number) FROM iceberg_snapshots('/data/pop_ice'));
+SELECT count(*), sum(population) FROM read_cell_dataset('/data/pop_ice', snapshot_id := getvariable('first_id'));
+SELECT count(*) FROM query_cell_dataset('/data/pop_ice', bbox := [106.82, -6.18, 106.83, -6.17],
+  as_of := now()::VARCHAR);
+
 SELECT sequence_number, snapshot_id, manifest_list FROM iceberg_snapshots('/data/pop_ice') ORDER BY sequence_number;
 
 -- read an older snapshot by its metadata file (table functions take constants, so pass
@@ -338,7 +458,7 @@ CREATE SECRET (TYPE s3, PROVIDER credential_chain, REGION 'ap-southeast-3');
 SELECT count(*) AS cells,
        sum(people_counts * coverage_ratio) AS people,
        sum(people_millenials_female_night * coverage_ratio) AS millenial_women_at_night
-FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=50m_people_v2023',
+FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=people_v2023',
   geometry := 'POLYGON ((106.8227 -6.1799, 106.8317 -6.1799, 106.8317 -6.1709, 106.8227 -6.1709, 106.8227 -6.1799))');
 
 -- not run in tests: 1 km roll-up of a few columns of the people table
@@ -346,7 +466,7 @@ SELECT left(gid, 9) AS gid_1km,
        sum(people_counts * coverage_ratio) AS people,
        sum(people_gen_z * coverage_ratio) AS gen_z,
        sum(people_gen_z_night * coverage_ratio) AS gen_z_night
-FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=50m_people_v2023',
+FROM query_cell_dataset('s3://geosquare-data/apps-data/data_v2/data_name=people_v2023',
   bbox := [106.80, -6.20, 106.84, -6.16])
 GROUP BY 1 ORDER BY 1;
 

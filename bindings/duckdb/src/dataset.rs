@@ -36,6 +36,8 @@ pub struct Source {
     pub root: String,
     pub layout: Layout,
     pub manifest: Option<Json>,
+    /// Iceberg snapshot to read instead of the current one (snapshot_id / as_of).
+    pub snapshot: Option<i64>,
 }
 
 pub fn join(root: &str, rest: &str) -> String {
@@ -202,6 +204,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root,
             layout: Layout::Iceberg { metadata: path },
             manifest,
+            snapshot: None,
         });
     }
     // An Iceberg table with a version hint: two small reads, no listing.
@@ -211,6 +214,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root: path,
             layout: Layout::Iceberg { metadata },
             manifest,
+            snapshot: None,
         });
     }
     // Read the manifest directly: globbing an exact S3 key returns it even when it is absent.
@@ -229,6 +233,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root: path,
             layout,
             manifest: Some(manifest),
+            snapshot: None,
         });
     }
     if is_http(&path) || !glob(lease, &join(&path, "metadata/*.metadata.json"))?.is_empty() {
@@ -238,6 +243,7 @@ pub fn open(lease: &Lease, path: &str) -> Result<Source, E> {
             root: path,
             layout: Layout::Iceberg { metadata },
             manifest,
+            snapshot: None,
         });
     }
     Err(format!("{path}: no {MANIFEST_FILE} and no Iceberg metadata found").into())
@@ -301,10 +307,13 @@ fn from_clause(lease: &Lease, src: &Source, files: Option<&[String]>) -> Result<
     }
     Ok(match &src.layout {
         Layout::Flat if is_http(&src.root) => format!(
-            "read_parquet({})",
+            "read_parquet({}, hive_partitioning = false)",
             lit(&join(&src.root, "data/part-00000.parquet"))
         ),
-        Layout::Flat => format!("read_parquet({})", lit(&join(&src.root, "data/*.parquet"))),
+        Layout::Flat => format!(
+            "read_parquet({}, hive_partitioning = false)",
+            lit(&join(&src.root, "data/*.parquet"))
+        ),
         Layout::Partitioned(_) => match files {
             Some(list) => format!(
                 "read_parquet([{}], hive_partitioning = false)",
@@ -322,11 +331,18 @@ fn from_clause(lease: &Lease, src: &Source, files: Option<&[String]>) -> Result<
             // resolves its manifests and data files under the new folder.
             match metadata.rsplit_once("/metadata/") {
                 Some((dir, file)) => format!(
-                    "iceberg_scan({}, version = {}, allow_moved_paths = true)",
+                    "iceberg_scan({}, version = {}, allow_moved_paths = true{})",
                     lit(dir),
-                    lit(file.strip_suffix(".metadata.json").unwrap_or(file))
+                    lit(file.strip_suffix(".metadata.json").unwrap_or(file)),
+                    src.snapshot
+                        .map_or(String::new(), |id| format!(", snapshot_from_id = {id}"))
                 ),
-                None => format!("iceberg_scan({})", lit(metadata)),
+                None => format!(
+                    "iceberg_scan({}{})",
+                    lit(metadata),
+                    src.snapshot
+                        .map_or(String::new(), |id| format!(", snapshot_from_id = {id}"))
+                ),
             }
         }
     })
@@ -395,14 +411,21 @@ fn add_geometry(plan: Plan, p: &Params, domain_code: Option<&str>) -> Result<Pla
         return Ok(plan);
     };
     let format = format.to_ascii_lowercase();
-    if !matches!(format.as_str(), "wkt" | "geojson") {
-        return Err(
-            format!("with_geometry must be 'wkt' or 'geojson'; received {format:?}").into(),
-        );
+    if !matches!(format.as_str(), "wkt" | "geojson" | "wkb") {
+        return Err(format!(
+            "with_geometry must be 'wkt', 'geojson' or 'wkb'; received {format:?}"
+        )
+        .into());
     }
     let crs = p.text("geometry_crs").unwrap_or_else(|| "EPSG:4326".into());
     let code = domain_code.ok_or("with_geometry needs the domain: pass domain_code := '<code>' (the dataset has no cell manifest)")?;
-    let expr = if p.int("allow_candidate_crs").unwrap_or(0) != 0 {
+    let allow_candidate = p.int("allow_candidate_crs").unwrap_or(0) != 0;
+    let expr = if format == "wkb" {
+        if allow_candidate {
+            return Err("allow_candidate_crs is not supported with with_geometry := 'wkb'; use 'wkt' or 'geojson'".into());
+        }
+        format!("cell_to_wkb({}, gid, {})", lit(code), lit(&crs))
+    } else if allow_candidate {
         format!(
             "cell_to_geometry({}, gid, {}, {}, true)",
             lit(code),
@@ -417,37 +440,603 @@ fn add_geometry(plan: Plan, p: &Params, domain_code: Option<&str>) -> Result<Pla
             lit(&format)
         )
     };
+    let null_type = if format == "wkb" { "BLOB" } else { "VARCHAR" };
     Ok(match plan {
         Plan::Query(sql) => Plan::Query(format!(
             "SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g"
         )),
         Plan::Typed(sql, probe) => Plan::Typed(
             format!("SELECT *, {expr} AS cell_geometry FROM ({sql}) AS gs_g"),
-            format!("SELECT *, NULL::VARCHAR AS cell_geometry FROM ({probe}) AS gs_p"),
+            format!("SELECT *, NULL::{null_type} AS cell_geometry FROM ({probe}) AS gs_p"),
         ),
         other => other,
     })
 }
 
+/// Metadata as if snapshot `id` were the current one (its schema too).
+fn meta_at_snapshot(meta: &Json, id: i64) -> Json {
+    let mut m = meta.clone();
+    let schema = m
+        .get("snapshots")
+        .and_then(Json::as_array)
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("snapshot-id").and_then(Json::as_i64) == Some(id))
+        })
+        .and_then(|s| s.get("schema-id").cloned());
+    m["current-snapshot-id"] = Json::from(id);
+    if let Some(sid) = schema {
+        m["current-schema-id"] = sid;
+    }
+    m
+}
+
+/// `snapshot_id := id` or `as_of := timestamp | epoch ms`: read an older Iceberg snapshot
+/// (the newest one at or before `as_of`). Expired snapshots cannot be read.
+pub fn select_snapshot(lease: &Lease, src: &mut Source, p: &Params) -> Result<(), E> {
+    let id = p.int("snapshot_id");
+    let as_of = p.text("as_of");
+    if id.is_none() && as_of.is_none() {
+        return Ok(());
+    }
+    let Layout::Iceberg { metadata } = &src.layout else {
+        return Err("snapshot_id / as_of read older versions of Iceberg tables only".into());
+    };
+    let meta = metadata_json(lease, metadata)?;
+    let snaps: Vec<(i64, i64)> = meta
+        .get("snapshots")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            Some((
+                s.get("snapshot-id")?.as_i64()?,
+                s.get("timestamp-ms").and_then(Json::as_i64).unwrap_or(0),
+            ))
+        })
+        .collect();
+    let chosen = match (id, as_of) {
+        (Some(id), _) => snaps
+            .iter()
+            .find(|(s, _)| *s == id)
+            .map(|(s, _)| *s)
+            .ok_or_else(|| format!("snapshot {id} is not in the table (expired or wrong id)"))?,
+        (None, Some(text)) => {
+            let ts = match text.trim().parse::<i64>() {
+                Ok(ms) => ms,
+                Err(_) => sql::query_text_on(
+                    lease,
+                    &format!("SELECT epoch_ms(CAST({} AS TIMESTAMPTZ))", lit(&text)),
+                )?
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next().flatten())
+                .and_then(|v| v.parse().ok())
+                .ok_or("as_of must be a timestamp or epoch milliseconds")?,
+            };
+            snaps
+                .iter()
+                .filter(|(_, t)| *t <= ts)
+                .max_by_key(|(_, t)| *t)
+                .map(|(s, _)| *s)
+                .ok_or_else(|| format!("the table has no snapshot at or before {text}"))?
+        }
+        _ => unreachable!(),
+    };
+    src.snapshot = Some(chosen);
+    Ok(())
+}
+
+/// A whole Iceberg table read with read_parquet over its live files (from the cached
+/// manifests) instead of iceberg_scan, which is very slow on S3. None when the table needs
+/// iceberg_scan (delete files, nothing to prune on, not Iceberg).
+fn iceberg_read_plan(lease: &Lease, src: &Source) -> Result<Option<(Plan, Vec<String>)>, E> {
+    let Layout::Iceberg { metadata } = &src.layout else {
+        return Ok(None);
+    };
+    let (key, meta) = match src.snapshot {
+        Some(id) => (
+            format!("{metadata}#{id}"),
+            meta_at_snapshot(&metadata_json(lease, metadata)?, id),
+        ),
+        None => (metadata.clone(), metadata_json(lease, metadata)?),
+    };
+    let Some(t) = crate::icefast::load(lease, &src.root, &key, &meta)? else {
+        return Ok(None);
+    };
+    let Some(files) = t.all_files(lease)? else {
+        return Ok(None);
+    };
+    let names: Vec<String> = t.columns.iter().map(|(n, _)| n.clone()).collect();
+    let probe = format!("SELECT {}", t.empty_select());
+    if files.is_empty() {
+        return Ok(Some((Plan::Query(format!("{probe} LIMIT 0")), names)));
+    }
+    let cols: Vec<String> = t
+        .columns
+        .iter()
+        .map(|(n, ty)| format!("CAST({0} AS {ty}) AS {0}", sql::ident(n)))
+        .collect();
+    Ok(Some((
+        Plan::Typed(
+            format!("SELECT {} FROM {}", cols.join(", "), t.scan(&files)),
+            probe,
+        ),
+        names,
+    )))
+}
+
 pub fn plan_read(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
     let lease = sql::lease()?;
-    let src = open(&lease, &path)?;
-    let code = if src.manifest.is_some() || p.text("domain_code").is_some() {
-        Some(identity(&src, p)?.0.code) // also validates the manifest against the engine
+    let mut src = open(&lease, &path)?;
+    select_snapshot(&lease, &mut src, p)?;
+    let id = if src.manifest.is_some() || p.text("domain_code").is_some() {
+        Some(identity(&src, p)?) // also validates the manifest against the engine
     } else {
         None
     };
-    let plan = Plan::Query(format!(
-        "SELECT * FROM {}",
-        from_clause(&lease, &src, None)?
-    ));
-    add_geometry(plan, p, code)
+    let mut present = None;
+    let plan = match iceberg_read_plan(&lease, &src)? {
+        Some((plan, cols)) => {
+            present = Some(cols);
+            plan
+        }
+        None => Plan::Query(format!(
+            "SELECT * FROM {}",
+            from_clause(&lease, &src, None)?
+        )),
+    };
+    let plan = match id {
+        Some((d, level)) => add_rollup(
+            plan,
+            p,
+            &QueryCtx {
+                code: d.code,
+                level,
+                manifest: src.manifest.clone(),
+                weight: None,
+                extra: None,
+                present,
+            },
+        )?,
+        None if p.int("rollup_level").is_some() => {
+            return Err(
+                "rollup_level needs the domain and level: the dataset has no cell manifest".into(),
+            )
+        }
+        None => plan,
+    };
+    add_geometry(plan, p, id.map(|(d, _)| d.code))
+}
+
+/// What a query plan knows about its dataset, for the roll-up and the geometry.
+pub struct QueryCtx {
+    pub code: &'static str,
+    pub level: u8,
+    pub manifest: Option<Json>,
+    /// Column with the share of each cell inside the query area (`coverage_ratio` or
+    /// `length_ratio`); None when every cell counts fully (read_cell_dataset) or for points.
+    pub weight: Option<&'static str>,
+    /// The column the query adds per cell (`coverage_ratio`, `length_ratio`, `point_count`).
+    pub extra: Option<&'static str>,
+    /// Columns the plan returns, when known (an older snapshot may lack newer columns).
+    pub present: Option<Vec<String>>,
+}
+
+/// SQL aggregate of value column `c` by rule, each cell weighted by `w`.
+pub fn rollup_expr(name: &str, rule: &str, w: &str) -> Result<String, E> {
+    let c = format!("r.{}", sql::ident(name));
+    Ok(match rule.to_ascii_lowercase().as_str() {
+        "sum" | "count" => format!("CAST(sum({c} * {w}) AS DOUBLE)"),
+        "mean" | "avg" | "average" | "weighted_mean" => format!(
+            "CAST(sum({c} * {w}) / nullif(sum(CASE WHEN {c} IS NOT NULL THEN {w} END), 0) AS DOUBLE)"
+        ),
+        "min" => format!("min({c})"),
+        "max" => format!("max({c})"),
+        // The plain median of the child values, with no weight. It needs at least 3 child
+        // values with data; with fewer the parent value is NULL.
+        "median" => format!("CASE WHEN count({c}) >= 3 THEN median({c}) END"),
+        other => {
+            return Err(format!(
+                "column {name} has aggregation_rule {other:?}, which rollup_level cannot apply; \
+                 pass rollup_rule := '{{\"{name}\": \"sum\" | \"mean\" | \"min\" | \"max\" | \"median\"}}'"
+            )
+            .into())
+        }
+    })
+}
+
+/// The parent rules spec 2.0 (dataset metadata, section 4) allows for each semantics.
+fn allowed_space_rules(semantics: &str) -> Option<&'static [&'static str]> {
+    Some(match semantics.to_ascii_uppercase().as_str() {
+        "COUNT" | "TOTAL" => &["sum", "none"],
+        "DENSITY" => &["weighted_mean", "none"],
+        "MEASUREMENT" => &["weighted_mean", "median", "max", "min", "none"],
+        "RATE" => &["weighted_mean", "none"],
+        "CATEGORICAL" => &["majority_weighted", "none"],
+        "ORDINAL" => &["max", "min", "none"],
+        "RANGE" => &["none"],
+        _ => return None,
+    })
+}
+
+/// The parent rule and weight of one value column. `rule` and `weight` are the explicit
+/// parameter if given, else the manifest value (spec 1.1 `space_aggregation`, `space_weight`).
+///
+/// With neither, COUNT and TOTAL sum, and DENSITY is a mean weighted by `area`. Other
+/// semantics have no default and must name a rule. `none` returns `None`: the column is not
+/// rolled up. Every other rule must be allowed for the semantics, and must have a weight
+/// exactly when the table says so.
+pub fn space_rule(
+    column: &str,
+    semantics: &str,
+    rule: Option<String>,
+    weight: Option<String>,
+) -> Result<Option<(String, Option<String>)>, E> {
+    let sem = semantics.to_ascii_uppercase();
+    let Some(allowed) = allowed_space_rules(&sem) else {
+        return Err(format!("column {column}: unknown semantics {semantics:?}").into());
+    };
+    let rule = match (rule, sem.as_str()) {
+        (Some(r), _) => r,
+        (None, "COUNT" | "TOTAL") => "sum".into(),
+        (None, "DENSITY") => "weighted_mean".into(),
+        (None, _) => {
+            return Err(format!(
+                "column {column} ({sem}) has no space_aggregation: name one of {}",
+                allowed.join(", ")
+            )
+            .into())
+        }
+    };
+    if rule == "none" {
+        return Ok(None);
+    }
+    if !allowed.contains(&rule.as_str()) {
+        return Err(format!(
+            "column {column}: {rule:?} is not allowed for {sem} (allowed: {})",
+            allowed.join(", ")
+        )
+        .into());
+    }
+    let weight = match (weight, sem.as_str(), rule.as_str()) {
+        (None, "DENSITY", "weighted_mean") => Some("area".to_string()),
+        (w, _, _) => w,
+    };
+    match rule.as_str() {
+        "weighted_mean" if weight.is_none() => Err(format!(
+            "column {column}: weighted_mean needs a space_weight: a COUNT or TOTAL column, or area"
+        )
+        .into()),
+        "sum" | "min" | "max" | "median" if weight.is_some() => {
+            Err(format!("column {column}: {rule} takes no space_weight").into())
+        }
+        "majority_weighted" => Err(format!(
+            "column {column}: majority_weighted is not implemented in the engine yet"
+        )
+        .into()),
+        _ => Ok(Some((rule, weight))),
+    }
+}
+
+/// The rollup expression of one column for a resolved parent rule and weight. `area_weight` is
+/// the cell's share inside the query area (`1.0` when there is none). A weight that names a
+/// field multiplies it in. `area` needs no field: cells at one level have the same area.
+pub fn space_expr(
+    column: &str,
+    rule: &str,
+    weight: Option<&str>,
+    area_weight: &str,
+) -> Result<String, E> {
+    let w = match weight {
+        None | Some("area") => area_weight.to_string(),
+        Some(field) => format!("(r.{} * {area_weight})", sql::ident(field)),
+    };
+    let engine_rule = if rule == "weighted_mean" {
+        "mean"
+    } else {
+        rule
+    };
+    rollup_expr(column, engine_rule, &w).map_err(|e| format!("column {column}: {e}").into())
+}
+
+/// `rollup_level := R`: one row per level-R ancestor cell instead of one per dataset cell.
+/// Each value column is aggregated by its `aggregation_rule` from the cell manifest (sum:
+/// weighted sum, mean: weighted mean, min, max, median; without a rule COUNT columns are summed and
+/// the others averaged), weighted by the share of each cell inside the query area.
+/// `rollup_rule` overrides the rule: one word for every column or `{column or pattern: rule}`.
+/// Adds `cell_count` (dataset cells in the group) and, for areas, the ancestor's
+/// `coverage_ratio` (its share inside the area).
+fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
+    let Some(r) = p.int("rollup_level") else {
+        if p.text("rollup_rule").is_some() {
+            return Err("rollup_rule needs rollup_level".into());
+        }
+        if p.text("space_weight").is_some() {
+            return Err("space_weight needs rollup_level".into());
+        }
+        return Ok(plan);
+    };
+    if r < 0 || r > ctx.level as i64 {
+        return Err(format!(
+            "rollup_level must be between 0 and the dataset level {}; received {r}",
+            ctx.level
+        )
+        .into());
+    }
+    if ctx.weight.is_none() && p.text("geometry").is_some() && p.get("bbox").is_none() {
+        if let Some(g) = p.text("geometry") {
+            if matches!(geom::parse_geometry(&g)?, geom::Geometry::Points(_)) {
+                return Err(
+                    "rollup_level works with a polygon, a line or bbox, not with points".into(),
+                );
+            }
+        }
+    }
+    let fields = ctx
+        .manifest
+        .as_ref()
+        .and_then(|m| m.get("value_fields"))
+        .and_then(Json::as_array)
+        .filter(|f| !f.is_empty())
+        .ok_or("rollup_level needs the value columns of the cell manifest (value_fields)")?;
+    let over_rule = crate::metadata::PerColumn::parse(p.text("rollup_rule"), "rollup_rule")?;
+    let over_weight = crate::metadata::PerColumn::parse(p.text("space_weight"), "space_weight")?;
+    let w = ctx
+        .weight
+        .map(|w| format!("r.{w}"))
+        .unwrap_or_else(|| "1.0".into());
+    let mut aggs = Vec::new();
+    for f in fields {
+        let name = f.get("name").and_then(Json::as_str).unwrap_or("");
+        if name.is_empty()
+            || ctx
+                .present
+                .as_ref()
+                .is_some_and(|p| !p.iter().any(|c| c == name))
+        {
+            continue;
+        }
+        // Parameters win over the manifest (spec 1.1 space_aggregation / space_weight).
+        let semantics = f.get("semantics").and_then(Json::as_str).unwrap_or("");
+        let rule = over_rule.get(name).map(str::to_string).or_else(|| {
+            f.get("space_aggregation")
+                .and_then(Json::as_str)
+                .map(str::to_string)
+        });
+        let weight = over_weight.get(name).map(str::to_string).or_else(|| {
+            f.get("space_weight")
+                .and_then(Json::as_str)
+                .map(str::to_string)
+        });
+        let Some((rule, weight)) = space_rule(name, semantics, rule, weight)? else {
+            continue; // `none`: the column is not rolled up
+        };
+        aggs.push(format!(
+            "{} AS {}",
+            space_expr(name, &rule, weight.as_deref(), &w)?,
+            sql::ident(name)
+        ));
+    }
+    let r = r as u8;
+    let side = |l: u8| codec::side_cell_count(l).map(|n| n as f64);
+    let children = (side(ctx.level)? / side(r)?).powi(2);
+    let coverage = match ctx.weight {
+        Some(w) => format!(", CAST(sum(r.{w}) / {children:?} AS DOUBLE) AS {w}"),
+        None => String::new(),
+    };
+    let wrap = |inner: &str| {
+        format!(
+            "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {}, \
+             count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY 1 ORDER BY 2",
+            lit(ctx.code),
+            aggs.join(", ")
+        )
+    };
+    Ok(match plan {
+        Plan::Query(q) => Plan::Query(wrap(&q)),
+        Plan::Typed(q, probe) => Plan::Typed(wrap(&q), wrap(&probe)),
+        other => other,
+    })
+}
+
+/// Value columns of a dataset (from its cell manifest).
+fn value_columns(ctx: &QueryCtx) -> Vec<String> {
+    ctx.manifest
+        .as_ref()
+        .and_then(|m| m.get("value_fields"))
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("name").and_then(Json::as_str).map(str::to_string))
+        .filter(|n| ctx.present.as_ref().is_none_or(|p| p.contains(n)))
+        .collect()
+}
+
+/// Short name of a dataset path for prefixing clashing columns: the last folder, without
+/// `data_name=`.
+fn dataset_alias(path: &str) -> String {
+    let last = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path);
+    last.strip_prefix("data_name=").unwrap_or(last).to_string()
+}
+
+/// query_cell_datasets([path, ...], <the parameters of query_cell_dataset>, fill_nulls := true)
+///
+/// Several datasets over one area in one call: one row per cell (or per `rollup_level` cell)
+/// with the value columns of every dataset. A column name used by more than one dataset is
+/// prefixed with the dataset's folder name (`demographyhires_v2023__population`). Cells that a
+/// dataset lacks get 0 in its columns (`fill_nulls := false` keeps NULL). Without
+/// `rollup_level` the datasets must share domain and level.
+pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
+    let paths: Vec<String> = match p.positional.first() {
+        Some(Param::List(items)) => items
+            .iter()
+            .filter_map(|i| i.text().map(str::to_string))
+            .collect(),
+        Some(Param::Text(t)) => vec![t.clone()],
+        _ => Vec::new(),
+    };
+    if paths.is_empty() {
+        return Err("query_cell_datasets needs a list of dataset paths".into());
+    }
+    let rollup = p.int("rollup_level").is_some();
+    let mut parts = Vec::new();
+    for path in &paths {
+        let (plan, ctx) = plan_query_cells(p, path)?;
+        let plan = add_rollup(plan, p, &ctx)?;
+        parts.push((path.clone(), plan, ctx));
+    }
+    let (code, level) = (parts[0].2.code, parts[0].2.level);
+    for (path, _, ctx) in &parts {
+        if ctx.code != code {
+            return Err(format!(
+                "{path} is in domain {}, the first dataset in {code}",
+                ctx.code
+            )
+            .into());
+        }
+        if !rollup && ctx.level != level {
+            return Err(format!(
+                "{path} is at level {}, the first dataset at level {level}: pass rollup_level := <level> to join them",
+                ctx.level
+            )
+            .into());
+        }
+    }
+    // Columns per dataset; clashing names are prefixed.
+    let cols: Vec<Vec<String>> = parts.iter().map(|(_, _, c)| value_columns(c)).collect();
+    let mut count = std::collections::HashMap::<&str, usize>::new();
+    for c in cols.iter().flatten() {
+        *count.entry(c.as_str()).or_default() += 1;
+    }
+    let fill = p.get("fill_nulls").and_then(Param::int).unwrap_or(1) != 0;
+    let key = if rollup { "gid" } else { "packed_id" };
+    let n = parts.len();
+    let coalesce = |c: &str| {
+        let items: Vec<String> = (0..n).map(|i| format!("t{i}.{c}")).collect();
+        if n == 1 {
+            items[0].clone()
+        } else {
+            format!("coalesce({})", items.join(", "))
+        }
+    };
+    let mut select = vec![
+        format!("{} AS packed_id", coalesce("packed_id")),
+        format!("{} AS gid", coalesce("gid")),
+    ];
+    let names: Vec<String> = parts.iter().map(|(p, _, _)| dataset_alias(p)).collect();
+    let aliases: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if names.iter().filter(|b| *b == a).count() > 1 {
+                format!("{a}_{}", i + 1)
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    for (i, _) in parts.iter().enumerate() {
+        let alias = &aliases[i];
+        for c in &cols[i] {
+            let out = if count[c.as_str()] > 1 {
+                format!("{alias}__{c}")
+            } else {
+                c.clone()
+            };
+            let v = format!("t{i}.{}", sql::ident(c));
+            let v = if fill { format!("coalesce({v}, 0)") } else { v };
+            select.push(format!("{v} AS {}", sql::ident(&out)));
+        }
+    }
+    if rollup {
+        let items: Vec<String> = (0..n).map(|i| format!("t{i}.cell_count")).collect();
+        select.push(format!("list_max([{}]) AS cell_count", items.join(", ")));
+    }
+    if let Some(extra) = parts[0].2.extra {
+        select.push(format!("{} AS {extra}", coalesce(extra)));
+    }
+    let join = |sqls: &[String]| {
+        let mut from = format!("({}) AS t0", sqls[0]);
+        for (i, s) in sqls.iter().enumerate().skip(1) {
+            let prev: Vec<String> = (0..i).map(|k| format!("t{k}.{key}")).collect();
+            let on = if i == 1 {
+                prev[0].clone()
+            } else {
+                format!("coalesce({})", prev.join(", "))
+            };
+            from.push_str(&format!(" FULL JOIN ({s}) AS t{i} ON t{i}.{key} = {on}"));
+        }
+        format!("SELECT {} FROM {from} ORDER BY 1", select.join(", "))
+    };
+    let typed = parts.iter().all(|(_, pl, _)| matches!(pl, Plan::Typed(..)));
+    let plan = if typed {
+        let (q, pr): (Vec<String>, Vec<String>) = parts
+            .iter()
+            .map(|(_, pl, _)| match pl {
+                Plan::Typed(q, pr) => (q.clone(), pr.clone()),
+                _ => unreachable!(),
+            })
+            .unzip();
+        Plan::Typed(join(&q), join(&pr))
+    } else {
+        let q: Vec<String> = parts
+            .iter()
+            .map(|(_, pl, _)| match pl {
+                Plan::Query(q) | Plan::Typed(q, _) => Ok(q.clone()),
+                _ => Err::<String, E>("unexpected plan".into()),
+            })
+            .collect::<Result<_, _>>()?;
+        Plan::Query(join(&q))
+    };
+    add_geometry(plan, p, Some(code))
+}
+
+/// Polygon of `n` vertices around (lon, lat) at `r` metres on the sphere (destination-point
+/// formula, mean Earth radius), counter-clockwise, as WKT.
+pub fn circle_wkt(lon: f64, lat: f64, r: f64, n: usize) -> String {
+    let (phi1, lam1, d) = (lat.to_radians(), lon.to_radians(), r / 6_371_008.8);
+    let pts: Vec<String> = (0..=n)
+        .map(|i| {
+            let brg = 2.0 * std::f64::consts::PI * ((n - i % n) % n) as f64 / n as f64;
+            let phi2 = (phi1.sin() * d.cos() + phi1.cos() * d.sin() * brg.cos()).asin();
+            let lam2 =
+                lam1 + (brg.sin() * d.sin() * phi1.cos()).atan2(d.cos() - phi1.sin() * phi2.sin());
+            format!("{} {}", lam2.to_degrees(), phi2.to_degrees())
+        })
+        .collect();
+    format!("POLYGON (({}))", pts.join(", "))
 }
 
 /// Query polygon in the grid CRS and its source CRS for `polygon_to_cells`.
 fn query_polygon(p: &Params, d: &Domain, level: u8) -> Result<(String, String, f64), E> {
     let min_cov = p.float("min_coverage").unwrap_or(0.0);
+    if let Some(r) = p.float("radius_m") {
+        // A circle around one lon/lat point, built on the sphere (true distance): 64 vertices.
+        let wkt = p
+            .text("geometry")
+            .ok_or("radius_m needs geometry := 'POINT (lon lat)'")?;
+        let crs = p.text("source_crs").unwrap_or_else(|| "EPSG:4326".into());
+        if !matches!(
+            crs.to_ascii_uppercase().as_str(),
+            "EPSG:4326" | "OGC:CRS84" | "WGS84"
+        ) {
+            return Err("radius_m needs a lon/lat point (source_crs EPSG:4326)".into());
+        }
+        let (lon, lat) = match geom::parse_geometry(&wkt)? {
+            geom::Geometry::Points(pts) if pts.len() == 1 => (pts[0].0, pts[0].1),
+            _ => return Err("radius_m needs exactly one POINT".into()),
+        };
+        if !(r > 0.0 && r <= 1_000_000.0) {
+            return Err("radius_m must be in (0, 1000000]".into());
+        }
+        return Ok((circle_wkt(lon, lat, r, 64), "EPSG:4326".into(), min_cov));
+    }
     if let Some(wkt) = p.text("geometry") {
         // Any WKT geometry; plan_query dispatches on its type.
         let crs = p.text("source_crs").unwrap_or_else(|| "EPSG:4326".into());
@@ -507,16 +1096,24 @@ fn query_polygon(p: &Params, d: &Domain, level: u8) -> Result<(String, String, f
 ///
 /// `bbox` behaves like a polygon (every cell overlapping the projected envelope).
 pub fn plan_query(p: &Params) -> Result<Plan, E> {
+    if let Some(Param::List(_)) = p.positional.first() {
+        return plan_query_multi(p);
+    }
+    if p.get("fill_nulls").is_some() {
+        return Err("fill_nulls is for several datasets: query_cell_dataset([path, ...])".into());
+    }
     let path = p.pos_text(0, "path")?;
-    let (plan, code) = plan_query_cells(p, &path)?;
-    add_geometry(plan, p, Some(code))
+    let (plan, ctx) = plan_query_cells(p, &path)?;
+    let plan = add_rollup(plan, p, &ctx)?;
+    add_geometry(plan, p, Some(ctx.code))
 }
 
 /// The cells of the query area joined with the dataset, and the dataset's domain code.
-fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
+fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
     let path = path.to_string();
     let lease = sql::lease()?;
-    let src = open(&lease, &path)?;
+    let mut src = open(&lease, &path)?;
+    select_snapshot(&lease, &mut src, p)?;
     let (d, level) = identity(&src, p)?;
     let limit = p.int("max_candidate_limit").unwrap_or(100_000);
     let (wkt, crs, min_cov) = query_polygon(p, d, level)?;
@@ -594,6 +1191,14 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
             )
         }
     };
+    let mut ctx = QueryCtx {
+        code: d.code,
+        level,
+        manifest: src.manifest.clone(),
+        weight: (extra != "point_count").then_some(extra),
+        extra: Some(extra),
+        present: None,
+    };
     let packed: Vec<i64> = cells
         .iter()
         .map(|c| packing::pack(d.id, *c))
@@ -605,22 +1210,29 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
 
     // Iceberg: choose data files from the cached manifests, read them with read_parquet.
     if let Layout::Iceberg { metadata } = &src.layout {
-        let meta = metadata_json(&lease, metadata)?;
-        if let Some(t) = crate::icefast::load(&lease, &src.root, metadata, &meta)? {
+        let (key, meta) = match src.snapshot {
+            Some(id) => (
+                format!("{metadata}#{id}"),
+                meta_at_snapshot(&metadata_json(&lease, metadata)?, id),
+            ),
+            None => (metadata.clone(), metadata_json(&lease, metadata)?),
+        };
+        if let Some(t) = crate::icefast::load(&lease, &src.root, &key, &meta)? {
             let mut sorted = packed.clone();
             sorted.sort_unstable();
             sorted.dedup();
             if let Some(sel) = t.files_for(&lease, &sorted)? {
                 if sel.is_empty() {
+                    ctx.present = Some(t.columns.iter().map(|(n, _)| n.clone()).collect());
                     return Ok((
                         Plan::Query(format!(
                             "SELECT {}, NULL::{extra_type} AS {extra} LIMIT 0",
                             t.empty_select()
                         )),
-                        d.code,
+                        ctx,
                     ));
                 }
-                let list: Vec<String> = sel.iter().map(|f| lit(f)).collect();
+                ctx.present = Some(t.columns.iter().map(|(n, _)| n.clone()).collect());
                 // Every column is cast to the type the probe declares: the proxy copies values
                 // by the declared type, so they must match exactly (e.g. point_count BIGINT).
                 let cols: Vec<String> = t
@@ -630,13 +1242,13 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
                     .collect();
                 return Ok((Plan::Typed(
                     format!(
-                        "SELECT {}, CAST(k.{extra} AS {extra_type}) AS {extra} FROM read_parquet([{}], hive_partitioning = false) AS d \
+                        "SELECT {}, CAST(k.{extra} AS {extra_type}) AS {extra} FROM {} AS d \
                          JOIN {keys} AS k ON d.packed_id = k.packed_id WHERE d.packed_id BETWEEN {lo} AND {hi}",
                         cols.join(", "),
-                        list.join(", ")
+                        t.scan(&sel)
                     ),
                     format!("SELECT {}, NULL::{extra_type} AS {extra}", t.empty_select()),
-                ), d.code));
+                ), ctx));
             }
         }
     }
@@ -669,13 +1281,14 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
                 Plan::Query(format!(
                     "SELECT *, NULL::{extra_type} AS {extra} FROM {full} LIMIT 0"
                 )),
-                d.code,
+                ctx,
             ));
         }
         Some(f) => from_clause(&lease, &src, Some(f))?,
         None => full,
     };
     let cols = columns(&lease, &from)?;
+    ctx.present = Some(cols.clone());
     let sql = if cols.iter().any(|c| c == "packed_id") {
         format!(
             "SELECT d.*, k.{extra} FROM {from} AS d JOIN {keys} AS k ON d.packed_id = k.packed_id \
@@ -686,7 +1299,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, &'static str), E> {
     } else {
         return Err("dataset has neither a packed_id nor a gid column".into());
     };
-    Ok((Plan::Query(sql), d.code))
+    Ok((Plan::Query(sql), ctx))
 }
 
 // ---------------------------------------------------------------------------
@@ -699,20 +1312,25 @@ fn describe_dataset(p: &Params) -> Result<(Source, Json, Json), E> {
     let lease = sql::lease()?;
     let src = open(&lease, &path)?;
     let manifest = src.manifest.clone().unwrap_or(Json::Null);
-    let info: Json = match &src.layout {
-        Layout::Iceberg { metadata } => metadata_json(&lease, metadata)?
+    let info = dataset_info(&lease, &src)?;
+    Ok((src, manifest, info))
+}
+
+/// The dataset_info document (title, description, period, version, column descriptions).
+pub fn dataset_info(lease: &Lease, src: &Source) -> Result<Json, E> {
+    Ok(match &src.layout {
+        Layout::Iceberg { metadata } => metadata_json(lease, metadata)?
             .pointer(&format!(
                 "/properties/{}",
                 crate::metadata::INFO_KEY.replace('/', "~1")
             ))
             .and_then(Json::as_str)
             .and_then(|t| serde_json::from_str(t).ok()),
-        _ => read_text(&lease, &join(&src.root, crate::metadata::INFO_FILE))
+        _ => read_text(lease, &join(&src.root, crate::metadata::INFO_FILE))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok()),
     }
-    .unwrap_or(Json::Null);
-    Ok((src, manifest, info))
+    .unwrap_or(Json::Null))
 }
 
 fn jlit(v: &Json) -> String {
@@ -798,4 +1416,61 @@ pub fn plan_columns(p: &Params) -> Result<Plan, E> {
         "SELECT * FROM (VALUES {}) AS t(\"column\", parquet_type, semantics, aggregation_rule, unit, description, nullable)",
         rows.join(", ")
     )))
+}
+
+/// cell_dataset_content_hashes(path): one row per data file listed in `storage.data_files` of a
+/// manifest 1.1 dataset. `content_sha256` is computed now from the file's rows (section 3.1).
+/// `manifest_content_sha256` is the hash the manifest records, or NULL if it records none.
+pub fn plan_content_hashes(p: &Params) -> Result<Plan, E> {
+    let path = p.pos_text(0, "path")?;
+    let lease = sql::lease()?;
+    let src = open(&lease, &path)?;
+    let m = src.manifest.clone().ok_or("the dataset has no manifest")?;
+    let fields = m
+        .get("value_fields")
+        .and_then(Json::as_array)
+        .ok_or("the manifest has no value_fields")?
+        .iter()
+        .map(|f| {
+            Ok(crate::content_hash::ValueField {
+                name: f["name"]
+                    .as_str()
+                    .ok_or("a value field has no name")?
+                    .to_string(),
+                parquet_type: f["parquet_type"]
+                    .as_str()
+                    .ok_or("a value field has no parquet_type")?
+                    .to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, E>>()?;
+    let files = m
+        .pointer("/storage/data_files")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(files.len());
+    for f in &files {
+        let rel = f["path"].as_str().ok_or("a data file has no path")?;
+        let recorded = f["content_sha256"]
+            .as_str()
+            .map_or("NULL::VARCHAR".into(), lit);
+        let hash = crate::content_hash::file_content_hash(&lease, &join(&src.root, rel), &fields)?;
+        rows.push(format!(
+            "({}, {}::BIGINT, {}, {recorded})",
+            lit(rel),
+            hash.rows,
+            lit(&hash.sha256)
+        ));
+    }
+    Ok(Plan::Query(if rows.is_empty() {
+        "SELECT NULL::VARCHAR AS file, NULL::BIGINT AS row_count, NULL::VARCHAR AS content_sha256, \
+         NULL::VARCHAR AS manifest_content_sha256 LIMIT 0"
+            .into()
+    } else {
+        format!(
+            "SELECT * FROM (VALUES {}) AS t(file, row_count, content_sha256, manifest_content_sha256)",
+            rows.join(", ")
+        )
+    }))
 }

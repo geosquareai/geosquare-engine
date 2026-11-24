@@ -59,6 +59,10 @@ export class GeosquareCellsWasm {
     await db.open({ allowUnsignedExtensions: true });
     const conn = await db.connect();
     try {
+      // Threads bundle (coi/threads): a thread of DuckDB's pool can run extension code before
+      // it has picked up the newly loaded module (Emscripten dlopen with pthreads) and hang.
+      // Keep queries on one thread there; the eh/mvp bundles are single-threaded anyway.
+      if (bundle.pthreadWorker) await conn.query('SET threads = 1');
       if (o.extension.endsWith('.wasm')) {
         await conn.query(`LOAD ${sqlString(o.extension)}`);
       } else {

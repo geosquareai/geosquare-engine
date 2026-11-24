@@ -4,7 +4,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 EXT="${1:-build/linux_amd64/geosquare_v2.duckdb_extension}"
-VERSIONS="${DUCKDB_VERSIONS:-1.4.0 1.4.5 1.5.0 1.5.6 2.0.0}"
+VERSIONS="${DUCKDB_VERSIONS:-1.4.0 1.4.1 1.4.2 1.4.3 1.4.4 1.4.5 1.5.0 1.5.1 1.5.2 1.5.3 1.5.4 1.5.5 1.5.6 2.0.0 2.0.1}"
 VENVS="${DUCKDB_VENVS:-.venvs}"
 TESTS="${TESTS:-tests/test_vectors.py}"
 fail=0

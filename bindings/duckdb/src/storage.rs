@@ -61,10 +61,15 @@ impl Storage {
     /// Resolve settings for `root`. Remote non-S3 schemes are refused for byte writes.
     pub fn for_path(lease: &Lease, root: &str, params: &S3Params) -> Result<Self, E> {
         if is_local(root) {
-            return Ok(Storage {
-                #[cfg(feature = "native-s3")]
-                s3: None,
-            });
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                return Ok(Storage {
+                    #[cfg(feature = "native-s3")]
+                    s3: None,
+                });
+            }
         }
         if !is_s3(root) {
             return Err(format!(
@@ -87,11 +92,16 @@ impl Storage {
 
     pub fn put(&self, path: &str, bytes: Vec<u8>) -> Result<(), E> {
         if is_local(path) {
-            let p = std::path::Path::new(local(path));
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir)?;
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let p = std::path::Path::new(local(path));
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                return Ok(std::fs::write(p, bytes)?);
             }
-            return Ok(std::fs::write(p, bytes)?);
         }
         #[cfg(feature = "native-s3")]
         {
@@ -103,7 +113,14 @@ impl Storage {
 
     pub fn get(&self, path: &str) -> Result<Vec<u8>, E> {
         if is_local(path) {
-            return Ok(std::fs::read(local(path)).map_err(|e| format!("cannot read {path}: {e}"))?);
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                return Ok(
+                    std::fs::read(local(path)).map_err(|e| format!("cannot read {path}: {e}"))?
+                );
+            }
         }
         #[cfg(feature = "native-s3")]
         {
@@ -115,7 +132,12 @@ impl Storage {
 
     pub fn size(&self, path: &str) -> Result<i64, E> {
         if is_local(path) {
-            return Ok(std::fs::metadata(local(path))?.len() as i64);
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                return Ok(std::fs::metadata(local(path))?.len() as i64);
+            }
         }
         #[cfg(feature = "native-s3")]
         {
@@ -145,21 +167,226 @@ impl Storage {
     /// Delete everything under `prefix` (a folder). Returns the number of objects removed.
     pub fn delete_prefix(&self, prefix: &str) -> Result<usize, E> {
         if is_local(prefix) {
-            let p = std::path::Path::new(local(prefix));
-            if p.is_dir() {
-                let n = walk_count(p);
-                std::fs::remove_dir_all(p)?;
-                return Ok(n);
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let p = std::path::Path::new(local(prefix));
+                if p.is_dir() {
+                    let n = walk_count(p);
+                    std::fs::remove_dir_all(p)?;
+                    return Ok(n);
+                }
+                if p.is_file() {
+                    std::fs::remove_file(p)?;
+                    return Ok(1);
+                }
+                return Ok(0);
             }
-            if p.is_file() {
-                std::fs::remove_file(p)?;
-                return Ok(1);
-            }
-            return Ok(0);
         }
         #[cfg(feature = "native-s3")]
         {
             return self.conf()?.delete_prefix(prefix);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// A tag of the object's current version (ETag on S3), None when it does not exist.
+    pub fn version_tag(&self, path: &str) -> Result<Option<String>, E> {
+        if is_local(path) {
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                return Ok(std::fs::metadata(local(path)).ok().map(|m| {
+                    let t = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_nanos());
+                    format!("{}-{t}", m.len())
+                }));
+            }
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.version_tag(path);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Write only if the object is still at version `expected` (None: it must not exist), so
+    /// two writers committing at once cannot both succeed. On S3 this is a conditional PUT
+    /// (If-Match / If-None-Match); locally a check right before the write.
+    pub fn put_if(&self, path: &str, bytes: Vec<u8>, expected: Option<&str>) -> Result<(), E> {
+        let conflict = || -> E { format!("{path} was changed by another writer; retry").into() };
+        if is_local(path) {
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                if self.version_tag(path)?.as_deref() != expected {
+                    return Err(conflict());
+                }
+                return self.put(path, bytes);
+            }
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.put_if(path, bytes, expected).map_err(|e| {
+                if e.to_string().contains("precondition")
+                    || e.to_string().contains("already exists")
+                {
+                    conflict()
+                } else {
+                    e
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Every object below `prefix` (recursive): (path, size, last modified ms since epoch).
+    pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64, i64)>, E> {
+        if is_local(prefix) {
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let mut out = Vec::new();
+                walk_files(std::path::Path::new(local(prefix)), &mut out);
+                let base = local(prefix).trim_end_matches('/');
+                let shown = prefix.trim_end_matches('/');
+                return Ok(out
+                    .into_iter()
+                    .map(|(p, n, t)| {
+                        let rel = p.strip_prefix(base).unwrap_or(&p).to_string();
+                        (format!("{shown}{rel}"), n, t)
+                    })
+                    .collect());
+            }
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.list(prefix);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Bytes `start .. start + len` of an object.
+    pub fn get_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, E> {
+        if is_local(path) {
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(local(path))
+                    .map_err(|e| format!("cannot open {path}: {e}"))?;
+                f.seek(SeekFrom::Start(start))?;
+                let mut buf = Vec::with_capacity(len as usize);
+                f.take(len).read_to_end(&mut buf)?;
+                return Ok(buf);
+            }
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.get_range(path, start, len);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Immediate sub-folders of `prefix` (full paths, no trailing slash).
+    pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, E> {
+        if is_local(prefix) {
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let shown = prefix.trim_end_matches('/');
+                let mut out: Vec<String> = std::fs::read_dir(local(prefix))
+                    .map_err(|e| format!("cannot list {prefix}: {e}"))?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| format!("{shown}/{}", e.file_name().to_string_lossy()))
+                    .collect();
+                out.sort();
+                return Ok(out);
+            }
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.list_dirs(prefix);
+        }
+        #[allow(unreachable_code)]
+        Err("no S3 client".into())
+    }
+
+    /// Read many objects with `threads` requests at a time, in the order given.
+    pub fn get_many(&self, paths: &[String], threads: usize) -> Result<Vec<Vec<u8>>, E> {
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = threads;
+            return paths.iter().map(|p| self.get(p)).collect();
+        }
+        #[cfg(not(target_family = "wasm"))]
+        let threads = threads.max(1).min(paths.len().max(1));
+        let chunk = paths.len().div_ceil(threads).max(1);
+        let parts: Vec<Result<Vec<Vec<u8>>, String>> = std::thread::scope(|sc| {
+            let handles: Vec<_> = paths
+                .chunks(chunk)
+                .map(|c| {
+                    sc.spawn(move || {
+                        c.iter()
+                            .map(|p| self.get(p).map_err(|e| e.to_string()))
+                            .collect::<Result<Vec<_>, String>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("reader thread panicked".into()))
+                })
+                .collect()
+        });
+        let mut out = Vec::with_capacity(paths.len());
+        for p in parts {
+            out.extend(p?);
+        }
+        Ok(out)
+    }
+
+    /// Delete these objects (files, not folders). Returns how many were deleted.
+    pub fn delete_many(&self, paths: &[String]) -> Result<usize, E> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        if paths.iter().all(|p| is_local(p)) {
+            #[cfg(target_family = "wasm")]
+            return Err(no_local_files());
+            #[cfg(not(target_family = "wasm"))]
+            {
+                let mut n = 0;
+                for p in paths {
+                    match std::fs::remove_file(local(p)) {
+                        Ok(()) => n += 1,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(format!("cannot delete {p}: {e}").into()),
+                    }
+                }
+                return Ok(n);
+            }
+        }
+        #[cfg(feature = "native-s3")]
+        {
+            return self.conf()?.delete_many(paths);
         }
         #[allow(unreachable_code)]
         Err("no S3 client".into())
@@ -173,6 +400,25 @@ impl Storage {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn walk_files(p: &std::path::Path, out: &mut Vec<(String, u64, i64)>) {
+    let Ok(it) = std::fs::read_dir(p) else { return };
+    for e in it.filter_map(|e| e.ok()) {
+        let path = e.path();
+        if path.is_dir() {
+            walk_files(&path, out);
+        } else if let Ok(m) = e.metadata() {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as i64);
+            out.push((path.to_string_lossy().into_owned(), m.len(), t));
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn walk_count(p: &std::path::Path) -> usize {
     std::fs::read_dir(p)
         .map(|it| {
@@ -187,6 +433,12 @@ fn walk_count(p: &std::path::Path) -> usize {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// Local files do not exist in DuckDB-Wasm (the browser reads over HTTP).
+#[cfg(target_family = "wasm")]
+fn no_local_files() -> E {
+    "local files are not available in DuckDB-Wasm; use an http(s):// URL".into()
 }
 
 /// Non-secret fields of the DuckDB secret DuckDB would use for `path`.
@@ -376,6 +628,39 @@ mod s3 {
             Ok(())
         }
 
+        pub fn version_tag(&self, path: &str) -> Result<Option<String>, E> {
+            let (bucket, key) = split_s3(path)?;
+            let store = self.store(&bucket)?;
+            match runtime()?.block_on(async move { store.head(&ObjPath::from(key)).await }) {
+                Ok(m) => Ok(Some(m.e_tag.unwrap_or_default())),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        }
+
+        pub fn put_if(&self, path: &str, bytes: Vec<u8>, expected: Option<&str>) -> Result<(), E> {
+            use object_store::{PutMode, PutOptions, UpdateVersion};
+            let (bucket, key) = split_s3(path)?;
+            let store = self.store(&bucket)?;
+            let mode = match expected {
+                Some(tag) => PutMode::Update(UpdateVersion {
+                    e_tag: Some(tag.to_string()),
+                    version: None,
+                }),
+                None => PutMode::Create,
+            };
+            let opts = PutOptions {
+                mode,
+                ..Default::default()
+            };
+            runtime()?.block_on(async move {
+                store
+                    .put_opts(&ObjPath::from(key), PutPayload::from(bytes), opts)
+                    .await
+            })?;
+            Ok(())
+        }
+
         pub fn get(&self, path: &str) -> Result<Vec<u8>, E> {
             let (bucket, key) = split_s3(path)?;
             let store = self.store(&bucket)?;
@@ -421,6 +706,72 @@ mod s3 {
                 .await
             })?;
             Ok(())
+        }
+
+        pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64, i64)>, E> {
+            let (bucket, key) = split_s3(prefix)?;
+            let store = self.store(&bucket)?;
+            let base = ObjPath::from(key.trim_end_matches('/').to_string());
+            let items: Vec<object_store::ObjectMeta> =
+                runtime()?.block_on(async move { store.list(Some(&base)).try_collect().await })?;
+            Ok(items
+                .into_iter()
+                .map(|o| {
+                    (
+                        format!("s3://{bucket}/{}", o.location),
+                        o.size,
+                        o.last_modified.timestamp_millis(),
+                    )
+                })
+                .collect())
+        }
+
+        pub fn get_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, E> {
+            let (bucket, key) = split_s3(path)?;
+            let store = self.store(&bucket)?;
+            let bytes = runtime()?.block_on(async move {
+                store
+                    .get_range(&ObjPath::from(key), start..start + len)
+                    .await
+            })?;
+            Ok(bytes.to_vec())
+        }
+
+        pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, E> {
+            let (bucket, key) = split_s3(prefix)?;
+            let store = self.store(&bucket)?;
+            let base = ObjPath::from(key.trim_end_matches('/').to_string());
+            let r =
+                runtime()?.block_on(async move { store.list_with_delimiter(Some(&base)).await })?;
+            let mut out: Vec<String> = r
+                .common_prefixes
+                .into_iter()
+                .map(|p| format!("s3://{bucket}/{p}"))
+                .collect();
+            out.sort();
+            Ok(out)
+        }
+
+        pub fn delete_many(&self, paths: &[String]) -> Result<usize, E> {
+            use futures::StreamExt;
+            let mut by_bucket: std::collections::HashMap<String, Vec<ObjPath>> = Default::default();
+            for p in paths {
+                let (bucket, key) = split_s3(p)?;
+                by_bucket
+                    .entry(bucket)
+                    .or_default()
+                    .push(ObjPath::from(key));
+            }
+            let mut n = 0;
+            for (bucket, keys) in by_bucket {
+                let store = self.store(&bucket)?;
+                n += runtime()?.block_on(async move {
+                    let stream = futures::stream::iter(keys.into_iter().map(Ok)).boxed();
+                    let done: Vec<ObjPath> = store.delete_stream(stream).try_collect().await?;
+                    Ok::<usize, object_store::Error>(done.len())
+                })?;
+            }
+            Ok(n)
         }
 
         pub fn delete_prefix(&self, prefix: &str) -> Result<usize, E> {

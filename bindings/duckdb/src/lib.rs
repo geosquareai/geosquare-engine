@@ -5,6 +5,7 @@
 //! `geosquare-engine` bindings.
 
 mod avro;
+mod content_hash;
 mod dataset;
 mod detect_fn;
 mod equal_area;
@@ -12,13 +13,17 @@ mod geom;
 mod grid;
 mod iceberg;
 mod icefast;
+mod inspect;
 mod lines;
+mod maintenance;
 mod metadata;
 mod polyfill;
+mod raster;
 mod registry;
 mod sql;
 mod storage;
 mod tables;
+mod v1;
 mod valid;
 mod writer;
 
@@ -58,12 +63,28 @@ unsafe fn init(
         con.register_table_function::<tables::PolygonToCells>("polygon_to_cells")?;
         con.register_table_function::<tables::Polyfill>("polyfill")?;
         con.register_table_function::<tables::LineToCells>("line_to_cells")?;
-        register_dataset_functions(db)?;
+        let pool = register_dataset_functions(db)?;
+        con.register_table_function_with_extra_info::<raster::ReadRaster, _>("read_raster", &pool)?;
         Ok(true)
     }
 }
 
-unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box<dyn Error>> {
+fn s3_named() -> Vec<(&'static str, sql::Kind)> {
+    use sql::Kind::Text;
+    vec![
+        ("s3_region", Text),
+        ("s3_endpoint", Text),
+        ("s3_url_style", Text),
+        ("s3_use_ssl", Text),
+        ("s3_access_key_id", Text),
+        ("s3_secret_access_key", Text),
+        ("s3_session_token", Text),
+    ]
+}
+
+unsafe fn register_dataset_functions(
+    db: ffi::duckdb_database,
+) -> Result<std::sync::Arc<sql::Pool>, Box<dyn Error>> {
     use sql::Kind::*;
     unsafe {
         let pool = sql::init_pool(db, pool_size())?;
@@ -73,7 +94,15 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
         }
         let identity = vec![("domain_code", Text), ("level", Int)];
         let mut read_params = identity.clone();
-        read_params.extend([("with_geometry", Text), ("geometry_crs", Text)]);
+        read_params.extend([
+            ("snapshot_id", Int),
+            ("as_of", Text),
+            ("with_geometry", Text),
+            ("geometry_crs", Text),
+            ("rollup_level", Int),
+            ("rollup_rule", Text),
+            ("space_weight", Text),
+        ]);
         let r = (|| -> Result<(), Box<dyn Error>> {
             sql::register(
                 con,
@@ -85,7 +114,10 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
             )?;
             let mut q = identity.clone();
             q.extend([
+                ("snapshot_id", Int),
+                ("as_of", Text),
                 ("geometry", Text),
+                ("radius_m", Float),
                 ("bbox", FloatList),
                 ("min_coverage", Float),
                 ("source_crs", Text),
@@ -94,15 +126,30 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("allow_candidate_crs", Bool),
                 ("with_geometry", Text),
                 ("geometry_crs", Text),
+                ("rollup_level", Int),
+                ("rollup_rule", Text),
+                ("space_weight", Text),
             ]);
+            let mut qm = q;
+            qm.push(("fill_nulls", Bool));
+            // query_cell_dataset(path | [path, ...]): a list behaves as query_cell_datasets.
             sql::register(
                 con,
                 "query_cell_dataset",
-                vec![Text],
-                q,
+                vec![TextOrList],
+                qm.clone(),
                 dataset::plan_query,
                 pool.clone(),
             )?;
+            sql::register(
+                con,
+                "query_cell_datasets",
+                vec![TextList],
+                qm,
+                dataset::plan_query_multi,
+                pool.clone(),
+            )?;
+
             let mut w = identity.clone();
             w.extend([
                 ("layout", Text),
@@ -124,6 +171,9 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 ("data_period", Text),
                 ("data_version", Text),
                 ("fill_nulls", Bool),
+                ("rollup_level", Int),
+                ("space_aggregation", Text),
+                ("space_weight", Text),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),
@@ -146,6 +196,14 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 vec![Text],
                 identity.clone(),
                 dataset::plan_columns,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "cell_dataset_content_hashes",
+                vec![Text],
+                identity.clone(),
+                dataset::plan_content_hashes,
                 pool.clone(),
             )?;
             let mut u = vec![
@@ -183,6 +241,66 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
                 detect_fn::plan,
                 pool.clone(),
             )?;
+            let mut ex = vec![
+                ("retain_last", Int),
+                ("older_than", Text),
+                ("orphan_age_hours", Float),
+                ("dry_run", Bool),
+            ];
+            ex.extend(s3_named());
+            for (name, extra, plan) in [
+                (
+                    "list_cell_datasets",
+                    vec![],
+                    inspect::plan_list as sql::Planner,
+                ),
+                (
+                    "validate_cell_dataset",
+                    vec![],
+                    inspect::plan_validate as sql::Planner,
+                ),
+                (
+                    "cell_dataset_stats",
+                    vec![("exact", Bool)],
+                    inspect::plan_stats as sql::Planner,
+                ),
+            ] {
+                let mut named = extra;
+                named.extend(s3_named());
+                sql::register(con, name, vec![Text], named, plan, pool.clone())?;
+            }
+            let mut al = vec![
+                ("drop_columns", Text),
+                ("rename_columns", Text),
+                ("add_columns", Text),
+            ];
+            al.extend(s3_named());
+            sql::register(
+                con,
+                "alter_cell_dataset",
+                vec![Text],
+                al,
+                writer::plan_alter,
+                pool.clone(),
+            )?;
+            let mut cp = vec![("partition_level", Int)];
+            cp.extend(s3_named());
+            sql::register(
+                con,
+                "compact_cell_dataset",
+                vec![Text],
+                cp,
+                writer::plan_compact,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "expire_snapshots",
+                vec![Text],
+                ex,
+                maintenance::plan_expire,
+                pool.clone(),
+            )?;
             sql::register(
                 con,
                 "write_cell_dataset",
@@ -194,7 +312,7 @@ unsafe fn register_dataset_functions(db: ffi::duckdb_database) -> Result<(), Box
             Ok(())
         })();
         ffi::duckdb_disconnect(&mut con);
-        r
+        r.map(|_| pool)
     }
 }
 

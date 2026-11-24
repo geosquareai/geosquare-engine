@@ -41,6 +41,11 @@ struct Manifest {
 pub struct Table {
     /// Current schema as (name, DuckDB type), in order.
     pub columns: Vec<(String, String)>,
+    /// (field id, DuckDB type, default literal) per column, in the order of `columns`.
+    fields: Vec<(i64, String, String)>,
+    /// Read data files by field id (columns renamed, dropped or added after they were
+    /// written: alter_cell_dataset).
+    by_id: bool,
     pk_id: i64,
     location: String,
     root: String,
@@ -96,6 +101,48 @@ impl Table {
             }
         }
         Ok(Some(out))
+    }
+
+    /// Every live data file of the snapshot, or None when a manifest needs iceberg_scan.
+    pub fn all_files(&self, lease: &Lease) -> Result<Option<Vec<String>>, E> {
+        let mut out = Vec::new();
+        for m in &self.manifests {
+            let Some(files) = manifest_files(lease, self, m)? else {
+                return Ok(None);
+            };
+            out.extend(files.iter().map(|f| f.path.clone()));
+        }
+        Ok(Some(out))
+    }
+
+    /// `read_parquet(...)` over `files` returning the current schema's columns by name; for
+    /// altered tables the files are read by field id (renamed columns, defaults for added
+    /// columns, dropped columns left out).
+    pub fn scan(&self, files: &[String]) -> String {
+        let list: Vec<String> = files.iter().map(|f| lit(f)).collect();
+        if !self.by_id {
+            return format!(
+                "read_parquet([{}], hive_partitioning = false)",
+                list.join(", ")
+            );
+        }
+        let map: Vec<String> = self
+            .columns
+            .iter()
+            .zip(&self.fields)
+            .map(|((name, _), (id, ty, default))| {
+                format!(
+                    "{id}: {{name: {}, type: {}, default_value: {default}}}",
+                    lit(name),
+                    lit(ty)
+                )
+            })
+            .collect();
+        format!(
+            "read_parquet([{}], hive_partitioning = false, schema = MAP {{{}}})",
+            list.join(", "),
+            map.join(", ")
+        )
     }
 
     /// `SELECT NULL::type AS col, ...` with the table's columns and no rows.
@@ -229,6 +276,7 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
         return Ok(None);
     };
     let mut columns = Vec::new();
+    let mut ids = Vec::new();
     let mut pk_id = None;
     for f in fields {
         let name = f
@@ -242,6 +290,17 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
         if name == "packed_id" {
             pk_id = f.get("id").and_then(Json::as_i64);
         }
+        // MAP values need one type: untyped NULL, or a plain number for added numeric columns
+        // (read_parquet casts the default to the column type).
+        let default = match f.get("initial-default") {
+            Some(Json::Number(n)) => format!("{n}"),
+            _ => "NULL".to_string(),
+        };
+        ids.push((
+            f.get("id").and_then(Json::as_i64).unwrap_or(-1),
+            ty.clone(),
+            default,
+        ));
         columns.push((name, ty));
     }
     let Some(pk_id) = pk_id else {
@@ -279,8 +338,14 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
             }
         }
     }
+    let by_id = meta
+        .pointer("/properties/geosquare.read-by-field-id")
+        .and_then(Json::as_str)
+        == Some("true");
     let mut table = Table {
         columns,
+        fields: ids,
+        by_id,
         pk_id,
         location,
         root: root.to_string(),

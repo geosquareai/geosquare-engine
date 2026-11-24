@@ -22,7 +22,7 @@ pub struct PerColumn {
 }
 
 impl PerColumn {
-    fn parse(text: Option<String>, what: &str) -> Result<Self, E> {
+    pub fn parse(text: Option<String>, what: &str) -> Result<Self, E> {
         let Some(t) = text else {
             return Ok(Self::default());
         };

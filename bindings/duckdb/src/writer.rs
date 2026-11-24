@@ -82,6 +82,17 @@ pub struct Options {
     extra: crate::metadata::Extra,
     /// Write 0 instead of NULL in numeric value columns (default true).
     fill_nulls: bool,
+    /// Aggregate the input cells to this ancestor level before writing (see rollup_query).
+    rollup_level: Option<i64>,
+    /// Parent rule per column (`space_aggregation`), used by rollup_level.
+    space_aggregation: Option<String>,
+    /// Weight per column (`space_weight`): a COUNT or TOTAL column, or `area`.
+    space_weight: Option<String>,
+    /// value_semantics was passed (not the default), so it is not inherited.
+    value_semantics_given: bool,
+    /// (cell manifest, dataset_info) of the dataset being appended to or overwritten: its
+    /// metadata is kept unless this write passes other values.
+    prev: Option<(Json, Json)>,
     s3: S3Params,
 }
 
@@ -90,6 +101,10 @@ const MANIFEST_FILES: usize = 128;
 
 /// Cell id columns, which always get full Iceberg metrics.
 const KEY_COLUMNS: [&str; 4] = ["packed_id", "gid", "x_idx", "y_idx"];
+
+pub(crate) fn s3_params_pub(p: &Params) -> S3Params {
+    s3_params(p)
+}
 
 fn s3_params(p: &Params) -> S3Params {
     S3Params {
@@ -108,6 +123,11 @@ fn s3_params(p: &Params) -> S3Params {
 pub fn plan_write(p: &Params) -> Result<Plan, E> {
     let query = p.pos_text(0, "query")?;
     let path = p.pos_text(1, "path")?;
+    if (p.text("space_aggregation").is_some() || p.text("space_weight").is_some())
+        && p.int("rollup_level").is_none()
+    {
+        return Err("space_aggregation and space_weight need rollup_level".into());
+    }
     let o = Options {
         layout: p
             .text("layout")
@@ -132,6 +152,11 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
             .unwrap_or_else(|| "query".into())
             .to_ascii_lowercase(),
         fill_nulls: p.int("fill_nulls").is_none_or(|v| v != 0),
+        rollup_level: p.int("rollup_level"),
+        space_aggregation: p.text("space_aggregation"),
+        space_weight: p.text("space_weight"),
+        value_semantics_given: p.text("value_semantics").is_some(),
+        prev: None,
         column_metrics: p
             .text("column_metrics")
             .unwrap_or_else(|| "auto".into())
@@ -154,8 +179,14 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
     if !matches!(o.layout.as_str(), "flat" | "partitioned" | "iceberg") {
         return Err("layout must be 'flat', 'partitioned' or 'iceberg'".into());
     }
-    if !matches!(o.mode.as_str(), "create" | "overwrite" | "append") {
-        return Err("mode must be 'create', 'overwrite' or 'append'".into());
+    if !matches!(
+        o.mode.as_str(),
+        "create" | "overwrite" | "append" | "upsert"
+    ) {
+        return Err("mode must be 'create', 'overwrite', 'append' or 'upsert'".into());
+    }
+    if o.mode == "upsert" && o.layout != "iceberg" {
+        return Err("mode 'upsert' is only for layout 'iceberg' (folders are rewritten whole: use 'overwrite')".into());
     }
     if o.mode == "append" && o.layout != "iceberg" {
         return Err("mode 'append' is only for layout 'iceberg' (a contract folder embeds row_count in every file)".into());
@@ -175,7 +206,7 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
 
 // ---------------------------------------------------------------------------
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -195,7 +226,7 @@ fn random_u64() -> u64 {
     h.finish()
 }
 
-fn uuid4() -> String {
+pub(crate) fn uuid4() -> String {
     let (a, b) = (random_u64(), random_u64());
     let a = (a & 0xffff_ffff_ffff_0fff) | 0x0000_0000_0000_4000;
     let b = (b & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
@@ -254,16 +285,21 @@ impl Staging {
                 files: Vec::new(),
             });
         }
-        let base = std::env::var_os("GEOSQUARE_V2_STAGING_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("geosquare_v2_upload_{}", uuid4()));
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create staging folder {}: {e}", dir.display()))?;
-        Ok(Staging {
-            dir: Some(dir),
-            files: Vec::new(),
-        })
+        #[cfg(target_family = "wasm")]
+        return Err("writing to S3 is not available in DuckDB-Wasm".into());
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let base = std::env::var_os("GEOSQUARE_V2_STAGING_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let dir = base.join(format!("geosquare_v2_upload_{}", uuid4()));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create staging folder {}: {e}", dir.display()))?;
+            Ok(Staging {
+                dir: Some(dir),
+                files: Vec::new(),
+            })
+        }
     }
 
     /// Where DuckDB writes the file that ends up at `remote` (`rel` below the table root).
@@ -272,6 +308,7 @@ impl Staging {
             return Ok(remote.to_string());
         };
         let p = dir.join(rel);
+        #[cfg(not(target_family = "wasm"))]
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -295,6 +332,7 @@ impl Staging {
 
 impl Drop for Staging {
     fn drop(&mut self) {
+        #[cfg(not(target_family = "wasm"))]
         if let Some(d) = &self.dir {
             let _ = std::fs::remove_dir_all(d);
         }
@@ -302,9 +340,12 @@ impl Drop for Staging {
 }
 
 fn ensure_dir(path: &str) -> Result<(), E> {
+    #[cfg(not(target_family = "wasm"))]
     if is_local(path) {
         std::fs::create_dir_all(local(path)).map_err(|e| format!("cannot create {path}: {e}"))?;
     }
+    #[cfg(target_family = "wasm")]
+    let _ = path;
     Ok(())
 }
 
@@ -439,6 +480,232 @@ impl Staged {
     }
 }
 
+/// `rollup_level := R`: the input cells aggregated to their level-R ancestors, one row per
+/// ancestor. Each numeric column is aggregated by its `aggregation_rule` (one word or
+/// `{column: rule}`: sum, mean, min, max, median); without a rule COUNT columns (`value_semantics`)
+/// are summed and the others averaged. An input `coverage_ratio` / `length_ratio` column
+/// (e.g. from query_cell_dataset) weights the cells and is not written.
+fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<String, E> {
+    if !(0..=codec::MAX_LEVEL as i64).contains(&r) {
+        return Err(format!(
+            "rollup_level must be in [0, {}]; received {r}",
+            codec::MAX_LEVEL
+        )
+        .into());
+    }
+    let src = format!("SELECT * FROM ({query}) AS gs_src");
+    let cols = describe(lease, &src)?;
+    let has = |n: &str| cols.iter().any(|(c, _)| c == n);
+    let gid = if has("gid") {
+        "CAST(r.gid AS VARCHAR)"
+    } else if has("packed_id") {
+        "packed_to_gid(CAST(r.packed_id AS BIGINT))"
+    } else {
+        return Err("the query needs a gid or a packed_id column".into());
+    };
+    let weight = ["coverage_ratio", "length_ratio"]
+        .into_iter()
+        .find(|w| has(w));
+    let w = weight.map_or("1.0".to_string(), |w| format!("r.{w}"));
+    type Rules = (Option<String>, serde_json::Map<String, Json>);
+    let word_or_map = |text: &Option<String>| -> Result<Rules, E> {
+        match text.as_deref().map(str::trim) {
+            Some(t) if t.starts_with('{') => match serde_json::from_str::<Json>(t) {
+                Ok(Json::Object(m)) => Ok((None, m)),
+                _ => Err("aggregation_rule / value_semantics must be a word or a JSON object {column: value}".into()),
+            },
+            Some(t) => Ok((Some(t.to_string()), Default::default())),
+            None => Ok((None, Default::default())),
+        }
+    };
+    let space_agg =
+        crate::metadata::PerColumn::parse(o.space_aggregation.clone(), "space_aggregation")?;
+    let space_weight = crate::metadata::PerColumn::parse(o.space_weight.clone(), "space_weight")?;
+    let (sem_all, sem_map) = word_or_map(&Some(o.value_semantics.clone()))?;
+    let skip = [
+        "gid",
+        "packed_id",
+        "x_idx",
+        "y_idx",
+        "uri",
+        "domain_code",
+        "level",
+        "cell_count",
+    ];
+    let mut aggs = Vec::new();
+    for (c, ty) in &cols {
+        if skip.contains(&c.as_str()) || Some(c.as_str()) == weight {
+            continue;
+        }
+        if !is_numeric_type(ty) {
+            return Err(format!(
+                "rollup_level aggregates numeric columns; {c} is {ty}: aggregate or drop it in the query"
+            )
+            .into());
+        }
+        let sem = sem_map
+            .get(c)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .or_else(|| sem_all.clone())
+            .unwrap_or_default();
+        // The parent rule and weight come from space_aggregation / space_weight (spec 2.0,
+        // dataset metadata section 4), not from aggregation_rule, which is the source-to-cell meaning.
+        let rule = space_agg.get(c).map(str::to_string);
+        let space_w = space_weight.get(c).map(str::to_string);
+        let Some((rule, space_w)) = crate::dataset::space_rule(c, &sem, rule, space_w)? else {
+            continue; // `none`: the column is not rolled up
+        };
+        aggs.push(format!(
+            "{} AS {}",
+            crate::dataset::space_expr(c, &rule, space_w.as_deref(), &w)?,
+            ident(c)
+        ));
+    }
+    if aggs.is_empty() {
+        return Err("rollup_level: the query has no value columns".into());
+    }
+    // Keep the domain with the cells: the parent's packed_id from the input's domain bits.
+    let packed = if has("packed_id") {
+        format!(
+            ", pack(CAST(any_value(r.packed_id >> 54) AS INTEGER), left({gid}, {r})) AS packed_id"
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "SELECT left({gid}, {r}) AS gid{packed}, {} FROM ({src}) AS r GROUP BY 1",
+        aggs.join(", ")
+    ))
+}
+
+/// compact_cell_dataset(path, partition_level := <current>): rewrite a dataset in place with
+/// one sorted file per partition (merging the files of many appends), optionally at another
+/// partition level, keeping its metadata (value fields with units and rules, source,
+/// coverage, notes, title, description, period, version, column descriptions). Iceberg: one
+/// new snapshot; run expire_snapshots afterwards to delete the old files.
+pub fn plan_compact(p: &Params) -> Result<Plan, E> {
+    let path = p.pos_text(0, "path")?;
+    let partition_level = p.int("partition_level");
+    let s3 = s3_params(p);
+    Ok(Plan::Action(
+        Box::new(move || compact(&path, partition_level, &s3)),
+        ["layout", "location", "files", "rows"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    ))
+}
+
+/// The partition level a dataset is written with (from the manifest's storage.partitioning).
+fn current_partition_level(manifest: &Json) -> Option<i64> {
+    let level = manifest.get("level").and_then(Json::as_i64)? as u8;
+    for p in manifest
+        .pointer("/storage/partitioning")
+        .and_then(Json::as_array)?
+        .iter()
+        .filter_map(Json::as_str)
+    {
+        if let Some(l) = p.strip_prefix("gid_prefix:") {
+            return l.parse().ok();
+        }
+        if let Some(w) = p
+            .strip_prefix("iceberg:truncate(")
+            .and_then(|r| r.split(',').next())
+            .and_then(|w| w.parse::<i64>().ok())
+        {
+            return (1..=level)
+                .find(|pl| truncate_width(level, *pl) == w)
+                .map(i64::from);
+        }
+    }
+    None
+}
+
+fn compact(
+    path: &str,
+    partition_level: Option<i64>,
+    s3: &S3Params,
+) -> Result<Vec<Vec<Option<String>>>, E> {
+    let lease = sql::lease()?;
+    let root = path.trim_end_matches('/').to_string();
+    let src = dataset::open(&lease, &root)?;
+    let manifest = src
+        .manifest
+        .clone()
+        .ok_or("compact_cell_dataset needs a dataset with a cell manifest")?;
+    let info = dataset::dataset_info(&lease, &src)?;
+    let layout = match src.layout {
+        dataset::Layout::Flat => "flat",
+        dataset::Layout::Partitioned(_) => "partitioned",
+        dataset::Layout::Iceberg { .. } => "iceberg",
+    };
+    let text = |v: Option<&Json>| v.and_then(Json::as_str).map(str::to_string);
+    let descriptions: serde_json::Map<String, Json> = info
+        .get("columns")
+        .and_then(Json::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| {
+            v.get("description")
+                .filter(|d| d.is_string())
+                .map(|d| (k.clone(), d.clone()))
+        })
+        .collect();
+    let object = |v: Option<&Json>| v.and_then(Json::as_object).cloned();
+    let fields = manifest
+        .get("value_fields")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let o = Options {
+        layout: layout.into(),
+        mode: "overwrite".into(),
+        domain_code: text(manifest.get("domain_code")),
+        level: None,
+        partition_level: partition_level.or_else(|| current_partition_level(&manifest)),
+        row_group_size: 8192,
+        value_semantics: "MEASUREMENT".into(),
+        aggregation_rule: None,
+        value_fields: Some(fields.to_string()),
+        notes: text(manifest.pointer("/provenance/notes")),
+        identity: if manifest
+            .pointer("/identity/packed_id_column")
+            .is_some_and(Json::is_null)
+        {
+            "compact".into()
+        } else {
+            "query".into()
+        },
+        column_metrics: if fields.as_array().map_or(0, Vec::len) > 96 {
+            "key".into()
+        } else {
+            "auto".into()
+        },
+        extra: crate::metadata::Extra {
+            descriptions: crate::metadata::PerColumn::parse(
+                (!descriptions.is_empty()).then(|| Json::Object(descriptions).to_string()),
+                "column_descriptions",
+            )?,
+            title: text(info.get("title")),
+            description: text(info.get("description")),
+            data_period: text(info.get("data_period")),
+            data_version: text(info.get("data_version")),
+            source: object(manifest.get("source")),
+            coverage: object(manifest.get("coverage")),
+            ..Default::default()
+        },
+        fill_nulls: true,
+        rollup_level: None,
+        space_aggregation: None,
+        space_weight: None,
+        value_semantics_given: false,
+        prev: None,
+        s3: s3.clone(),
+    };
+    let query = format!("SELECT * FROM read_cell_dataset({})", lit(&root));
+    write(&query, &root, &o)
+}
+
 /// Stage the query sorted by packed_id and run the identity checks.
 fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
     let stage = stage_table();
@@ -503,7 +770,13 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
         if c == "gid" || c == "packed_id" {
             continue;
         }
-        if o.fill_nulls && !IDENTITY.contains(&c.as_str()) && is_numeric_type(ty) {
+        // A rollup value stays NULL where no child has data (median: fewer than 3 children).
+        // Filling it with 0 would make that gap look like a measured zero.
+        if o.fill_nulls
+            && o.rollup_level.is_none()
+            && !IDENTITY.contains(&c.as_str())
+            && is_numeric_type(ty)
+        {
             select.push(format!("coalesce({0}, CAST(0 AS {ty})) AS {0}", ident(c)));
         } else {
             select.push(ident(c));
@@ -710,8 +983,71 @@ fn manifest(
             "notes": o.notes
         }
     });
+    if let Some((prev, _)) = &o.prev {
+        inherit(&mut m, prev, o);
+    }
     crate::metadata::apply(&mut m, &o.extra)?;
     Ok(m)
+}
+
+/// Keep the metadata of the dataset being appended to or overwritten: per column (same name)
+/// unit, semantics and aggregation rule; source, coverage, notes and the provenance rules.
+/// What this write passes explicitly wins (units/source/coverage are applied afterwards).
+fn inherit(m: &mut Json, prev: &Json, o: &Options) {
+    if o.value_fields.is_none() {
+        let old: std::collections::HashMap<&str, &Json> = prev
+            .get("value_fields")
+            .and_then(Json::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| Some((f.get("name")?.as_str()?, f)))
+            .collect();
+        if let Some(fields) = m.get_mut("value_fields").and_then(Json::as_array_mut) {
+            for f in fields {
+                let name = f
+                    .get("name")
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let Some(p) = old.get(name.as_str()) else {
+                    continue;
+                };
+                let mut keys = vec!["unit"];
+                if !o.value_semantics_given {
+                    keys.push("semantics");
+                }
+                if o.aggregation_rule.is_none() {
+                    keys.push("aggregation_rule");
+                }
+                for k in keys {
+                    if let Some(v) = p.get(k) {
+                        f[k] = v.clone();
+                    }
+                }
+            }
+        }
+    }
+    for section in ["source", "coverage"] {
+        if let Some(v) = prev.get(section).filter(|v| v.is_object()) {
+            m[section] = v.clone();
+        }
+    }
+    let pv = |k: &str| prev.pointer(&format!("/provenance/{k}")).cloned();
+    if o.notes.is_none() {
+        if let Some(v) = pv("notes") {
+            m["provenance"]["notes"] = v;
+        }
+    }
+    if o.aggregation_rule.is_none() {
+        if let Some(v) = pv("aggregation_rule") {
+            m["provenance"]["aggregation_rule"] = v;
+        }
+    }
+    if !o.value_semantics_given {
+        if let Some(v) = pv("value_semantics") {
+            m["provenance"]["value_semantics"] = v;
+        }
+    }
 }
 
 /// DuckDB numeric column types (as DESCRIBE prints them).
@@ -818,8 +1154,27 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
     let root = path.trim_end_matches('/').to_string();
     let result = (|| -> Result<Vec<Vec<Option<String>>>, E> {
         let store = Storage::for_path(&lease, &root, &o.s3)?;
+        // Metadata of the dataset being appended to or overwritten, kept by default.
+        let mut o = o.clone();
+        if o.mode != "create" {
+            if let Ok(src) = dataset::open(&lease, &root) {
+                if let Some(m) = src.manifest.clone() {
+                    let info = dataset::dataset_info(&lease, &src).unwrap_or(Json::Null);
+                    o.prev = Some((m, info));
+                }
+            }
+        }
+        let o = &o;
         // Stage (read the whole input) before clearing the target: the input may read the
         // dataset being overwritten (update / delete by rewriting it).
+        let rolled;
+        let query = match o.rollup_level {
+            Some(r) => {
+                rolled = rollup_query(&lease, query, r, o)?;
+                rolled.as_str()
+            }
+            None => query,
+        };
         let st = stage(&lease, query, o)?;
         if o.layout != "iceberg" {
             prepare_target(&lease, &root, o, &store)?;
@@ -868,7 +1223,7 @@ fn write_flat(
     write_json(
         lease,
         &join(root, crate::metadata::INFO_FILE),
-        &crate::metadata::info(None, &m, &o.extra),
+        &crate::metadata::info(o.prev.as_ref().map(|(_, i)| i), &m, &o.extra),
     )?;
     Ok(vec![vec![
         Some("flat".into()),
@@ -940,7 +1295,7 @@ fn write_partitioned(
     write_json(
         lease,
         &join(root, crate::metadata::INFO_FILE),
-        &crate::metadata::info(None, &m, &o.extra),
+        &crate::metadata::info(o.prev.as_ref().map(|(_, i)| i), &m, &o.extra),
     )?;
     // Partition index for readers that cannot list folders (plain HTTP).
     let list = serde_json::to_string(&prefixes)?;
@@ -1020,7 +1375,7 @@ fn plain(p: &str) -> &str {
 }
 
 /// Highest metadata version number in `<root>/metadata`.
-fn max_metadata_version(lease: &Lease, root: &str) -> Result<Option<u64>, E> {
+pub(crate) fn max_metadata_version(lease: &Lease, root: &str) -> Result<Option<u64>, E> {
     Ok(sql::query_text_on(
         lease,
         &format!(
@@ -1042,6 +1397,48 @@ fn max_metadata_version(lease: &Lease, root: &str) -> Result<Option<u64>, E> {
     .max())
 }
 
+/// A DataFile (path, counts, partition, metrics) from a manifest entry's data_file record.
+fn data_file_from_entry(df: &crate::avro::D) -> Option<DataFile> {
+    use crate::avro::D;
+    let path = match df.get("file_path")? {
+        D::Str(s) => s.clone(),
+        _ => return None,
+    };
+    let partition = df.get("partition")?.get(iceberg::PARTITION_FIELD)?.long()?;
+    let longs = |n: &str| -> Vec<(i64, i64)> {
+        match df.get(n) {
+            Some(D::Arr(items)) => items
+                .iter()
+                .filter_map(|kv| Some((kv.get("key")?.long()?, kv.get("value")?.long()?)))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let bytes = |n: &str| -> Vec<(i64, Vec<u8>)> {
+        match df.get(n) {
+            Some(D::Arr(items)) => items
+                .iter()
+                .filter_map(|kv| match kv.get("value")? {
+                    D::Bytes(b) => Some((kv.get("key")?.long()?, b.clone())),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    Some(DataFile {
+        path,
+        record_count: df.get("record_count")?.long()?,
+        size: df.get("file_size_in_bytes")?.long()?,
+        partition,
+        column_sizes: longs("column_sizes"),
+        value_counts: longs("value_counts"),
+        null_counts: longs("null_value_counts"),
+        lower: bytes("lower_bounds"),
+        upper: bytes("upper_bounds"),
+    })
+}
+
 fn write_iceberg(
     lease: &Lease,
     root: &str,
@@ -1050,6 +1447,9 @@ fn write_iceberg(
     store: &Storage,
 ) -> Result<Vec<Vec<Option<String>>>, E> {
     let stage = stage_table();
+    // Version of the hint the commit must still find (conditional write at the end).
+    let hint_path = join(root, "metadata/version-hint.text");
+    let hint_tag = store.version_tag(&hint_path)?;
     let existing = dataset::latest_iceberg_metadata(lease, root).ok();
     if existing.is_some() && o.mode == "create" {
         return Err(format!(
@@ -1117,6 +1517,32 @@ fn write_iceberg(
         }
         let (ty, cast) = iceberg_type(t)?;
         wanted.push((c.clone(), ty, cast));
+    }
+
+    // append / upsert: numbers of another numeric type (e.g. a DECIMAL literal) are cast to
+    // the table's column type instead of refusing the write.
+    if prev.is_some() && !overwrite {
+        let numeric =
+            |t: &str| matches!(t, "double" | "float" | "long" | "int") || t.starts_with("decimal");
+        let duck = |t: &str| -> Option<&'static str> {
+            match t {
+                "double" => Some("DOUBLE"),
+                "float" => Some("FLOAT"),
+                "long" => Some("BIGINT"),
+                "int" => Some("INTEGER"),
+                _ => None,
+            }
+        };
+        for w in wanted.iter_mut() {
+            if let Some(cf) = cur_fields.iter().find(|f| f.name == w.0) {
+                if cf.ty != w.1 && numeric(&cf.ty) && numeric(&w.1) {
+                    if let Some(d) = duck(&cf.ty) {
+                        w.1 = cf.ty.clone();
+                        w.2 = Some(d);
+                    }
+                }
+            }
+        }
     }
 
     // Field ids: reuse ids of unchanged columns; new or retyped columns get new ids.
@@ -1264,32 +1690,122 @@ fn write_iceberg(
         )
     };
 
-    // cell_values on append: no cell may already be in the table.
-    if let (Some((meta_path, _)), false) = (&prev, overwrite) {
-        dataset::load_iceberg_ext(lease)?;
-        let scan = match meta_path.rsplit_once("/metadata/") {
-            Some((dir, file)) => format!(
-                "iceberg_scan({}, version = {}, allow_moved_paths = true)",
-                lit(dir),
-                lit(file.strip_suffix(".metadata.json").unwrap_or(file))
-            ),
-            None => format!("iceberg_scan({})", lit(meta_path)),
+    // Append: no cell may already be in the table. Upsert: merge the staged rows with the
+    // rows of the partitions they touch (staged rows win); only those partitions are written.
+    let upsert = o.mode == "upsert";
+    if upsert && prev.is_none() {
+        return Err(format!("{root}: mode 'upsert' needs an existing Iceberg table").into());
+    }
+    if upsert && (schema_changed || spec_changed) {
+        return Err("mode 'upsert' keeps the table's columns, types and partition level; the input differs: use mode := 'overwrite'".into());
+    }
+    let mut replaced: std::collections::HashSet<String> = Default::default();
+    let mut replaced_rows = 0i64;
+    let mut staged_rows = st.rows;
+    if let (Some((meta_path, meta)), false) = (&prev, overwrite) {
+        let parts_in: Vec<i64> = rows(
+            lease,
+            &format!("SELECT DISTINCT packed_id - (packed_id % {width}) FROM {stage} ORDER BY 1"),
+        )?
+        .iter()
+        .map(|r| num(&r[0]))
+        .collect();
+        // files_for takes cell ids: give the first and last id of every partition so its
+        // packed_id bounds check covers whole partitions.
+        let span: Vec<i64> = parts_in.iter().flat_map(|p| [*p, p + width - 1]).collect();
+        let table = crate::icefast::load(lease, root, meta_path, meta)?;
+        let planned = table
+            .as_ref()
+            .map(|t| t.files_for(lease, &span))
+            .transpose()?
+            .flatten();
+        let scan = |files: &[String]| -> String {
+            match &table {
+                Some(t) => t.scan(files),
+                None => format!(
+                    "read_parquet([{}], hive_partitioning = false)",
+                    files.iter().map(|f| lit(f)).collect::<Vec<_>>().join(", ")
+                ),
+            }
         };
-        // Only the staged packed_id range can collide, so the scan prunes files outside it.
-        let r = one_row(
-            lease,
-            &format!("SELECT min(packed_id), max(packed_id) FROM {stage}"),
-        )?;
-        let (lo, hi) = (num(&r[0]), num(&r[1]));
-        let dup = num(&one_row(
-            lease,
-            &format!(
-                "SELECT count(*) FROM {stage} s JOIN (SELECT packed_id FROM {scan} \
-                 WHERE packed_id BETWEEN {lo} AND {hi}) t ON s.packed_id = t.packed_id"
-            ),
-        )?[0]);
-        if dup > 0 {
-            return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'overwrite' to replace it)").into());
+        match (planned, upsert) {
+            (Some(old_files), _) if old_files.is_empty() => {}
+            (Some(old_files), false) => {
+                let dup = num(&one_row(
+                    lease,
+                    &format!(
+                        "SELECT count(*) FROM {stage} s SEMI JOIN {} t ON s.packed_id = t.packed_id",
+                        scan(&old_files)
+                    ),
+                )?[0]);
+                if dup > 0 {
+                    return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'upsert' or 'overwrite')").into());
+                }
+            }
+            (Some(old_files), true) => {
+                let old = scan(&old_files);
+                let cols: Vec<String> = st
+                    .columns
+                    .iter()
+                    .map(|(c, _)| {
+                        let c = ident(c);
+                        if c == "\"packed_id\"" {
+                            "coalesce(n.packed_id, o.packed_id) AS packed_id".to_string()
+                        } else {
+                            format!("CASE WHEN n.packed_id IS NOT NULL THEN n.{c} ELSE o.{c} END AS {c}")
+                        }
+                    })
+                    .collect();
+                replaced_rows = num(&one_row(lease, &format!("SELECT count(*) FROM {old}"))?[0]);
+                // stage is `db.main."w_<uuid>"`: the merged table goes next to it.
+                let merged = match stage.strip_suffix('"') {
+                    Some(q) => format!("{q}_u\""),
+                    None => format!("{stage}_u"),
+                };
+                sql::exec_on(lease, &format!("DROP TABLE IF EXISTS {merged}"))?;
+                sql::exec_on(
+                    lease,
+                    &format!(
+                        "CREATE TABLE {merged} AS SELECT {} FROM {stage} n FULL JOIN (SELECT * FROM {old}) o ON n.packed_id = o.packed_id ORDER BY packed_id",
+                        cols.join(", ")
+                    ),
+                )?;
+                sql::exec_on(lease, &format!("DROP TABLE {stage}"))?;
+                let short = stage.rsplit('.').next().unwrap_or(&stage).to_string();
+                sql::exec_on(lease, &format!("ALTER TABLE {merged} RENAME TO {short}"))?;
+                staged_rows = num(&one_row(lease, &format!("SELECT count(*) FROM {stage}"))?[0]);
+                replaced = old_files.into_iter().collect();
+            }
+            (None, true) => {
+                return Err("this table cannot be planned (delete files or no partition values): use mode := 'overwrite'".into());
+            }
+            (None, false) => {
+                // Fallback for tables icefast cannot plan: iceberg_scan over the staged range.
+                dataset::load_iceberg_ext(lease)?;
+                let scan = match meta_path.rsplit_once("/metadata/") {
+                    Some((dir, file)) => format!(
+                        "iceberg_scan({}, version = {}, allow_moved_paths = true)",
+                        lit(dir),
+                        lit(file.strip_suffix(".metadata.json").unwrap_or(file))
+                    ),
+                    None => format!("iceberg_scan({})", lit(meta_path)),
+                };
+                let r = one_row(
+                    lease,
+                    &format!("SELECT min(packed_id), max(packed_id) FROM {stage}"),
+                )?;
+                let (lo, hi) = (num(&r[0]), num(&r[1]));
+                let dup = num(&one_row(
+                    lease,
+                    &format!(
+                        "SELECT count(*) FROM {stage} s JOIN (SELECT packed_id FROM {scan} \
+                         WHERE packed_id BETWEEN {lo} AND {hi}) t ON s.packed_id = t.packed_id"
+                    ),
+                )?[0]);
+                if dup > 0 {
+                    return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'overwrite' to replace it)").into());
+                }
+            }
         }
     }
 
@@ -1350,7 +1866,7 @@ fn write_iceberg(
             "level".into(),
             format!("iceberg:truncate({width},packed_id)"),
         ],
-        prev_total + st.rows,
+        prev_total - replaced_rows + staged_rows,
     )?;
 
     // Data files: one sorted file per partition, written by DuckDB (staged locally for S3).
@@ -1470,9 +1986,75 @@ fn write_iceberg(
             entries = iceberg::read_manifest_list(&bytes)?;
         }
     }
+    let mut carried: Vec<DataFile> = Vec::new();
+    let mut replaced_size = 0i64;
+    if upsert && !replaced.is_empty() {
+        let mut keep = Vec::new();
+        for e in entries {
+            let range = e
+                .partitions
+                .as_ref()
+                .and_then(|p| p.first())
+                .and_then(|(_, lo, hi)| {
+                    let f = |b: &Option<Vec<u8>>| {
+                        Some(i64::from_le_bytes(b.as_ref()?.get(..8)?.try_into().ok()?))
+                    };
+                    f(lo).zip(f(hi))
+                });
+            let touched = match range {
+                Some((lo, hi)) => parts.iter().any(|p| *p >= lo && *p <= hi),
+                None => true,
+            };
+            if !touched {
+                keep.push(e);
+                continue;
+            }
+            if e.spec_id != spec_id {
+                return Err("the table has files of an older partition spec: run compact_cell_dataset first".into());
+            }
+            let bytes = store.get(&relocate(&e.path))?;
+            let (_, recs) = crate::avro::read_container(&bytes)?;
+            let mut hit = false;
+            let mut rest = Vec::new();
+            let mut gone_size = 0i64;
+            for r in recs {
+                if r.get("status").and_then(crate::avro::D::long) == Some(2) {
+                    continue;
+                }
+                let Some(df) = r.get("data_file") else {
+                    continue;
+                };
+                let Some(f) = data_file_from_entry(df) else {
+                    return Err("cannot carry a manifest entry over (unexpected layout): use mode := 'overwrite'".into());
+                };
+                if replaced.contains(&relocate(&f.path)) {
+                    hit = true;
+                    gone_size += f.size;
+                } else {
+                    rest.push(f);
+                }
+            }
+            if hit {
+                carried.extend(rest);
+                replaced_size += gone_size;
+            } else {
+                keep.push(e);
+            }
+        }
+        entries = keep;
+    }
+    // Files kept from manifests an upsert touched: listed again in new manifests.
+    let mut written_carried = Vec::new();
+    for (k, chunk) in carried.chunks(MANIFEST_FILES).enumerate() {
+        let rel = format!("metadata/{write_uuid}-c{k}.avro");
+        let bytes = iceberg::manifest_bytes(chunk, snapshot_id, &schema, &spec, sync_marker());
+        let len = bytes.len() as i64;
+        store.put(&join(root, &rel), bytes)?;
+        written_carried.push((rel, len, chunk));
+    }
     let le = |v: i64| v.to_le_bytes().to_vec();
     let added_rows: i64 = files.iter().map(|f| f.record_count).sum();
-    for (rel, len, chunk) in &written {
+    for (rel, len, chunk) in written.iter().chain(written_carried.iter()) {
         entries.push(ManifestFile {
             path: join(&location, rel),
             length: *len,
@@ -1511,19 +2093,24 @@ fn write_iceberg(
         }
     };
     let mut summary = json!({
-        "operation": if overwrite { "overwrite" } else { "append" },
+        "operation": if overwrite || upsert { "overwrite" } else { "append" },
         "added-data-files": files.len().to_string(),
         "added-records": added_rows.to_string(),
         "added-files-size": added_size.to_string(),
         "changed-partition-count": parts.len().to_string(),
-        "total-records": (base("total-records") + added_rows).to_string(),
-        "total-data-files": (base("total-data-files") + files.len() as i64).to_string(),
-        "total-files-size": (base("total-files-size") + added_size).to_string(),
+        "total-records": (base("total-records") + added_rows - replaced_rows).to_string(),
+        "total-data-files": (base("total-data-files") + files.len() as i64 - replaced.len() as i64).to_string(),
+        "total-files-size": (base("total-files-size") + added_size - replaced_size).to_string(),
         "total-delete-files": "0",
         "total-position-deletes": "0",
         "total-equality-deletes": "0",
         "geosquare-writer": format!("geosquare_v2 duckdb extension {}", env!("CARGO_PKG_VERSION"))
     });
+    if upsert {
+        summary["deleted-data-files"] = json!(replaced.len().to_string());
+        summary["deleted-records"] = json!(replaced_rows.to_string());
+        summary["removed-files-size"] = json!(replaced_size.to_string());
+    }
     if overwrite {
         if let Some((_, m)) = &prev {
             summary["deleted-data-files"] = json!(summary_i64(m, "total-data-files").to_string());
@@ -1661,16 +2248,264 @@ fn write_iceberg(
     let stem = format!("{version:05}-{}", uuid4());
     let meta_rel = format!("metadata/{stem}.metadata.json");
     store.put(&join(root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
-    store.put(&join(root, "metadata/version-hint.text"), stem.into_bytes())?;
+    store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
     Ok(vec![vec![
         Some(if overwrite {
             "iceberg (overwrite)".into()
+        } else if upsert {
+            "iceberg (upsert)".into()
         } else {
             "iceberg".into()
         }),
         Some(join(root, &meta_rel)),
         Some(files.len().to_string()),
-        Some(st.rows.to_string()),
+        Some(staged_rows.to_string()),
+    ]])
+}
+
+// ---------------------------------------------------------------------------
+// alter_cell_dataset: drop, rename or add columns without rewriting data (Iceberg)
+// ---------------------------------------------------------------------------
+
+/// alter_cell_dataset(path, drop_columns := 'a,b' | '["a","b"]', rename_columns :=
+/// '{"old": "new"}', add_columns := '{"name": "DOUBLE"}'). Iceberg only: a new schema with the
+/// same field ids, so data files stay as they are and are read by field id (renamed columns
+/// under their new name, dropped columns left out, added columns 0 until rewritten). The cell
+/// manifest and the column descriptions follow.
+pub fn plan_alter(p: &Params) -> Result<Plan, E> {
+    let path = p.pos_text(0, "path")?;
+    let drop: Vec<String> = match p.text("drop_columns") {
+        None => Vec::new(),
+        Some(t) if t.trim_start().starts_with('[') => serde_json::from_str(&t)
+            .map_err(|_| "drop_columns must be 'a,b' or a JSON list of names")?,
+        Some(t) => t
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+    };
+    let rename: Vec<(String, String)> = match p.text("rename_columns") {
+        None => Vec::new(),
+        Some(t) => match serde_json::from_str::<Json>(&t) {
+            Ok(Json::Object(m)) => m
+                .into_iter()
+                .map(|(k, v)| {
+                    Ok((
+                        k,
+                        v.as_str()
+                            .ok_or("rename_columns values must be names")?
+                            .to_string(),
+                    ))
+                })
+                .collect::<Result<_, E>>()?,
+            _ => return Err("rename_columns must be a JSON object {\"old\": \"new\"}".into()),
+        },
+    };
+    let add: Vec<(String, String)> = match p.text("add_columns") {
+        None => Vec::new(),
+        Some(t) => match serde_json::from_str::<Json>(&t) {
+            Ok(Json::Object(m)) => m
+                .into_iter()
+                .map(|(k, v)| Ok((k, v.as_str().unwrap_or("DOUBLE").to_ascii_uppercase())))
+                .collect::<Result<_, E>>()?,
+            _ => return Err("add_columns must be a JSON object {\"name\": \"DOUBLE\"}".into()),
+        },
+    };
+    if drop.is_empty() && rename.is_empty() && add.is_empty() {
+        return Err("nothing to alter: pass drop_columns, rename_columns or add_columns".into());
+    }
+    let s3 = s3_params(p);
+    Ok(Plan::Action(
+        Box::new(move || alter(&path, &drop, &rename, &add, &s3)),
+        vec!["path".into(), "metadata".into(), "columns".into()],
+    ))
+}
+
+fn alter(
+    path: &str,
+    drop: &[String],
+    rename: &[(String, String)],
+    add: &[(String, String)],
+    s3: &S3Params,
+) -> Result<Vec<Vec<Option<String>>>, E> {
+    let lease = sql::lease()?;
+    let root = path.trim_end_matches('/').to_string();
+    let store = Storage::for_path(&lease, &root, s3)?;
+    let src = dataset::open(&lease, &root)?;
+    let dataset::Layout::Iceberg { metadata } = &src.layout else {
+        return Err("alter_cell_dataset changes Iceberg tables; rewrite a folder dataset with mode := 'overwrite'".into());
+    };
+    let hint_path = join(&root, "metadata/version-hint.text");
+    let hint_tag = store.version_tag(&hint_path)?;
+    let mut meta = dataset::metadata_json(&lease, metadata)?;
+    let sid = meta
+        .get("current-schema-id")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let schemas = meta
+        .get("schemas")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let current = schemas
+        .iter()
+        .find(|s| s.get("schema-id").and_then(Json::as_i64) == Some(sid))
+        .ok_or("current schema not found")?;
+    let mut fields: Vec<Json> = current
+        .get("fields")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let name_of = |f: &Json| {
+        f.get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let protected = ["gid", "packed_id", "x_idx", "y_idx"];
+    for d in drop {
+        if protected.contains(&d.as_str()) {
+            return Err(format!("{d} is a cell id column and cannot be dropped").into());
+        }
+        let n = fields.len();
+        fields.retain(|f| &name_of(f) != d);
+        if fields.len() == n {
+            return Err(format!("drop_columns: no column {d}").into());
+        }
+    }
+    for (old, new) in rename {
+        if protected.contains(&old.as_str()) || protected.contains(&new.as_str()) {
+            return Err(format!("cell id columns cannot be renamed ({old} -> {new})").into());
+        }
+        if fields.iter().any(|f| &name_of(f) == new) {
+            return Err(format!("rename_columns: {new} already exists").into());
+        }
+        let f = fields
+            .iter_mut()
+            .find(|f| &name_of(f) == old)
+            .ok_or_else(|| format!("rename_columns: no column {old}"))?;
+        f["name"] = json!(new);
+        if let Some(o) = f.as_object_mut() {
+            o.remove("doc");
+        }
+    }
+    let mut last_id = meta
+        .get("last-column-id")
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let mut added_fields = Vec::new();
+    for (name, ty) in add {
+        if fields.iter().any(|f| &name_of(f) == name) {
+            return Err(format!("add_columns: {name} already exists").into());
+        }
+        let ice = match ty.as_str() {
+            "DOUBLE" => "double",
+            "FLOAT" | "REAL" => "float",
+            "BIGINT" | "LONG" => "long",
+            "INTEGER" | "INT" => "int",
+            other => {
+                return Err(format!(
+                    "add_columns: type {other} is not supported (DOUBLE, FLOAT, BIGINT, INTEGER)"
+                )
+                .into())
+            }
+        };
+        last_id += 1;
+        fields.push(
+            json!({"id": last_id, "name": name, "required": false, "type": ice,
+                           "initial-default": 0, "write-default": 0}),
+        );
+        added_fields.push((name.clone(), ice));
+    }
+    let new_sid = schemas
+        .iter()
+        .filter_map(|s| s.get("schema-id").and_then(Json::as_i64))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut schema = json!({"type": "struct", "schema-id": new_sid, "fields": fields});
+    if let Some(ids) = current.get("identifier-field-ids") {
+        schema["identifier-field-ids"] = ids.clone();
+    }
+
+    // Cell manifest and dataset_info follow the columns.
+    let prop = |m: &Json, k: &str| -> Option<Json> {
+        m.pointer(&format!("/properties/{}", k.replace('/', "~1")))
+            .and_then(Json::as_str)
+            .and_then(|t| serde_json::from_str(t).ok())
+    };
+    let mut manifest = prop(&meta, MANIFEST_KEY).ok_or("the table has no cell manifest")?;
+    let mut info = prop(&meta, crate::metadata::INFO_KEY).unwrap_or_else(|| json!({}));
+    if let Some(vf) = manifest
+        .get_mut("value_fields")
+        .and_then(Json::as_array_mut)
+    {
+        vf.retain(|f| {
+            !drop
+                .iter()
+                .any(|d| f.get("name").and_then(Json::as_str) == Some(d))
+        });
+        for f in vf.iter_mut() {
+            if let Some((_, new)) = rename
+                .iter()
+                .find(|(o, _)| f.get("name").and_then(Json::as_str) == Some(o))
+            {
+                f["name"] = json!(new);
+            }
+        }
+        for (name, ice) in &added_fields {
+            vf.push(json!({"name": name, "parquet_type": ice, "logical_type": "numeric", "semantics": "MEASUREMENT",
+                           "aggregation_rule": null, "unit": null, "nullable": true}));
+        }
+    }
+    if let Some(cols) = info.get_mut("columns").and_then(Json::as_object_mut) {
+        for d in drop {
+            cols.remove(d);
+        }
+        for (o, n) in rename {
+            if let Some(v) = cols.remove(o) {
+                cols.insert(n.clone(), v);
+            }
+        }
+        for (name, _) in &added_fields {
+            cols.insert(name.clone(), json!({"description": null, "unit": null}));
+        }
+    }
+    crate::metadata::schema_docs(&mut schema, &info);
+
+    let now = now_ms();
+    let obj = meta.as_object_mut().ok_or("metadata is not an object")?;
+    obj.get_mut("schemas")
+        .and_then(Json::as_array_mut)
+        .ok_or("schemas")?
+        .push(schema);
+    obj.insert("current-schema-id".into(), json!(new_sid));
+    obj.insert("last-column-id".into(), json!(last_id));
+    let props = obj
+        .entry("properties")
+        .or_insert(json!({}))
+        .as_object_mut()
+        .ok_or("properties")?;
+    props.insert(MANIFEST_KEY.into(), json!(manifest.to_string()));
+    props.insert(crate::metadata::INFO_KEY.into(), json!(info.to_string()));
+    props.insert("geosquare.read-by-field-id".into(), json!("true"));
+    let prev_ts = obj.get("last-updated-ms").cloned().unwrap_or(json!(now));
+    obj.insert("last-updated-ms".into(), json!(now));
+    obj.entry("metadata-log")
+        .or_insert(json!([]))
+        .as_array_mut()
+        .ok_or("metadata-log")?
+        .push(json!({"metadata-file": metadata, "timestamp-ms": prev_ts}));
+    let version = max_metadata_version(&lease, &root)?.map_or(0, |v| v + 1);
+    let stem = format!("{version:05}-{}", uuid4());
+    let meta_rel = format!("metadata/{stem}.metadata.json");
+    store.put(&join(&root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
+    store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
+    let n = manifest["value_fields"].as_array().map_or(0, Vec::len);
+    Ok(vec![vec![
+        Some(root.clone()),
+        Some(join(&root, &meta_rel)),
+        Some(n.to_string()),
     ]])
 }
 
@@ -1707,6 +2542,8 @@ fn update_metadata(
     let src = dataset::open(&lease, &root)?;
     match &src.layout {
         dataset::Layout::Iceberg { metadata } => {
+            let hint_path = join(&root, "metadata/version-hint.text");
+            let hint_tag = store.version_tag(&hint_path)?;
             let mut meta = dataset::metadata_json(&lease, metadata)?;
             let prop = |m: &Json, k: &str| -> Option<Json> {
                 m.pointer(&format!("/properties/{}", k.replace('/', "~1")))
@@ -1774,10 +2611,7 @@ fn update_metadata(
             let stem = format!("{version:05}-{}", uuid4());
             let meta_rel = format!("metadata/{stem}.metadata.json");
             store.put(&join(&root, &meta_rel), serde_json::to_vec_pretty(&meta)?)?;
-            store.put(
-                &join(&root, "metadata/version-hint.text"),
-                stem.into_bytes(),
-            )?;
+            store.put_if(&hint_path, stem.into_bytes(), hint_tag.as_deref())?;
             let n = manifest["value_fields"].as_array().map_or(0, Vec::len);
             Ok(vec![vec![
                 Some(root.clone()),

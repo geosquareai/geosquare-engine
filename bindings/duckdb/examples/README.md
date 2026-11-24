@@ -34,7 +34,7 @@ const gs = await GeosquareCells.open({
   extension: '/opt/geosquare_v2.duckdb_extension',            // or the repository URL: INSTALL ... FROM
   s3: { provider: 'credential_chain', region: 'ap-southeast-3' },
 });
-const PEOPLE = 's3://geosquare-data/apps-data/data_v2/data_name=50m_people_v2023';
+const PEOPLE = 's3://geosquare-data/apps-data/data_v2/data_name=people_v2023';
 const total = await gs.summarize(PEOPLE, { geojson: polygon }, ['people_counts', 'people_gen_z_night']);
 const km = await gs.rollup(PEOPLE, { geojson: polygon }, ['people_counts'], 9);
 await gs.write("SELECT packed_id, sales FROM read_parquet('sales.parquet')", 's3://bucket/v2/sales',
