@@ -180,7 +180,13 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
     .into_iter()
     .filter_map(|r| r.into_iter().next().flatten())
     .collect();
-    let identity = ["gid", "packed_id", "x_idx", "y_idx"];
+    // A time cube: one row per (cell, period), periods of one type inside the declared range.
+    let grain = crate::timequery::grain_of(Some(&m))?;
+    let identity: &[&str] = if grain.is_some() {
+        &["gid", "packed_id", "x_idx", "y_idx", "period"]
+    } else {
+        &["gid", "packed_id", "x_idx", "y_idx"]
+    };
     let missing: Vec<&String> = fields.iter().filter(|f| !cols.contains(f)).collect();
     let extra: Vec<&String> = cols
         .iter()
@@ -268,11 +274,30 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
     } else {
         format!("count(*) FILTER (WHERE length(gid) <> {level})")
     };
+    let (distinct_key, period_check) = match &grain {
+        Some(g) if has("period") => {
+            let range = match (
+                m.get("period_start").and_then(Json::as_str),
+                m.get("period_end").and_then(Json::as_str),
+            ) {
+                (Some(a), Some(b)) => format!(" OR period < {} OR period >= {}", lit(a), lit(b)),
+                _ => String::new(),
+            };
+            (
+                format!("({key}, period)"),
+                format!(
+                    "count(*) FILTER (WHERE period IS NULL OR NOT period_valid(period, {}){range})",
+                    lit(&g.spec())
+                ),
+            )
+        }
+        _ => (key.to_string(), "0".to_string()),
+    };
     let r = sql::query_text_on(
         &lease,
         &format!(
-            "SELECT count(*), count(DISTINCT {key}), {pack_check}, {level_check}, {null_sum}, \
-             count(*) FILTER (WHERE {key} IS NULL) FROM {from}"
+            "SELECT count(*), count(DISTINCT {distinct_key}), {pack_check}, {level_check}, {null_sum}, \
+             count(*) FILTER (WHERE {key} IS NULL), {period_check} FROM {from}"
         ),
     )?;
     let v: Vec<i64> = r
@@ -282,8 +307,8 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
         .into_iter()
         .map(|x| x.and_then(|s| s.parse().ok()).unwrap_or(0))
         .collect();
-    let (rows, distinct, bad_pack, bad_level, null_values, null_ids) =
-        (v[0], v[1], v[2], v[3], v[4], v[5]);
+    let (rows, distinct, bad_pack, bad_level, null_values, null_ids, bad_periods) =
+        (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
     let declared = m.pointer("/storage/row_count").and_then(Json::as_i64);
     checks.push((
         "row_count".into(),
@@ -293,11 +318,33 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
             declared.map_or("nothing".into(), |d| d.to_string())
         ),
     ));
-    checks.push((
-        "unique_cells".into(),
-        distinct == rows && null_ids == 0,
-        format!("{distinct} distinct of {rows}; {null_ids} without id"),
-    ));
+    if let Some(g) = &grain {
+        checks.push((
+            "unique_cell_periods".into(),
+            distinct == rows && null_ids == 0,
+            format!("{distinct} distinct (cell, period) of {rows}; {null_ids} without id"),
+        ));
+        checks.push((
+            "periods".into(),
+            has("period") && bad_periods == 0,
+            if has("period") {
+                format!(
+                    "{bad_periods} rows with no {} label inside [{}, {})",
+                    g.spec(),
+                    m.get("period_start").and_then(Json::as_str).unwrap_or("?"),
+                    m.get("period_end").and_then(Json::as_str).unwrap_or("?")
+                )
+            } else {
+                "the data has no period column".into()
+            },
+        ));
+    } else {
+        checks.push((
+            "unique_cells".into(),
+            distinct == rows && null_ids == 0,
+            format!("{distinct} distinct of {rows}; {null_ids} without id"),
+        ));
+    }
     checks.push((
         "gid_matches_packed_id".into(),
         bad_pack == 0,

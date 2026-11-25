@@ -2340,7 +2340,7 @@ fn write_iceberg(
         let table = crate::icefast::load(lease, root, meta_path, meta)?;
         let planned = table
             .as_ref()
-            .map(|t| t.files_for(lease, &span))
+            .map(|t| t.files_for(lease, &span, None))
             .transpose()?
             .flatten();
         let scan = |files: &[String]| -> String {
