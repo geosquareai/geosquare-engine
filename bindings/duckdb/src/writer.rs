@@ -20,6 +20,7 @@ use crate::{
     sql::{self, ident, lit, Lease, Params, Plan, E},
     storage::{is_local, local, S3Params, Storage},
 };
+use crate::timecube::Grain;
 use geosquare_core::{codec, domain::Domain, packing, topology};
 use serde_json::{json, Value as Json};
 use std::{
@@ -104,13 +105,52 @@ pub struct Options {
     version: String,
     /// Governance and lineage parameters (manifest 1.1).
     gov: manifest11::Params,
+    /// Time cube (`cell_time_values`): one row per (cell, period). Set by `period_type`, or
+    /// taken from the dataset being appended to or overwritten.
+    time: Option<TimeOpt>,
+}
+
+/// Time settings of a write (`period_type`, `bucket_hours`, `period_start`, `period_end`,
+/// `time_chunk`, `time_aggregation`).
+#[derive(Clone)]
+struct TimeOpt {
+    grain: Grain,
+    start: Option<String>,
+    end: Option<String>,
+    /// Width of the label prefix one data file holds (0 none, 4 year, 7 month, 10 day).
+    chunk: usize,
+    /// `time_aggregation` of MEASUREMENT columns: one word (mean, min, max) or `{column: rule}`.
+    aggregation: Option<String>,
+}
+
+fn chunk_width(name: &str, grain: &Grain) -> Result<usize, E> {
+    let w = match name {
+        "none" => 0,
+        "year" => 4,
+        "month" => 7,
+        "day" => 10,
+        other => return Err(format!("time_chunk must be 'none', 'year', 'month' or 'day'; received {other:?}").into()),
+    };
+    // A chunk finer than the period type holds one period: use the period itself.
+    Ok(w.min(grain.width()))
+}
+
+fn chunk_name(w: usize) -> &'static str {
+    match w {
+        0 => "none",
+        4 => "year",
+        7 => "month",
+        10 => "day",
+        _ => "period",
+    }
 }
 
 /// Data files per Iceberg manifest (see write_iceberg).
 const MANIFEST_FILES: usize = 128;
 
 /// Cell id columns, which always get full Iceberg metrics.
-const KEY_COLUMNS: [&str; 4] = ["packed_id", "gid", "x_idx", "y_idx"];
+// `period` (time cubes): its bounds let readers skip files outside a period range.
+const KEY_COLUMNS: [&str; 5] = ["packed_id", "gid", "x_idx", "y_idx", "period"];
 
 pub(crate) fn s3_params_pub(p: &Params) -> S3Params {
     s3_params(p)
@@ -185,7 +225,31 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
         version: "1.0".into(),
         gov,
         s3: s3_params(p),
+        time: match p.text("period_type") {
+            Some(t) => {
+                let grain = Grain::parse(&t, p.int("bucket_hours"))?;
+                let chunk = p.text("time_chunk").unwrap_or_else(|| "month".into());
+                Some(TimeOpt {
+                    chunk: chunk_width(&chunk.to_ascii_lowercase(), &grain)?,
+                    grain,
+                    start: p.text("period_start"),
+                    end: p.text("period_end"),
+                    aggregation: p.text("time_aggregation"),
+                })
+            }
+            None => {
+                for k in ["bucket_hours", "period_start", "period_end", "time_chunk", "time_aggregation"] {
+                    if p.get(k).is_some() {
+                        return Err(format!("{k} is for time cubes: pass period_type := 'day' (or year, month, hour)").into());
+                    }
+                }
+                None
+            }
+        },
     };
+    if o.time.is_some() && o.manifest_version.as_deref() == Some("1.1") {
+        return Err("time cubes are written as manifest 1.0; manifest_version := '1.1' is not supported for them yet".into());
+    }
     if !matches!(o.identity.as_str(), "query" | "compact") {
         return Err(
             "identity must be 'query' (gid, packed_id, x_idx, y_idx) or 'compact' (gid only)"
@@ -494,6 +558,29 @@ struct Staged {
     columns: Vec<(String, String)>,
     /// Identity columns that were not in the query and were derived.
     derived: Vec<&'static str>,
+    /// Time cube facts of the staged rows.
+    time: Option<StagedTime>,
+}
+
+struct StagedTime {
+    grain: Grain,
+    /// The declared or derived `[period_start, period_end)`.
+    start: String,
+    end: String,
+    /// Label prefix width per data file (0: not chunked).
+    chunk: usize,
+    aggregation: Option<String>,
+}
+
+impl StagedTime {
+    /// SQL condition selecting one chunk of the stage.
+    fn chunk_filter(&self, chunk: &str) -> String {
+        if self.chunk == 0 {
+            "TRUE".into()
+        } else {
+            format!("left(period, {}) = {}", self.chunk, lit(chunk))
+        }
+    }
 }
 
 impl Staged {
@@ -727,6 +814,8 @@ fn compact(
         version: "1.0".into(),
         gov: Default::default(),
         s3: s3.clone(),
+        // Taken from the dataset (period type, chunking) by inherit_time; the range is kept.
+        time: None,
     };
     let query = format!("SELECT * FROM read_cell_dataset({})", lit(&root));
     write(&query, &root, &o)
@@ -747,6 +836,9 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
     }
     if let Some((c, _)) = cols.iter().find(|(c, _)| RESERVED.contains(&c.as_str())) {
         return Err(format!("column {c:?} is a reserved cell-dataset name; rename it").into());
+    }
+    if o.time.is_some() && !has("period") {
+        return Err("a time cube needs a period column (labels such as 2026-11-19; pass period_type)".into());
     }
     let domain = match &o.domain_code {
         Some(c) => domain_by_code(c)?,
@@ -798,6 +890,10 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
         }
         // A rollup value stays NULL where no child has data (median: fewer than 3 children).
         // Filling it with 0 would make that gap look like a measured zero.
+        if o.time.is_some() && c == "period" {
+            select.push("CAST(period AS VARCHAR) AS period".into());
+            continue;
+        }
         if o.fill_nulls
             && o.rollup_level.is_none()
             && !IDENTITY.contains(&c.as_str())
@@ -812,8 +908,9 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
     sql::exec_on(
         lease,
         &format!(
-            "CREATE TABLE {stage} AS SELECT {} FROM ({src}) ORDER BY packed_id",
-            select.join(", ")
+            "CREATE TABLE {stage} AS SELECT {} FROM ({src}) ORDER BY packed_id{}",
+            select.join(", "),
+            if o.time.is_some() { ", period" } else { "" }
         ),
     )?;
 
@@ -868,13 +965,19 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
         )
         .into());
     }
-    if distinct != n {
-        return Err(format!(
-            "{} duplicate cells: a cell_values dataset needs one row per cell (aggregate first)",
-            n - distinct
-        )
-        .into());
-    }
+    let time = match &o.time {
+        Some(t) => Some(stage_time(lease, &stage, t, n)?),
+        None => {
+            if distinct != n {
+                return Err(format!(
+                    "{} duplicate cells: a cell_values dataset needs one row per cell (aggregate first)",
+                    n - distinct
+                )
+                .into());
+            }
+            None
+        }
+    };
     let level = level_u8(num(&r[2]) as i32)?;
     if let Some(l) = o.level {
         if l != level as i64 {
@@ -887,6 +990,69 @@ fn stage(lease: &Lease, query: &str, o: &Options) -> Result<Staged, E> {
         rows: n,
         columns: describe(lease, &format!("SELECT * FROM {stage}"))?,
         derived,
+        time,
+    })
+}
+
+/// Check the periods of the staged rows (labels, range, one row per (cell, period)) and
+/// work out the range and the chunks.
+fn stage_time(lease: &Lease, stage: &str, t: &TimeOpt, n: i64) -> Result<StagedTime, E> {
+    use crate::timecube::{next_label, parse_label};
+    let spec = lit(&t.grain.spec());
+    let r = one_row(
+        lease,
+        &format!(
+            "SELECT count(*) FILTER (WHERE period IS NULL), count(*) FILTER (WHERE NOT period_valid(period, {spec})), \
+             min(period), max(period) FROM {stage}"
+        ),
+    )?;
+    if num(&r[0]) > 0 {
+        return Err(format!("{} rows have no period", num(&r[0])).into());
+    }
+    if num(&r[1]) > 0 {
+        let bad = one_row(
+            lease,
+            &format!("SELECT any_value(period) FROM {stage} WHERE NOT period_valid(period, {spec})"),
+        )?;
+        let example = bad[0].clone().unwrap_or_default();
+        let why = parse_label(&example, &t.grain).err().map_or(String::new(), |e| e.to_string());
+        return Err(format!("{} rows have a period that is not a {} label, e.g. {why}", num(&r[1]), t.grain.spec()).into());
+    }
+    let (lo, hi) = (r[2].clone().unwrap_or_default(), r[3].clone().unwrap_or_default());
+    let start = match &t.start {
+        Some(s) => {
+            parse_label(s, &t.grain).map_err(|e| format!("period_start: {e}"))?;
+            s.clone()
+        }
+        None => lo.clone(),
+    };
+    let end = match &t.end {
+        Some(e) => {
+            parse_label(e, &t.grain).map_err(|e| format!("period_end: {e}"))?;
+            e.clone()
+        }
+        None => next_label(&hi, &t.grain)?,
+    };
+    if start >= end {
+        return Err(format!("period_start {start} must be before period_end {end}; the range is half-open and must not be empty").into());
+    }
+    if lo < start || hi >= end {
+        return Err(format!("periods {lo} to {hi} are not all inside [{start}, {end})").into());
+    }
+    let distinct = num(&one_row(lease, &format!("SELECT count(*) FROM (SELECT DISTINCT packed_id, period FROM {stage})"))?[0]);
+    if distinct != n {
+        return Err(format!(
+            "{} duplicate (cell, period) pairs: a time cube holds one row per cell and period (aggregate first)",
+            n - distinct
+        )
+        .into());
+    }
+    Ok(StagedTime {
+        grain: t.grain,
+        start,
+        end,
+        chunk: t.chunk,
+        aggregation: t.aggregation.clone(),
     })
 }
 
@@ -926,6 +1092,7 @@ fn value_fields(st: &Staged, o: &Options) -> Result<Json, E> {
             st.columns
                 .iter()
                 .filter(|(c, _)| !IDENTITY.contains(&c.as_str()) && c != "uri")
+                .filter(|(c, _)| st.time.is_none() || c != "period")
                 .map(|(c, t)| {
                     let numeric = is_numeric(t);
                     json!({
@@ -1026,6 +1193,9 @@ fn manifest(
         inherit(&mut m, prev, o);
     }
     crate::metadata::apply(&mut m, &o.extra)?;
+    if let Some(t) = &st.time {
+        time_manifest(&mut m, t, o)?;
+    }
     if let Some(f) = facts {
         let prev = o.prev.as_ref().map(|(p, _)| p);
         let governance = manifest11::governance(&o.gov, o.extra.title.as_deref(), prev);
@@ -1033,6 +1203,77 @@ fn manifest(
         manifest11::apply(&mut m, f, governance, derived);
     }
     Ok(m)
+}
+
+/// The `cell_time_values` fields of a manifest (geosquare-v2 docs/time-cube.md section 6),
+/// with `time_aggregation` per value field and, when appending, the union of both ranges.
+fn time_manifest(m: &mut Json, t: &StagedTime, o: &Options) -> Result<(), E> {
+    let (mut start, mut end) = (t.start.clone(), t.end.clone());
+    let prev = o.prev.as_ref().map(|(p, _)| p).filter(|_| o.mode != "overwrite");
+    if let Some(p) = prev {
+        if let (Some(a), Some(b)) = (
+            p.get("period_start").and_then(Json::as_str),
+            p.get("period_end").and_then(Json::as_str),
+        ) {
+            start = start.min(a.to_string());
+            end = end.max(b.to_string());
+        }
+    }
+    m["dataset_type"] = json!("cell_time_values");
+    m["period_type"] = json!(t.grain.name());
+    m["bucket_hours"] = json!(t.grain.bucket);
+    m["timezone"] = json!("UTC");
+    m["period_start"] = json!(start);
+    m["period_end"] = json!(end);
+    m["identity"]["period_column"] = json!("period");
+    m["identity"]["unique_gid"] = json!(false);
+    m["identity"]["unique_key"] = json!(["gid", "period"]);
+    m["storage"]["sorted_by"] = json!(["gid", "period"]);
+    m["storage"]["time_chunk"] = json!(chunk_name(t.chunk));
+    if let Some(o) = m["storage"].as_object_mut() {
+        o.remove("unique_cell_count");
+    }
+    if o.layout == "flat" {
+        m["storage"]["partitioning"] = json!([]);
+    } else if t.chunk > 0 {
+        if let Some(a) = m["storage"]["partitioning"].as_array_mut() {
+            a.push(json!(format!("period:{}", chunk_name(t.chunk))));
+        }
+    }
+    // time_aggregation: the parameter (word or {column: rule}), else what the dataset had.
+    let map = match t.aggregation.as_deref().map(str::trim) {
+        Some(x) if x.starts_with('{') => match serde_json::from_str::<Json>(x) {
+            Ok(Json::Object(m)) => Some(m),
+            _ => return Err("time_aggregation must be mean, min, max or a JSON object {column: rule}".into()),
+        },
+        _ => None,
+    };
+    let kept = |name: &str| -> Option<Json> {
+        prev?.get("value_fields")?.as_array()?.iter()
+            .find(|f| f.get("name").and_then(Json::as_str) == Some(name))?
+            .get("time_aggregation").cloned()
+    };
+    if let Some(fields) = m.get_mut("value_fields").and_then(Json::as_array_mut) {
+        for f in fields {
+            let name = f.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+            let measurement = f.get("semantics").and_then(Json::as_str) == Some("MEASUREMENT");
+            let given = match (&map, &t.aggregation) {
+                (Some(m), _) => m.get(&name).and_then(Json::as_str).map(str::to_string),
+                (None, Some(word)) if measurement => Some(word.trim().to_string()),
+                _ => None,
+            };
+            if let Some(g) = &given {
+                if !matches!(g.as_str(), "mean" | "min" | "max") {
+                    return Err(format!("time_aggregation of {name} must be mean, min or max; received {g:?}").into());
+                }
+            }
+            f["time_aggregation"] = match given {
+                Some(g) => json!(g),
+                None => kept(&name).unwrap_or(Json::Null),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Keep the metadata of the dataset being appended to or overwritten: per column (same name)
@@ -1210,6 +1451,7 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
             }
         }
         o.version = resolve_version(&o, &root)?;
+        inherit_time(&mut o)?;
         let o = &o;
         // Stage (read the whole input) before clearing the target: the input may read the
         // dataset being overwritten (update / delete by rewriting it).
@@ -1246,6 +1488,65 @@ fn write(query: &str, path: &str, o: &Options) -> Result<Vec<Vec<Option<String>>
     })();
     let _ = sql::exec_on(&lease, &format!("DROP TABLE IF EXISTS {stage_name}"));
     result
+}
+
+/// Time settings for a write to an existing dataset: appends, upserts and compactions of a
+/// time cube keep its period type and chunking; a different period type is refused (overwrite
+/// may change it).
+fn inherit_time(o: &mut Options) -> Result<(), E> {
+    let Some((prev, _)) = &o.prev else {
+        flat_time_identity(o);
+        return Ok(());
+    };
+    let prev_time = prev.get("dataset_type").and_then(Json::as_str) == Some("cell_time_values");
+    let replace = o.mode == "overwrite";
+    match (&mut o.time, prev_time) {
+        (None, true) => {
+            let grain = Grain::new(
+                prev.get("period_type").and_then(Json::as_str).unwrap_or(""),
+                prev.get("bucket_hours").and_then(Json::as_i64),
+            )?;
+            let chunk = prev
+                .pointer("/storage/time_chunk")
+                .and_then(Json::as_str)
+                .unwrap_or("month");
+            let keep = |k: &str| replace.then(|| prev.get(k).and_then(Json::as_str).map(str::to_string)).flatten();
+            o.time = Some(TimeOpt {
+                chunk: chunk_width(chunk, &grain)?,
+                grain,
+                // Rewriting the dataset (compaction) keeps its declared range.
+                start: keep("period_start"),
+                end: keep("period_end"),
+                aggregation: None,
+            });
+        }
+        (Some(t), true) if !replace => {
+            let pt = prev.get("period_type").and_then(Json::as_str).unwrap_or("");
+            let pb = prev.get("bucket_hours").and_then(Json::as_i64);
+            if Grain::new(pt, pb)? != t.grain {
+                return Err(format!(
+                    "the dataset holds {pt} periods{}; this write gives {}: use mode := 'overwrite' to change it",
+                    pb.map_or(String::new(), |b| format!(" of {b} hours")),
+                    t.grain.spec()
+                )
+                .into());
+            }
+        }
+        (Some(_), false) if !replace && matches!(o.mode.as_str(), "append" | "upsert") => {
+            return Err("the dataset is a cell_values dataset (no periods): append or upsert rows without period_type, or overwrite it".into());
+        }
+        _ => {}
+    }
+    flat_time_identity(o);
+    Ok(())
+}
+
+/// The flat time cube is the spec file (gid, period and the values): no packed_id, x_idx or
+/// y_idx columns in the manifest identity.
+fn flat_time_identity(o: &mut Options) {
+    if o.time.is_some() && o.layout == "flat" {
+        o.identity = "compact".into();
+    }
 }
 
 impl Options {
@@ -1439,6 +1740,9 @@ fn write_flat(
 ) -> Result<Vec<Vec<Option<String>>>, E> {
     let stage = stage_table();
     let vf = value_fields(st, o)?;
+    if st.time.is_some() {
+        return write_flat_time(lease, root, st, o, vf);
+    }
     let file = FileSpec {
         path: "data/part-00000.parquet".into(),
         predicate: "TRUE".into(),
@@ -1452,6 +1756,47 @@ fn write_flat(
             "COPY (SELECT {} FROM {stage} ORDER BY packed_id) TO {} ({})",
             folder_columns(st, o),
             lit(&join(root, "data/part-00000.parquet")),
+            parquet_options(o, &m, "")
+        ),
+    )?;
+    write_manifest(lease, root, &m)?;
+    write_json(
+        lease,
+        &join(root, crate::metadata::INFO_FILE),
+        &crate::metadata::info(o.prev.as_ref().map(|(_, i)| i), &m, &o.extra),
+    )?;
+    Ok(vec![vec![
+        Some("flat".into()),
+        Some(root.to_string()),
+        Some("1".into()),
+        Some(st.rows.to_string()),
+    ]])
+}
+
+/// The flat time cube, as geosquare_v2.time_store writes it: `data/time_values.parquet` with
+/// exactly `gid`, `period` and the value fields, sorted by gid then period.
+fn write_flat_time(
+    lease: &Lease,
+    root: &str,
+    st: &Staged,
+    o: &Options,
+    vf: Json,
+) -> Result<Vec<Vec<Option<String>>>, E> {
+    let stage = stage_table();
+    let names: Vec<String> = vf
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("name").and_then(Json::as_str).map(ident))
+        .collect();
+    let m = manifest(st, o, vf, vec![], st.rows, None)?;
+    ensure_dir(&join(root, "data"))?;
+    sql::exec_on(
+        lease,
+        &format!(
+            "COPY (SELECT gid, period, {} FROM {stage} ORDER BY packed_id, period) TO {} ({})",
+            names.join(", "),
+            lit(&join(root, &format!("data/{}", dataset::TIME_FILE))),
             parquet_options(o, &m, "")
         ),
     )?;
@@ -1492,24 +1837,41 @@ fn write_partitioned(
     let stage = stage_table();
     let mut staging = Staging::new(root)?;
     let l = partition_level(st, o)?;
-    let prefixes: Vec<String> = rows(
+    // (prefix, chunk) pairs: one file each. Without periods the chunk is empty.
+    let pairs: Vec<(String, String)> = rows(
         lease,
-        &format!("SELECT DISTINCT left(gid, {l}) FROM {stage} ORDER BY 1"),
+        &format!(
+            "SELECT DISTINCT left(gid, {l}), {} FROM {stage} ORDER BY 1, 2",
+            match &st.time {
+                Some(t) if t.chunk > 0 => format!("left(period, {})", t.chunk),
+                _ => "''".into(),
+            }
+        ),
     )?
     .into_iter()
-    .filter_map(|r| r.into_iter().next().flatten())
+    .map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default()))
     .collect();
-    let mut jobs = Vec::with_capacity(prefixes.len());
-    let mut specs = Vec::with_capacity(prefixes.len());
-    for p in &prefixes {
+    let mut prefixes: Vec<String> = pairs.iter().map(|(p, _)| p.clone()).collect();
+    prefixes.dedup();
+    let mut jobs = Vec::with_capacity(pairs.len());
+    let mut specs = Vec::with_capacity(pairs.len());
+    let mut chunk_index: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (p, chunk) in &pairs {
         let (lo, hi) = topology::descendant_range(st.domain.id, codec::decode(p)?, st.level)?;
-        let rel = format!("data/gid_prefix={p}/part-00000.parquet");
+        let name = if chunk.is_empty() {
+            "part-00000.parquet".to_string()
+        } else {
+            chunk_index.entry(p.clone()).or_default().push(chunk.clone());
+            format!("period={chunk}.parquet")
+        };
+        let rel = format!("data/gid_prefix={p}/{name}");
         ensure_dir(&join(root, &format!("data/gid_prefix={p}")))?;
+        let time_filter = st.time.as_ref().map_or("TRUE".into(), |t| t.chunk_filter(chunk));
         specs.push(FileSpec {
             path: rel.clone(),
-            predicate: format!("packed_id BETWEEN {lo} AND {hi}"),
+            predicate: format!("packed_id BETWEEN {lo} AND {hi} AND {time_filter}"),
         });
-        jobs.push((lo, hi, staging.path(&join(root, &rel), &rel)?));
+        jobs.push((lo, hi, time_filter, staging.path(&join(root, &rel), &rel)?));
     }
     let vf = value_fields(st, o)?;
     let facts = facts11(lease, st, o, &vf, specs)?;
@@ -1526,11 +1888,13 @@ fn write_partitioned(
         facts.as_ref(),
     )?;
     let (columns, options) = (folder_columns(st, o), parquet_options(o, &m, ""));
-    sql::par_map(jobs, write_threads(), |l, (lo, hi, target)| {
+    let order = if st.time.is_some() { "packed_id, period" } else { "packed_id" };
+    let files = jobs.len();
+    sql::par_map(jobs, write_threads(), |l, (lo, hi, time_filter, target)| {
         sql::exec_on(
             l,
             &format!(
-                "COPY (SELECT {columns} FROM {stage} WHERE packed_id BETWEEN {lo} AND {hi} ORDER BY packed_id) TO {} ({options})",
+                "COPY (SELECT {columns} FROM {stage} WHERE packed_id BETWEEN {lo} AND {hi} AND {time_filter} ORDER BY {order}) TO {} ({options})",
                 lit(&target)
             ),
         )
@@ -1552,10 +1916,14 @@ fn write_partitioned(
             lit(&join(root, PREFIX_INDEX_FILE))
         ),
     )?;
+    if !chunk_index.is_empty() {
+        // Chunk files per prefix, for readers that cannot list folders.
+        write_json(lease, &join(root, dataset::CHUNK_INDEX_FILE), &json!(chunk_index))?;
+    }
     Ok(vec![vec![
         Some("partitioned".into()),
         Some(root.to_string()),
-        Some(prefixes.len().to_string()),
+        Some(files.to_string()),
         Some(st.rows.to_string()),
     ]])
 }
@@ -1944,6 +2312,17 @@ fn write_iceberg(
     if upsert && (schema_changed || spec_changed) {
         return Err("mode 'upsert' keeps the table's columns, types and partition level; the input differs: use mode := 'overwrite'".into());
     }
+    // Row key: the cell, or the (cell, period) pair of a time cube.
+    let timed = st.time.is_some();
+    let on = |a: &str, b: &str| {
+        if timed {
+            format!("{a}.packed_id = {b}.packed_id AND {a}.period = {b}.period")
+        } else {
+            format!("{a}.packed_id = {b}.packed_id")
+        }
+    };
+    let what = if timed { "(cell, period) rows" } else { "cells" };
+    let order = if timed { "packed_id, period" } else { "packed_id" };
     let mut replaced: std::collections::HashSet<String> = Default::default();
     let mut replaced_rows = 0i64;
     let mut staged_rows = st.rows;
@@ -1979,12 +2358,13 @@ fn write_iceberg(
                 let dup = num(&one_row(
                     lease,
                     &format!(
-                        "SELECT count(*) FROM {stage} s SEMI JOIN {} t ON s.packed_id = t.packed_id",
-                        scan(&old_files)
+                        "SELECT count(*) FROM {stage} s SEMI JOIN {} t ON {}",
+                        scan(&old_files),
+                        on("s", "t")
                     ),
                 )?[0]);
                 if dup > 0 {
-                    return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'upsert' or 'overwrite')").into());
+                    return Err(format!("{dup} {what} are already in the table; a table holds one row per key (use mode := 'upsert' or 'overwrite')").into());
                 }
             }
             (Some(old_files), true) => {
@@ -1996,6 +2376,8 @@ fn write_iceberg(
                         let c = ident(c);
                         if c == "\"packed_id\"" {
                             "coalesce(n.packed_id, o.packed_id) AS packed_id".to_string()
+                        } else if timed && c == "\"period\"" {
+                            "coalesce(n.period, o.period) AS period".to_string()
                         } else {
                             format!("CASE WHEN n.packed_id IS NOT NULL THEN n.{c} ELSE o.{c} END AS {c}")
                         }
@@ -2011,8 +2393,9 @@ fn write_iceberg(
                 sql::exec_on(
                     lease,
                     &format!(
-                        "CREATE TABLE {merged} AS SELECT {} FROM {stage} n FULL JOIN (SELECT * FROM {old}) o ON n.packed_id = o.packed_id ORDER BY packed_id",
-                        cols.join(", ")
+                        "CREATE TABLE {merged} AS SELECT {} FROM {stage} n FULL JOIN (SELECT * FROM {old}) o ON {} ORDER BY {order}",
+                        cols.join(", "),
+                        on("n", "o")
                     ),
                 )?;
                 sql::exec_on(lease, &format!("DROP TABLE {stage}"))?;
@@ -2043,12 +2426,13 @@ fn write_iceberg(
                 let dup = num(&one_row(
                     lease,
                     &format!(
-                        "SELECT count(*) FROM {stage} s JOIN (SELECT packed_id FROM {scan} \
-                         WHERE packed_id BETWEEN {lo} AND {hi}) t ON s.packed_id = t.packed_id"
+                        "SELECT count(*) FROM {stage} s JOIN (SELECT {order} FROM {scan} \
+                         WHERE packed_id BETWEEN {lo} AND {hi}) t ON {}",
+                        on("s", "t")
                     ),
                 )?[0]);
                 if dup > 0 {
-                    return Err(format!("{dup} cells are already in the table; a cell_values table holds one row per cell (use mode := 'overwrite' to replace it)").into());
+                    return Err(format!("{dup} {what} are already in the table; a table holds one row per key (use mode := 'overwrite' to replace it)").into());
                 }
             }
         }
@@ -2090,13 +2474,21 @@ fn write_iceberg(
         .collect();
     let snapshot_id = (random_u64() >> 1) as i64;
     let write_uuid = uuid4();
-    let parts: Vec<i64> = rows(
+    // (partition, period chunk) pairs: one data file each, so a period filter skips files by
+    // their period bounds. Without periods there is one file per partition.
+    let chunk_sql = match &st.time {
+        Some(t) if t.chunk > 0 => format!("left(period, {})", t.chunk),
+        _ => "''".into(),
+    };
+    let pairs: Vec<(i64, String)> = rows(
         lease,
-        &format!("SELECT DISTINCT packed_id - (packed_id % {width}) FROM {stage} ORDER BY 1"),
+        &format!("SELECT DISTINCT packed_id - (packed_id % {width}), {chunk_sql} FROM {stage} ORDER BY 1, 2"),
     )?
-    .iter()
-    .map(|r| num(&r[0]))
+    .into_iter()
+    .map(|r| (num(&r[0]), r[1].clone().unwrap_or_default()))
     .collect();
+    let mut parts: Vec<i64> = pairs.iter().map(|(p, _)| *p).collect();
+    parts.dedup();
     let prev_total = if overwrite {
         0
     } else {
@@ -2105,23 +2497,28 @@ fn write_iceberg(
     };
     // Data files: one sorted file per partition, written by DuckDB (staged locally for S3).
     let mut staging = Staging::new(root)?;
-    let mut jobs = Vec::with_capacity(parts.len());
-    let mut specs = Vec::with_capacity(parts.len());
-    for (i, pt) in parts.iter().enumerate() {
+    let mut jobs = Vec::with_capacity(pairs.len());
+    let mut specs = Vec::with_capacity(pairs.len());
+    for (i, (pt, chunk)) in pairs.iter().enumerate() {
         let rel = format!(
             "data/{}={pt}/{write_uuid}-{i:05}.parquet",
             iceberg::PARTITION_FIELD
         );
+        let filter = format!(
+            "packed_id >= {pt} AND packed_id < {} AND {}",
+            pt + width,
+            st.time.as_ref().map_or("TRUE".into(), |t| t.chunk_filter(chunk))
+        );
         specs.push(FileSpec {
             path: rel.clone(),
-            predicate: format!("packed_id >= {pt} AND packed_id < {}", pt + width),
+            predicate: filter.clone(),
         });
         let file = staging.path(&join(root, &rel), &rel)?;
         ensure_dir(&join(
             root,
             &format!("data/{}={pt}", iceberg::PARTITION_FIELD),
         ))?;
-        jobs.push((*pt, rel, file));
+        jobs.push((*pt, rel, file, filter));
     }
     let vf = value_fields(st, o)?;
     let facts = facts11(lease, st, o, &vf, specs)?;
@@ -2152,12 +2549,11 @@ fn write_iceberg(
     let agg = agg.join(", ");
     let select = select.join(", ");
     // One sorted file per partition, several partitions at a time on internal connections.
-    let files = sql::par_map(jobs, write_threads(), |l, (pt, rel, file)| {
-        let filter = format!("packed_id >= {pt} AND packed_id < {}", pt + width);
+    let files = sql::par_map(jobs, write_threads(), |l, (pt, rel, file, filter)| {
         sql::exec_on(
             l,
             &format!(
-                "COPY (SELECT {select} FROM {stage} WHERE {filter} ORDER BY packed_id) TO {} ({copy_options})",
+                "COPY (SELECT {select} FROM {stage} WHERE {filter} ORDER BY {order}) TO {} ({copy_options})",
                 lit(&file)
             ),
         )?;

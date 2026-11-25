@@ -23,6 +23,10 @@ use serde_json::Value as Json;
 pub const MANIFEST_FILE: &str = "manifest.json";
 /// Partition index of a gid_prefix dataset, for readers that cannot list folders.
 pub const PREFIX_INDEX_FILE: &str = "gid_prefixes.json";
+/// Flat time cube data file (geosquare_v2.time_store).
+pub const TIME_FILE: &str = "time_values.parquet";
+/// Partitioned time cube: period chunk files per gid prefix.
+pub const CHUNK_INDEX_FILE: &str = "period_chunks.json";
 pub const MANIFEST_KEY: &str = "geosquare.manifest";
 
 #[derive(Debug, Clone)]
