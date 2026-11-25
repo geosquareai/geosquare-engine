@@ -1173,6 +1173,165 @@ impl VScalar for LonLatToV1Gid {
     }
 }
 
+// ---------- time cube periods (cell_time_values) ----------
+
+/// (label, period_type, bucket) columns starting at `col`; bucket only when `with_bucket`.
+fn period_args(
+    input: &DataChunkHandle,
+    col: usize,
+    with_bucket: bool,
+    n: usize,
+) -> (Vec<Option<String>>, Vec<Option<String>>, Vec<Option<i32>>) {
+    let labels = strings(input, col, n);
+    let types = strings(input, col + 1, n);
+    let buckets = if with_bucket {
+        prims::<i32>(input, col + 2, n)
+    } else {
+        vec![None; n]
+    };
+    (labels, types, buckets)
+}
+
+/// A period type, optionally with its bucket written in it (`hour:4`); a bucket argument of
+/// 0 means none (DuckDB passes NULL arguments to no function, so NULL cannot mean none).
+fn grain(t: &str, b: Option<i32>) -> Result<crate::timecube::Grain, Box<dyn Error>> {
+    crate::timecube::Grain::parse(t, b.filter(|b| *b != 0).map(i64::from))
+}
+
+/// period_valid(label, period_type [, bucket_hours]) -> BOOLEAN (false for a bad label)
+pub struct PeriodValid;
+impl VScalar for PeriodValid {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (l, t, b) = period_args(input, 0, input.num_columns() > 2, n);
+        let rows: Vec<Option<bool>> = (0..n)
+            .map(|i| match (&l[i], &t[i]) {
+                (Some(l), Some(t)) => {
+                    Some(grain(t, b[i]).is_ok_and(|g| crate::timecube::interval(l, &g).is_ok()))
+                }
+                _ => None,
+            })
+            .collect();
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Varchar, Varchar], type_id(Boolean)),
+            sig(&[Varchar, Varchar, Integer], type_id(Boolean)),
+        ]
+    }
+}
+
+/// period_interval(label, period_type [, bucket_hours]) -> STRUCT(start TIMESTAMP, "end" TIMESTAMP), UTC, end excluded
+pub struct PeriodInterval;
+impl VScalar for PeriodInterval {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (l, t, b) = period_args(input, 0, input.num_columns() > 2, n);
+        let (mut valid, mut s0, mut s1) = (vec![false; n], vec![0i64; n], vec![0i64; n]);
+        for i in 0..n {
+            if let (Some(l), Some(t)) = (&l[i], &t[i]) {
+                let (a, e) = crate::timecube::interval(l, &grain(t, b[i])?)?;
+                (valid[i], s0[i], s1[i]) = (true, a * 1_000_000, e * 1_000_000);
+            }
+        }
+        finish_struct(out, &valid, vec![Field::I64(s0), Field::I64(s1)]);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        let t = || {
+            struct_type(&[
+                ("start", LogicalTypeId::Timestamp),
+                ("end", LogicalTypeId::Timestamp),
+            ])
+        };
+        vec![
+            sig(&[Varchar, Varchar], t()),
+            sig(&[Varchar, Varchar, Integer], t()),
+        ]
+    }
+}
+
+/// period_relation(label_a, type_a, label_b, type_b) or
+/// period_relation(label_a, type_a, bucket_a, label_b, type_b, bucket_b) -> VARCHAR:
+/// equal, contains (a contains b), contained (a inside b), overlap or disjoint
+pub struct PeriodRelation;
+impl VScalar for PeriodRelation {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let wb = input.num_columns() == 6;
+        let (la, ta, ba) = period_args(input, 0, wb, n);
+        let (lb, tb, bb) = period_args(input, if wb { 3 } else { 2 }, wb, n);
+        let mut v = out.flat_vector();
+        for i in 0..n {
+            match (&la[i], &ta[i], &lb[i], &tb[i]) {
+                (Some(la), Some(ta), Some(lb), Some(tb)) => {
+                    let r = crate::timecube::relation(
+                        (la, &grain(ta, ba[i])?),
+                        (lb, &grain(tb, bb[i])?),
+                    )?;
+                    v.insert(i, r);
+                }
+                _ => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Varchar, Varchar, Varchar, Varchar], type_id(Varchar)),
+            sig(
+                &[Varchar, Varchar, Integer, Varchar, Varchar, Integer],
+                type_id(Varchar),
+            ),
+        ]
+    }
+}
+
+/// period_rollup(label, period_type, to_type) or
+/// period_rollup(label, period_type, bucket_hours, to_type, to_bucket_hours) -> VARCHAR, the
+/// label of the coarser period holding `label` (day -> month, 1-hour -> 4-hour bucket, ...)
+pub struct PeriodRollup;
+impl VScalar for PeriodRollup {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let wb = input.num_columns() == 5;
+        let (l, t, b) = period_args(input, 0, wb, n);
+        let to_t = strings(input, if wb { 3 } else { 2 }, n);
+        let to_b = if wb {
+            prims::<i32>(input, 4, n)
+        } else {
+            vec![None; n]
+        };
+        let mut v = out.flat_vector();
+        for i in 0..n {
+            match (&l[i], &t[i], &to_t[i]) {
+                (Some(l), Some(t), Some(tt)) => {
+                    let r =
+                        crate::timecube::rollup_label(l, &grain(t, b[i])?, &grain(tt, to_b[i])?)?;
+                    v.insert(i, r.as_str());
+                }
+                _ => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Varchar, Varchar, Varchar], type_id(Varchar)),
+            sig(
+                &[Varchar, Varchar, Integer, Varchar, Integer],
+                type_id(Varchar),
+            ),
+        ]
+    }
+}
+
 /// Register every scalar function.
 ///
 /// Engine names that clash with DuckDB are not registered, so results never depend
@@ -1204,5 +1363,9 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<V1GidCenter>("v1_gid_center")?;
     con.register_scalar_function::<V1GidToGeometry>("v1_gid_to_geometry")?;
     con.register_scalar_function::<LonLatToV1Gid>("lonlat_to_v1_gid")?;
+    con.register_scalar_function::<PeriodValid>("period_valid")?;
+    con.register_scalar_function::<PeriodInterval>("period_interval")?;
+    con.register_scalar_function::<PeriodRelation>("period_relation")?;
+    con.register_scalar_function::<PeriodRollup>("period_rollup")?;
     Ok(())
 }

@@ -24,6 +24,7 @@ mod registry;
 mod sql;
 mod storage;
 mod tables;
+mod timecube;
 mod v1;
 mod valid;
 mod writer;
