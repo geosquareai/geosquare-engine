@@ -35,9 +35,9 @@ curl -sO https://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2/v
 gunzip geosquare_v2.duckdb_extension.gz   # then: INSTALL './geosquare_v2.duckdb_extension'; LOAD geosquare_v2;
 ```
 
-macOS and Windows builds are not in the repository yet; `.github/workflows/duckdb-release.yml`
-builds them. `scripts/publish_local.sh` rebuilds and republishes what a Linux workstation can
-build. Other repositories: see `community/README.md`.
+The repository has Linux (amd64, arm64), Windows (amd64), macOS 11+ (amd64, arm64) and
+DuckDB-Wasm builds; `scripts/publish_local.sh` builds all of them on one Linux machine and
+republishes. Other repositories: see `community/README.md`.
 
 ## Build and load
 
