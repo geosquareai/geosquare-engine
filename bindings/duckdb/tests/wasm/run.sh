@@ -55,6 +55,18 @@ for layout in ("flat", "partitioned", "iceberg"):
     exp[f"{layout}_points"] = s(c.execute(f"SELECT count(*), sum(point_count) FROM query_cell_dataset('{p}', geometry := 'MULTIPOINT ((106.85 -6.2), (106.85 -6.2), (106.81 -6.24))')").fetchone())
     exp[f"{layout}_rollup"] = s(c.execute(f"SELECT count(*), round(sum(population), 6)::VARCHAR FROM query_cell_dataset('{p}', geometry := ?, rollup_level := 9)", [wkt]).fetchone())
     exp[f"{layout}_radius"] = s(c.execute(f"SELECT count(*), round(sum(population * coverage_ratio), 6)::VARCHAR FROM query_cell_dataset('{p}', geometry := 'POINT (106.85 -6.2)', radius_m := 800)").fetchone())
+# time cubes: one row per cell and day over 40 days
+tsrc = ("SELECT packed_id, strftime(DATE '2026-01-20' + INTERVAL (i) DAY, '%Y-%m-%d') AS period, "
+        "((packed_id % 97) + i)::DOUBLE AS rain FROM polygon_to_cells('ID', "
+        "'POLYGON ((106.80 -6.25, 106.90 -6.25, 106.90 -6.15, 106.80 -6.15, 106.80 -6.25))', 12), range(40) t(i)")
+for layout in ("flat", "partitioned", "iceberg"):
+    extra = "" if layout == "flat" else ", partition_level := 7"
+    c.execute(f"SELECT * FROM write_cell_dataset(?, ?, layout := '{layout}', period_type := 'day', value_semantics := 'MEASUREMENT', time_aggregation := 'max'{extra})", [tsrc, f"{www}/time_{layout}"]).fetchall()
+exp["period_labels"] = s(c.execute("SELECT period_valid('2026-02-29', 'day')::VARCHAR, period_relation('2026-11-19', 'day', '2026-11', 'month'), period_rollup('2026-11-19T05', 'hour:1', 'day'), strftime(period_interval('2026-11', 'month')['end'], '%Y-%m-%d')").fetchone())
+for layout in ("flat", "partitioned", "iceberg"):
+    p = f"{url}/time_{layout}"
+    exp[f"time_{layout}_month"] = s(c.execute(f"SELECT count(*), round(sum(rain), 6)::VARCHAR FROM read_cell_dataset('{p}', period := '2026-02')").fetchone())
+    exp[f"time_{layout}_query"] = s(c.execute(f"SELECT count(*), round(sum(rain), 6)::VARCHAR FROM query_cell_dataset('{p}', geometry := ?, time_rollup := 'month', period_from := '2026-01-25')", [wkt]).fetchone())
 exp["multi"] = s(c.execute(f"SELECT count(*), round(sum(flat__population + iceberg__population), 6)::VARCHAR FROM query_cell_datasets(['{url}/flat', '{url}/iceberg'], geometry := ?, rollup_level := 9)", [wkt]).fetchone())
 json.dump(exp, open(f"{www}/expected.json", "w"), indent=1)
 PY
