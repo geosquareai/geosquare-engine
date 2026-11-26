@@ -65,6 +65,8 @@ pub struct Facts {
     pub bbox: Option<[f64; 4]>,
     /// `storage.data_files` entries, in the order the files are listed.
     pub data_files: Vec<Json>,
+    /// `extent.compact_set_path`: the compact cell set of the covered cells, when written.
+    pub compact_set_path: Option<String>,
 }
 
 /// Check the parameter values the 1.1 schema allows. Runs before the target is cleared.
@@ -400,7 +402,7 @@ pub fn apply(manifest: &mut Json, facts: &Facts, governance: Json, derived: Json
     manifest["manifest_version"] = json!(VERSION);
     manifest["extent"] = json!({
         "bbox_wgs84": facts.bbox.map(|b| b.to_vec()),
-        "compact_set_path": null,
+        "compact_set_path": facts.compact_set_path,
     });
     manifest["governance"] = governance;
     manifest["storage"]["data_files"] = json!(facts.data_files);

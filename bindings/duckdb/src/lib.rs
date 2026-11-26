@@ -212,6 +212,7 @@ unsafe fn register_dataset_functions(
                 ("period_end", Text),
                 ("time_chunk", Text),
                 ("time_aggregation", Text),
+                ("compact_extent", Bool),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),
@@ -271,6 +272,24 @@ unsafe fn register_dataset_functions(
                     ("source_crs", Text),
                 ],
                 crosswalk::plan_polygons,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "time_values",
+                vec![Text],
+                vec![
+                    ("period_type", Text),
+                    ("bucket_hours", Int),
+                    ("value_semantics", Text),
+                    ("time_aggregation", Text),
+                    ("period", Text),
+                    ("period_from", Text),
+                    ("period_to", Text),
+                    ("time_rollup", Text),
+                    ("time_rule", Text),
+                ],
+                timequery::plan_time_values,
                 pool.clone(),
             )?;
             sql::register(

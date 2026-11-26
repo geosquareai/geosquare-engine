@@ -14,6 +14,7 @@ use crate::{
     sql::{self, Pool},
     storage::{S3Params, Storage},
 };
+use duckdb::core::Inserter;
 use duckdb::{
     core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId},
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value},
@@ -413,6 +414,8 @@ pub struct Bind {
     window: (u64, u64, u64, u64),
     tiles: Vec<usize>,
     bbox: [f64; 4],
+    /// `period := '<label>'`: a constant period column, for building time cubes.
+    period: Option<String>,
 }
 
 /// (next tile in the list, decoded current tile (index, samples), next row, next column).
@@ -435,6 +438,11 @@ impl VTab for ReadRaster {
     fn bind(bind: &BindInfo) -> Result<Bind, E> {
         for c in ["lon", "lat", "value"] {
             bind.add_result_column(c, LogicalTypeId::Double.into());
+        }
+        let period = named(bind, "period").map(|v| v.to_string());
+        if let Some(l) = &period {
+            crate::timequery::check_any_label(l).map_err(|e| format!("period: {e}"))?;
+            bind.add_result_column("period", LogicalTypeId::Varchar.into());
         }
         let path = bind.get_parameter(0).to_string();
         let bbox: Vec<f64> = match named(bind, "bbox") {
@@ -491,6 +499,7 @@ impl VTab for ReadRaster {
             window,
             tiles,
             bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
+            period,
         })
     }
 
@@ -567,6 +576,12 @@ impl VTab for ReadRaster {
             let mut vec = out.flat_vector(k);
             unsafe { vec.as_mut_slice::<f64>()[..n].copy_from_slice(&v) };
         }
+        if let Some(p) = &b.period {
+            let vec = out.flat_vector(3);
+            for i in 0..n {
+                vec.insert(i, p.as_str());
+            }
+        }
         out.set_len(n);
         Ok(())
     }
@@ -582,6 +597,7 @@ impl VTab for ReadRaster {
                 LogicalTypeHandle::list(&LogicalTypeId::Double.into()),
             ),
             ("max_pixels".into(), LogicalTypeId::Bigint.into()),
+            ("period".into(), LogicalTypeId::Varchar.into()),
         ];
         for n in [
             "s3_region",
