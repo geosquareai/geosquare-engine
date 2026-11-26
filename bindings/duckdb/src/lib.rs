@@ -26,6 +26,7 @@ mod storage;
 mod tables;
 mod compact;
 mod compact_store;
+mod geoagg;
 mod timecube;
 mod timequery;
 mod v1;
@@ -215,6 +216,25 @@ unsafe fn register_dataset_functions(
                 vec![Text, Text],
                 vec![("domain_code", Text), ("canonicalize", Bool), ("mode", Text)],
                 compact_store::plan_write,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "aggregate_geometries_to_cells",
+                vec![Text],
+                vec![
+                    ("domain_code", Text),
+                    ("level", Int),
+                    ("value_semantics", Text),
+                    ("geometry_column", Text),
+                    ("source_crs", Text),
+                    ("id_column", Text),
+                    ("category_rule", Text),
+                    ("rate_parts", Text),
+                    ("range_columns", Text),
+                    ("ordinal_order", Text),
+                ],
+                geoagg::plan,
                 pool.clone(),
             )?;
             sql::register(

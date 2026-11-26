@@ -1481,6 +1481,122 @@ impl VScalar for CompactCheck {
     }
 }
 
+// ---------- geometry_to_cells: one feature's cells with its share in each ----------
+
+/// One feature's cells at `level`: (cell, share of the feature, records, cell coverage).
+/// Polygons: share = coverage / sum of coverage (the feature's area share), coverage kept;
+/// lines: share = length ratio; points: share = records = points in the cell.
+pub fn feature_cells(
+    d: &'static domain::Domain,
+    wkt: &str,
+    level: u8,
+    crs: &str,
+) -> Result<Vec<(Cell, f64, i64, Option<f64>)>, Box<dyn Error>> {
+    Ok(match geom::parse_geometry(wkt)? {
+        geom::Geometry::Polygons(p) => {
+            let opts = crate::polyfill::PolyfillOptions {
+                source_crs: crs.to_string(),
+                max_candidate_limit: i64::MAX,
+                ..Default::default()
+            };
+            let cells = crate::polyfill::polyfill(d, p, level, &opts).map_err(|e| e.to_string())?;
+            let total: f64 = cells.iter().map(|(_, c)| c).sum();
+            cells
+                .into_iter()
+                .map(|(c, cov)| (c, if total > 0.0 { cov / total } else { 0.0 }, 1, Some(cov)))
+                .collect()
+        }
+        geom::Geometry::Lines(l) => crate::lines::line_to_cells(d, &l, level, crs, i64::MAX)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(c, r)| (c, r, 1, None))
+            .collect(),
+        geom::Geometry::Points(p) => crate::lines::points_to_cells(d, &p, level, crs, false)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(c, n)| (c, n as f64, n as i64, None))
+            .collect(),
+    })
+}
+
+/// geometry_to_cells(domain_code, wkt, level [, source_crs]) ->
+///   LIST(STRUCT(gid, packed_id, share, records, coverage_ratio))
+/// The cells of one feature (POINT, LINESTRING, POLYGON or their MULTI forms, lon/lat unless
+/// source_crs). `share` is the feature's share in the cell: a polygon's area share (its
+/// coverage over the sum of its coverage), a line's length ratio, or the points in the cell.
+/// `coverage_ratio` is the cell's share covered by a polygon (NULL for lines and points).
+pub struct GeometryToCells;
+impl VScalar for GeometryToCells {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, wkt, level) = (strings(input, 0, n), strings(input, 1, n), prims::<i32>(input, 2, n));
+        let crs = if input.num_columns() > 3 { strings(input, 3, n) } else { vec![None; n] };
+        let mut rows: Vec<Option<Vec<(String, i64, f64, i64, Option<f64>)>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], &wkt[i], level[i]) {
+                (Some(c), Some(w), Some(l)) => {
+                    let d = domain_by_code(c)?;
+                    let l = u8::try_from(l).map_err(|_| "level must be 0 to 14")?;
+                    let crs = crs[i].clone().unwrap_or_else(|| "EPSG:4326".into());
+                    let mut v = Vec::new();
+                    for (cell, share, rec, cov) in feature_cells(d, w, l, &crs)? {
+                        v.push((codec::encode(cell)?, packing::pack(d.id, cell)?, share, rec, cov));
+                    }
+                    Some(v)
+                }
+                _ => None,
+            });
+        }
+        let mut lv = out.list_vector();
+        let total: usize = rows.iter().map(|r| r.as_ref().map_or(0, Vec::len)).sum();
+        let sv = lv.struct_child(total);
+        let (g, mut p, mut s, mut r, mut c) =
+            (sv.child(0, total), sv.child(1, total), sv.child(2, total), sv.child(3, total), sv.child(4, total));
+        let mut off = 0;
+        for (i, row) in rows.iter().enumerate() {
+            match row {
+                Some(items) => {
+                    for (k, (gid, pk, share, rec, cov)) in items.iter().enumerate() {
+                        let j = off + k;
+                        g.insert(j, gid.as_str());
+                        put_i64(&mut p, j, *pk);
+                        put_f64(&mut s, j, *share);
+                        put_i64(&mut r, j, *rec);
+                        match cov {
+                            Some(x) => put_f64(&mut c, j, *x),
+                            None => c.set_null(j),
+                        }
+                    }
+                    lv.set_entry(i, off, items.len());
+                    off += items.len();
+                }
+                None => {
+                    lv.set_entry(i, off, 0);
+                    lv.set_null(i);
+                }
+            }
+        }
+        lv.set_len(total);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        let ret = || {
+            LogicalTypeHandle::list(&struct_type(&[
+                ("gid", Varchar),
+                ("packed_id", Bigint),
+                ("share", Double),
+                ("records", Bigint),
+                ("coverage_ratio", Double),
+            ]))
+        };
+        vec![
+            sig(&[Varchar, Varchar, Integer], ret()),
+            sig(&[Varchar, Varchar, Integer, Varchar], ret()),
+        ]
+    }
+}
+
 pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<PointToCell>("point_to_cell")?;
     con.register_scalar_function::<PackInt64>("pack_int64")?;
@@ -1495,6 +1611,7 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<CompactExpand>("compact_expand")?;
     con.register_scalar_function::<CompactContains>("compact_contains")?;
     con.register_scalar_function::<CompactCheck>("compact_check")?;
+    con.register_scalar_function::<GeometryToCells>("geometry_to_cells")?;
     con.register_scalar_function::<KRing>("k_ring")?;
     con.register_scalar_function::<KDisk>("k_disk")?;
     con.register_scalar_function::<DistanceM>("distance_m")?;
