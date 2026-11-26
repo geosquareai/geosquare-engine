@@ -333,7 +333,7 @@ fn sync_marker() -> [u8; 16] {
     s
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     let secs = now_ms() / 1000;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -425,7 +425,7 @@ impl Drop for Staging {
     }
 }
 
-fn ensure_dir(path: &str) -> Result<(), E> {
+pub(crate) fn ensure_dir(path: &str) -> Result<(), E> {
     #[cfg(not(target_family = "wasm"))]
     if is_local(path) {
         std::fs::create_dir_all(local(path)).map_err(|e| format!("cannot create {path}: {e}"))?;
@@ -1385,7 +1385,7 @@ fn write_manifest(lease: &Lease, root: &str, manifest: &Json) -> Result<(), E> {
 }
 
 /// Write one JSON object as a file through DuckDB (any filesystem DuckDB can write).
-fn write_json(lease: &Lease, path: &str, doc: &Json) -> Result<(), E> {
+pub(crate) fn write_json(lease: &Lease, path: &str, doc: &Json) -> Result<(), E> {
     let obj = doc.as_object().ok_or("document must be a JSON object")?;
     let cols: Vec<String> = obj
         .iter()

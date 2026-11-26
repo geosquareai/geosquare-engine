@@ -37,6 +37,32 @@ fn strings(chunk: &DataChunkHandle, col: usize, n: usize) -> Vec<Option<String>>
         .collect()
 }
 
+/// VARCHAR[] input: one list of strings per row (None for a NULL list). NULL items are an error.
+fn string_lists(chunk: &DataChunkHandle, col: usize, n: usize) -> Result<Vec<Option<Vec<String>>>, Box<dyn Error>> {
+    let lv = chunk.list_vector(col);
+    let total = lv.len();
+    let child = lv.child(total);
+    let raw = unsafe { child.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(total) };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if lv.row_is_null(i as u64) {
+            out.push(None);
+            continue;
+        }
+        let (off, len) = lv.get_entry(i);
+        let mut items = Vec::with_capacity(len);
+        for k in off..off + len {
+            if is_null(&child, k) {
+                return Err("a GID list holds NULL".into());
+            }
+            let mut s = raw[k];
+            items.push(DuckString::new(&mut s).as_str().to_string());
+        }
+        out.push(Some(items));
+    }
+    Ok(out)
+}
+
 fn prims<T: Copy>(chunk: &DataChunkHandle, col: usize, n: usize) -> Vec<Option<T>> {
     let v = chunk.flat_vector(col);
     let raw = unsafe { v.as_slice_with_len::<T>(n) };
@@ -1338,6 +1364,123 @@ impl VScalar for PeriodRollup {
 /// on the DuckDB version: `encode`/`decode` are DuckDB BLOB built-ins (DuckDB 1.4
 /// resolves `decode('<gid>')` to the built-in), and `UNPACK(...)` is DuckDB syntax.
 /// Use the v2 names `canonical_to_gid`, `gid_to_canonical` and `unpack_int64`.
+// ---------- cell_compact_set (crate::compact) ----------
+
+fn compact_err(e: Box<dyn Error + Send + Sync>) -> Box<dyn Error> {
+    e.to_string().into()
+}
+
+/// compact_canonicalize(gids VARCHAR[]) -> VARCHAR[]: the canonical compact set, sorted.
+pub struct CompactCanonicalize;
+impl VScalar for CompactCanonicalize {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let mut rows = Vec::with_capacity(n);
+        for l in string_lists(input, 0, n)? {
+            rows.push(match l {
+                Some(l) => Some(crate::compact::canonicalize(l.iter().map(String::as_str)).map_err(compact_err)?),
+                None => None,
+            });
+        }
+        finish_list(out, rows);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar))],
+            LogicalTypeHandle::list(&type_id(Varchar)),
+        )]
+    }
+}
+
+/// compact_expand(gids VARCHAR[], level) -> VARCHAR[]: every level-`level` cell of the set.
+pub struct CompactExpand;
+impl VScalar for CompactExpand {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (lists, level) = (string_lists(input, 0, n)?, prims::<i32>(input, 1, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&lists[i], level[i]) {
+                (Some(l), Some(t)) => {
+                    let t = u8::try_from(t).map_err(|_| "level must be 0 to 14")?;
+                    Some(crate::compact::expand(l.iter().map(String::as_str), t).map_err(compact_err)?)
+                }
+                _ => None,
+            });
+        }
+        finish_list(out, rows);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar)), type_id(Integer)],
+            LogicalTypeHandle::list(&type_id(Varchar)),
+        )]
+    }
+}
+
+/// compact_contains(gids VARCHAR[], gid) -> BOOLEAN: gid is a row of the set or under one.
+pub struct CompactContains;
+impl VScalar for CompactContains {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (lists, g) = (string_lists(input, 0, n)?, strings(input, 1, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&lists[i], &g[i]) {
+                (Some(l), Some(g)) => Some(crate::compact::contains(l.iter().map(String::as_str), g).map_err(compact_err)?),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar)), type_id(Varchar)],
+            type_id(Boolean),
+        )]
+    }
+}
+
+/// compact_check(gids VARCHAR[]) -> VARCHAR: why the list is not a canonical compact set,
+/// NULL when it is (no duplicates, no row inside another, no complete child group).
+pub struct CompactCheck;
+impl VScalar for CompactCheck {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let mut msg: Vec<Option<String>> = Vec::with_capacity(n);
+        for l in string_lists(input, 0, n)? {
+            msg.push(match l {
+                Some(l) => {
+                    let rows: Vec<(String, Option<i64>)> = l.into_iter().map(|g| (g, None)).collect();
+                    crate::compact::check(&rows).map_err(compact_err)?
+                }
+                None => None,
+            });
+        }
+        let mut v = out.flat_vector();
+        for (i, m) in msg.iter().enumerate() {
+            match m {
+                Some(m) => v.insert(i, m.as_str()),
+                None => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar))],
+            type_id(Varchar),
+        )]
+    }
+}
+
 pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<PointToCell>("point_to_cell")?;
     con.register_scalar_function::<PackInt64>("pack_int64")?;
@@ -1348,6 +1491,10 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<Pack>("pack")?;
     con.register_scalar_function::<Parent>("parent")?;
     con.register_scalar_function::<Children>("children")?;
+    con.register_scalar_function::<CompactCanonicalize>("compact_canonicalize")?;
+    con.register_scalar_function::<CompactExpand>("compact_expand")?;
+    con.register_scalar_function::<CompactContains>("compact_contains")?;
+    con.register_scalar_function::<CompactCheck>("compact_check")?;
     con.register_scalar_function::<KRing>("k_ring")?;
     con.register_scalar_function::<KDisk>("k_disk")?;
     con.register_scalar_function::<DistanceM>("distance_m")?;

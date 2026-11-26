@@ -24,6 +24,8 @@ mod registry;
 mod sql;
 mod storage;
 mod tables;
+mod compact;
+mod compact_store;
 mod timecube;
 mod timequery;
 mod v1;
@@ -207,6 +209,22 @@ unsafe fn register_dataset_functions(
                 ("s3_secret_access_key", Text),
                 ("s3_session_token", Text),
             ]);
+            sql::register(
+                con,
+                "write_compact_set",
+                vec![Text, Text],
+                vec![("domain_code", Text), ("canonicalize", Bool), ("mode", Text)],
+                compact_store::plan_write,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "read_compact_set",
+                vec![Text],
+                vec![("level", Int)],
+                compact_store::plan_read,
+                pool.clone(),
+            )?;
             sql::register(
                 con,
                 "cell_dataset_info",

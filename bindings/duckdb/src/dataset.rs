@@ -73,7 +73,7 @@ fn glob(lease: &Lease, pattern: &str) -> Result<Vec<String>, E> {
     }
 }
 
-fn is_not_found(msg: &str) -> bool {
+pub(crate) fn is_not_found(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("404")
         || m.contains("not found")
@@ -81,7 +81,7 @@ fn is_not_found(msg: &str) -> bool {
         || m.contains("no files found")
 }
 
-fn read_text(lease: &Lease, path: &str) -> Result<String, E> {
+pub(crate) fn read_text(lease: &Lease, path: &str) -> Result<String, E> {
     sql::query_text_on(
         lease,
         &format!("SELECT content FROM read_text({})", lit(path)),
@@ -619,6 +619,10 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
     let lease = sql::lease()?;
     let mut src = open(&lease, &path)?;
+    if crate::compact_store::is_compact(src.manifest.as_ref()) {
+        // A compact set: its rows, or its cells at `level := L`.
+        return crate::compact_store::read_plan(&src.root, p.int("level"));
+    }
     select_snapshot(&lease, &mut src, p)?;
     let id = if src.manifest.is_some() || p.text("domain_code").is_some() {
         Some(identity(&src, p)?) // also validates the manifest against the engine
