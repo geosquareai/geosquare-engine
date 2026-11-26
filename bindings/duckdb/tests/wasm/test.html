@@ -40,6 +40,7 @@ try {
   await c.query(`LOAD '${location.origin}/build/${ext}/geosquare_v2.duckdb_extension.wasm'`);
   results.point_to_cell = (await one("SELECT point_to_cell('ID', 106.894082, -6.26109, 12).gid"))[0];
   results.v1_gid = await one("SELECT v1_gid_to_cell('ID', lonlat_to_v1_gid(106.8272, -6.1754, 12), 12).gid, octet_length(cell_to_wkb('ID', point_to_cell('ID', 106.8, -6.2, 12).gid))");
+  results.period_labels = await one("SELECT period_valid('2026-02-29', 'day')::VARCHAR, period_relation('2026-11-19', 'day', '2026-11', 'month'), period_rollup('2026-11-19T05', 'hour:1', 'day'), strftime(period_interval('2026-11', 'month')['end'], '%Y-%m-%d')");
   results.cells = await one("SELECT count(*), round(sum(coverage_ratio), 6)::VARCHAR FROM polygon_to_cells('ID', 'POLYGON ((106.80 -6.25, 106.90 -6.25, 106.90 -6.15, 106.80 -6.15, 106.80 -6.25))', 12)");
   // Datasets need DuckDB's own parquet extension; in the threads bundles it does not load
   // (extensions.duckdb.org serves a non-shared-memory build), so those checks are skipped.
@@ -60,6 +61,11 @@ try {
     results[`${layout}_points`] = await one(`SELECT count(*), sum(point_count) FROM query_cell_dataset('${p}', geometry := 'MULTIPOINT ((106.85 -6.2), (106.85 -6.2), (106.81 -6.24))')`);
     results[`${layout}_rollup`] = await one(`SELECT count(*), round(sum(population), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := '${wkt}', rollup_level := 9)`);
     results[`${layout}_radius`] = await one(`SELECT count(*), round(sum(population * coverage_ratio), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := 'POINT (106.85 -6.2)', radius_m := 800)`);
+  }
+  for (const layout of ["flat", "partitioned", "iceberg"]) {
+    const p = `${location.origin}/www/time_${layout}`;
+    results[`time_${layout}_month`] = await one(`SELECT count(*), round(sum(rain), 6)::VARCHAR FROM read_cell_dataset('${p}', period := '2026-02')`);
+    results[`time_${layout}_query`] = await one(`SELECT count(*), round(sum(rain), 6)::VARCHAR FROM query_cell_dataset('${p}', geometry := '${wkt}', time_rollup := 'month', period_from := '2026-01-25')`);
   }
   results.multi = await one(`SELECT count(*), round(sum(flat__population + iceberg__population), 6)::VARCHAR FROM query_cell_datasets(['${location.origin}/www/flat', '${location.origin}/www/iceberg'], geometry := '${wkt}', rollup_level := 9)`);
 } catch (e) { if (e !== "__skip__") results.error = String((e && e.message) || e); }

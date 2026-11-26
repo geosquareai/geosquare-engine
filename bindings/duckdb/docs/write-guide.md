@@ -263,6 +263,12 @@ For a whole country, loop over boxes (e.g. per 1 degree) and `append` each, or u
 predictor 1/2/3, 8-64 bit integers and 32/64 bit floats; `max_pixels` (default 200 million)
 guards against huge boxes.
 
+## Time cubes
+
+Values per cell and period (daily, hourly, monthly) are written with `period_type` and a
+`period` column; append and upsert are keyed on (cell, period). See
+[time-cube.md](time-cube.md).
+
 ## Check what was written
 
 ```sql

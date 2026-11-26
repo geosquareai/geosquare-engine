@@ -35,9 +35,9 @@ curl -sO https://geosquare-static.s3.ap-southeast-3.amazonaws.com/geosquare-v2/v
 gunzip geosquare_v2.duckdb_extension.gz   # then: INSTALL './geosquare_v2.duckdb_extension'; LOAD geosquare_v2;
 ```
 
-macOS and Windows builds are not in the repository yet; `.github/workflows/duckdb-release.yml`
-builds them. `scripts/publish_local.sh` rebuilds and republishes what a Linux workstation can
-build. Other repositories: see `community/README.md`.
+The repository has Linux (amd64, arm64), Windows (amd64), macOS 11+ (amd64, arm64) and
+DuckDB-Wasm builds; `scripts/publish_local.sh` builds all of them on one Linux machine and
+republishes. Other repositories: see `community/README.md`.
 
 ## Build and load
 
@@ -214,6 +214,9 @@ joins, writes, snapshots, S3/HTTP, choosing a partition level):
 `tests/test_docs_examples.py`.
 Creating and changing datasets (create, insert, update/upsert, delete, schema and partition
 changes, for every layout): [docs/write-guide.md](docs/write-guide.md).
+Time cubes (`cell_time_values`, one row per cell and period: `period_type`, `period`,
+`period_from` / `period_to`, `time_rollup`, file pruning by period):
+[docs/time-cube.md](docs/time-cube.md).
 Ready-to-use wrappers for Node (`@duckdb/node-api`), the browser (DuckDB-Wasm) and Python,
 with one API (`summarize`, `cells`, `rollup`, `atPoints`, `featureCollection`, `stream`,
 `write`): [examples/](examples/README.md).
@@ -415,6 +418,10 @@ roll-up ke 1 km/10 km, join, penulisan, snapshot, S3/HTTP, pemilihan level parti
 [docs/query-examples.md](docs/query-examples.md); semua contohnya dijalankan oleh tes.
 Panduan membuat dan mengubah dataset (create, insert, update/upsert, delete, ubah kolom dan
 partisi) untuk ketiga layout ada di [docs/write-guide.md](docs/write-guide.md).
+Time cube (`cell_time_values`, satu baris per sel dan periode) untuk ketiga layout: tulis
+dengan `period_type`, baca dengan `period`, `period_from` / `period_to` dan `time_rollup`;
+Iceberg dan partitioned hanya membaca file yang periodenya masuk rentang. Lihat
+[docs/time-cube.md](docs/time-cube.md).
 Skrip siap pakai untuk backend Node, frontend (DuckDB-Wasm) dan Python ada di
 [examples/](examples/README.md).
 Beberapa nama fungsi berbeda dari binding Python/Wasm karena bentrok dengan DuckDB (`encode` → `canonical_to_gid`,

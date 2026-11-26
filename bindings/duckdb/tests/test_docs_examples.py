@@ -56,4 +56,11 @@ expected = wc.execute("""SELECT count(*) FROM (SELECT packed_id FROM src UNION S
     USING (packed_id)""").fetchone()[0]
 assert ice[0] == ice[1] == expected and ice[3] == 0, (ice, expected)
 assert ice[2] > 0 and ice[2] <= n_changes, (ice, n_changes)
+# time-cube.md: the values its comments state
+t, tc = dirs["time-cube.md"], conns["time-cube.md"]
+assert tc.execute("SELECT period_valid('2026-02-29', 'day'), period_valid('2026-11-19T04', 'hour:4'), "
+                  "period_relation('2026-11-19', 'day', '2026-11', 'month'), period_rollup('2026-11-19T05', 'hour:1', 'day')").fetchone() == (
+    False, True, "contained", "2026-11-19")
+assert tc.execute(f"SELECT period_start, period_end FROM cell_dataset_info('{t}/rain_ice')").fetchone() == ("2026-01-01", "2026-04-04")
+assert tc.execute(f"SELECT count(*), count(DISTINCT period) FROM read_cell_dataset('{t}/rain_ice')").fetchone() == (11914 * 93, 93)
 print(f"docs examples OK: {ran} statements in {len(docs)} documents ({skipped} blocks need S3/network)", dirs)

@@ -13,6 +13,7 @@
 
 use crate::avro::{self, D};
 use crate::sql::{self, lit, Lease, E};
+use crate::timequery::PeriodRange;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,6 +26,16 @@ pub struct DataFile {
     pub partition: Option<(i64, i64)>,
     /// packed_id lower/upper bounds from the manifest.
     pub bounds: Option<(i64, i64)>,
+    /// `period` lower/upper bounds (time cubes).
+    pub period: Option<(String, String)>,
+}
+
+/// Whether file `f` can hold a period of `range` (no bounds: it can).
+fn in_period(f: &DataFile, range: Option<&PeriodRange>) -> bool {
+    match (range, &f.period) {
+        (Some(r), Some((lo, hi))) => r.overlaps(lo, hi),
+        _ => true,
+    }
 }
 
 /// A manifest of the current snapshot and what the manifest list says about it.
@@ -47,6 +58,8 @@ pub struct Table {
     /// written: alter_cell_dataset).
     by_id: bool,
     pk_id: i64,
+    /// Field id of `period` (time cubes).
+    period_id: Option<i64>,
     location: String,
     root: String,
     manifests: Vec<Manifest>,
@@ -62,7 +75,13 @@ fn partition_values(packed: &[i64], w: i64) -> Vec<i64> {
 impl Table {
     /// Data files that can hold any of `packed` (sorted ascending), or None when a manifest
     /// turns out to need iceberg_scan (delete files, nothing to prune on).
-    pub fn files_for(&self, lease: &Lease, packed: &[i64]) -> Result<Option<Vec<String>>, E> {
+    /// With `period`, files whose period bounds miss the range are skipped too.
+    pub fn files_for(
+        &self,
+        lease: &Lease,
+        packed: &[i64],
+        period: Option<&PeriodRange>,
+    ) -> Result<Option<Vec<String>>, E> {
         if packed.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -95,7 +114,7 @@ impl Table {
                     Some((a, b)) => b >= lo && a <= hi,
                     None => true,
                 };
-                if in_part && in_bounds {
+                if in_part && in_bounds && in_period(f, period) {
                     out.push(f.path.clone());
                 }
             }
@@ -104,13 +123,22 @@ impl Table {
     }
 
     /// Every live data file of the snapshot, or None when a manifest needs iceberg_scan.
-    pub fn all_files(&self, lease: &Lease) -> Result<Option<Vec<String>>, E> {
+    pub fn all_files(
+        &self,
+        lease: &Lease,
+        period: Option<&PeriodRange>,
+    ) -> Result<Option<Vec<String>>, E> {
         let mut out = Vec::new();
         for m in &self.manifests {
             let Some(files) = manifest_files(lease, self, m)? else {
                 return Ok(None);
             };
-            out.extend(files.iter().map(|f| f.path.clone()));
+            out.extend(
+                files
+                    .iter()
+                    .filter(|f| in_period(f, period))
+                    .map(|f| f.path.clone()),
+            );
         }
         Ok(Some(out))
     }
@@ -278,6 +306,7 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
     let mut columns = Vec::new();
     let mut ids = Vec::new();
     let mut pk_id = None;
+    let mut period_id = None;
     for f in fields {
         let name = f
             .get("name")
@@ -289,6 +318,9 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
         };
         if name == "packed_id" {
             pk_id = f.get("id").and_then(Json::as_i64);
+        }
+        if name == "period" && ty == "VARCHAR" {
+            period_id = f.get("id").and_then(Json::as_i64);
         }
         // MAP values need one type: untyped NULL, or a plain number for added numeric columns
         // (read_parquet casts the default to the column type).
@@ -347,6 +379,7 @@ fn build(lease: &Lease, root: &str, meta: &Json) -> Result<Option<Table>, E> {
         fields: ids,
         by_id,
         pk_id,
+        period_id,
         location,
         root: root.to_string(),
         manifests: Vec::new(),
@@ -449,6 +482,22 @@ fn parse_manifest(lease: &Lease, t: &Table, m: &Manifest) -> Result<Option<Vec<D
             })
         };
         let bounds = bound("lower_bounds").zip(bound("upper_bounds"));
+        let text_bound = |n: &str| -> Option<String> {
+            let id = t.period_id?;
+            let D::Arr(items) = df.get(n)? else {
+                return None;
+            };
+            items.iter().find_map(|kv| {
+                if kv.get("key")?.long()? != id {
+                    return None;
+                }
+                match kv.get("value")? {
+                    D::Bytes(b) => String::from_utf8(b.clone()).ok(),
+                    _ => None,
+                }
+            })
+        };
+        let period = text_bound("lower_bounds").zip(text_bound("upper_bounds"));
         if partition.is_none() && bounds.is_none() {
             return Ok(None); // nothing to prune on
         }
@@ -456,6 +505,7 @@ fn parse_manifest(lease: &Lease, t: &Table, m: &Manifest) -> Result<Option<Vec<D
             path,
             partition,
             bounds,
+            period,
         });
     }
     Ok(Some(files))

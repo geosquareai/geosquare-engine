@@ -165,6 +165,12 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
                 .unwrap_or("?")
         ),
     ));
+    if crate::timequery::grain_of(Some(&m)).is_err()
+        || m.get("dataset_type").and_then(Json::as_str) == Some("cell_time_values")
+    {
+        let (ok, detail) = time_manifest_check(&m);
+        checks.push(("time_manifest".into(), ok, detail));
+    }
     let fields: Vec<String> = m
         .get("value_fields")
         .and_then(Json::as_array)
@@ -180,7 +186,13 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
     .into_iter()
     .filter_map(|r| r.into_iter().next().flatten())
     .collect();
-    let identity = ["gid", "packed_id", "x_idx", "y_idx"];
+    // A time cube: one row per (cell, period), periods of one type inside the declared range.
+    let grain = crate::timequery::grain_of(Some(&m)).ok().flatten();
+    let identity: &[&str] = if grain.is_some() {
+        &["gid", "packed_id", "x_idx", "y_idx", "period"]
+    } else {
+        &["gid", "packed_id", "x_idx", "y_idx"]
+    };
     let missing: Vec<&String> = fields.iter().filter(|f| !cols.contains(f)).collect();
     let extra: Vec<&String> = cols
         .iter()
@@ -268,11 +280,30 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
     } else {
         format!("count(*) FILTER (WHERE length(gid) <> {level})")
     };
+    let (distinct_key, period_check) = match &grain {
+        Some(g) if has("period") => {
+            let range = match (
+                m.get("period_start").and_then(Json::as_str),
+                m.get("period_end").and_then(Json::as_str),
+            ) {
+                (Some(a), Some(b)) => format!(" OR period < {} OR period >= {}", lit(a), lit(b)),
+                _ => String::new(),
+            };
+            (
+                format!("({key}, period)"),
+                format!(
+                    "count(*) FILTER (WHERE period IS NULL OR NOT period_valid(period, {}){range})",
+                    lit(&g.spec())
+                ),
+            )
+        }
+        _ => (key.to_string(), "0".to_string()),
+    };
     let r = sql::query_text_on(
         &lease,
         &format!(
-            "SELECT count(*), count(DISTINCT {key}), {pack_check}, {level_check}, {null_sum}, \
-             count(*) FILTER (WHERE {key} IS NULL) FROM {from}"
+            "SELECT count(*), count(DISTINCT {distinct_key}), {pack_check}, {level_check}, {null_sum}, \
+             count(*) FILTER (WHERE {key} IS NULL), {period_check} FROM {from}"
         ),
     )?;
     let v: Vec<i64> = r
@@ -282,8 +313,8 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
         .into_iter()
         .map(|x| x.and_then(|s| s.parse().ok()).unwrap_or(0))
         .collect();
-    let (rows, distinct, bad_pack, bad_level, null_values, null_ids) =
-        (v[0], v[1], v[2], v[3], v[4], v[5]);
+    let (rows, distinct, bad_pack, bad_level, null_values, null_ids, bad_periods) =
+        (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
     let declared = m.pointer("/storage/row_count").and_then(Json::as_i64);
     checks.push((
         "row_count".into(),
@@ -293,11 +324,33 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
             declared.map_or("nothing".into(), |d| d.to_string())
         ),
     ));
-    checks.push((
-        "unique_cells".into(),
-        distinct == rows && null_ids == 0,
-        format!("{distinct} distinct of {rows}; {null_ids} without id"),
-    ));
+    if let Some(g) = &grain {
+        checks.push((
+            "unique_cell_periods".into(),
+            distinct == rows && null_ids == 0,
+            format!("{distinct} distinct (cell, period) of {rows}; {null_ids} without id"),
+        ));
+        checks.push((
+            "periods".into(),
+            has("period") && bad_periods == 0,
+            if has("period") {
+                format!(
+                    "{bad_periods} rows with no {} label inside [{}, {})",
+                    g.spec(),
+                    m.get("period_start").and_then(Json::as_str).unwrap_or("?"),
+                    m.get("period_end").and_then(Json::as_str).unwrap_or("?")
+                )
+            } else {
+                "the data has no period column".into()
+            },
+        ));
+    } else {
+        checks.push((
+            "unique_cells".into(),
+            distinct == rows && null_ids == 0,
+            format!("{distinct} distinct of {rows}; {null_ids} without id"),
+        ));
+    }
     checks.push((
         "gid_matches_packed_id".into(),
         bad_pack == 0,
@@ -313,6 +366,30 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
         null_values == 0,
         format!("{null_values} NULL values in value columns"),
     ));
+    // The flat time cube is stored sorted by gid, then period (spec section 6).
+    if let (Some(_), Layout::Flat) = (&grain, &src.layout) {
+        if has("period") {
+            let file = lit(&join(&root, "data/*.parquet"));
+            let unsorted = sql::query_text_on(
+                &lease,
+                &format!(
+                    "SELECT count(*) FILTER (WHERE k < prev) FROM (SELECT k, lag(k) OVER (ORDER BY f, n) AS prev FROM \
+                     (SELECT (gid, period) AS k, filename AS f, file_row_number AS n FROM \
+                     read_parquet({file}, filename = true, file_row_number = true)))"
+                ),
+            )
+            .ok()
+            .and_then(|r| r.into_iter().next()?.into_iter().next()?)
+            .and_then(|x| x.parse::<i64>().ok());
+            if let Some(n) = unsorted {
+                checks.push((
+                    "sorted_by_gid_period".into(),
+                    n == 0,
+                    format!("{n} rows out of (gid, period) order"),
+                ));
+            }
+        }
+    }
     if let Some(records) = manifest_records {
         checks.push((
             "manifest_record_count".into(),
@@ -321,6 +398,49 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
         ));
     }
     Ok(checks_plan(&checks))
+}
+
+/// The time fields of a cell_time_values manifest (geosquare-v2 docs/time-cube.md section 6).
+fn time_manifest_check(m: &Json) -> (bool, String) {
+    use crate::timecube::{parse_label, Grain};
+    let s = |k: &str| m.get(k).and_then(Json::as_str);
+    let mut bad = Vec::new();
+    match Grain::new(s("period_type").unwrap_or(""), m.get("bucket_hours").and_then(Json::as_i64)) {
+        Err(e) => bad.push(e.to_string()),
+        Ok(g) => match (
+            parse_label(s("period_start").unwrap_or(""), &g),
+            parse_label(s("period_end").unwrap_or(""), &g),
+        ) {
+            (Ok(a), Ok(b)) if a < b => {}
+            (Ok(_), Ok(_)) => bad.push("period_start must be before period_end (half-open, not empty)".into()),
+            (a, b) => bad.extend(a.err().into_iter().chain(b.err()).map(|e| e.to_string())),
+        },
+    }
+    if s("timezone") != Some("UTC") {
+        bad.push("timezone must be UTC".into());
+    }
+    if m.pointer("/identity/unique_gid") != Some(&Json::Bool(false))
+        || m.pointer("/identity/unique_key") != Some(&serde_json::json!(["gid", "period"]))
+    {
+        bad.push("identity must have unique_gid false and unique_key [gid, period]".into());
+    }
+    if m.pointer("/storage/sorted_by") != Some(&serde_json::json!(["gid", "period"])) {
+        bad.push("storage.sorted_by must be [gid, period]".into());
+    }
+    let period_field = m
+        .get("value_fields")
+        .and_then(Json::as_array)
+        .into_iter()
+        .flatten()
+        .any(|f| f.get("name").and_then(Json::as_str) == Some("period"));
+    if period_field {
+        bad.push("period is reserved and cannot be a value field".into());
+    }
+    if bad.is_empty() {
+        (true, "period type, range, timezone, identity and sort order are valid".into())
+    } else {
+        (false, bad.join("; "))
+    }
 }
 
 fn checks_plan(checks: &[(String, bool, String)]) -> Plan {

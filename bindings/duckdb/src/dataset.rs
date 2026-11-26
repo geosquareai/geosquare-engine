@@ -23,6 +23,10 @@ use serde_json::Value as Json;
 pub const MANIFEST_FILE: &str = "manifest.json";
 /// Partition index of a gid_prefix dataset, for readers that cannot list folders.
 pub const PREFIX_INDEX_FILE: &str = "gid_prefixes.json";
+/// Flat time cube data file (geosquare_v2.time_store).
+pub const TIME_FILE: &str = "time_values.parquet";
+/// Partitioned time cube: period chunk files per gid prefix.
+pub const CHUNK_INDEX_FILE: &str = "period_chunks.json";
 pub const MANIFEST_KEY: &str = "geosquare.manifest";
 
 #[derive(Debug, Clone)]
@@ -271,10 +275,44 @@ pub fn load_iceberg_ext(lease: &Lease) -> Result<(), E> {
         })
 }
 
-/// Every partition file of a gid_prefix dataset (listing, or the index over HTTP).
-fn partition_files(lease: &Lease, src: &Source) -> Result<Vec<String>, E> {
+/// Partition files of a gid_prefix dataset (listing, or the index over HTTP). A time cube
+/// has one file per (prefix, period chunk): with `period`, chunks outside the range are left
+/// out.
+fn partition_files(
+    lease: &Lease,
+    src: &Source,
+    period: Option<&crate::timequery::PeriodRange>,
+) -> Result<Vec<String>, E> {
+    let keep = |f: &String| match (period, f.rsplit('/').next().and_then(|n| n.strip_prefix("period="))) {
+        (Some(r), Some(n)) => r.overlaps_chunk(n.strip_suffix(".parquet").unwrap_or(n)),
+        _ => true,
+    };
     if !is_http(&src.root) {
-        return glob(lease, &join(&src.root, "data/*/*.parquet"));
+        return Ok(glob(lease, &join(&src.root, "data/*/*.parquet"))?
+            .into_iter()
+            .filter(keep)
+            .collect());
+    }
+    let timed = crate::timequery::grain_of(src.manifest.as_ref())?.is_some();
+    let chunks: Option<Json> = if timed {
+        read_text(lease, &join(&src.root, CHUNK_INDEX_FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+    } else {
+        None
+    };
+    if let Some(Json::Object(map)) = chunks {
+        return Ok(map
+            .iter()
+            .flat_map(|(prefix, list)| {
+                list.as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Json::as_str)
+                    .map(move |c| join(&src.root, &format!("data/gid_prefix={prefix}/period={c}.parquet")))
+            })
+            .filter(keep)
+            .collect());
     }
     let index: Json = serde_json::from_str(
         &read_text(lease, &join(&src.root, PREFIX_INDEX_FILE)).map_err(|_| {
@@ -302,13 +340,20 @@ fn partition_files(lease: &Lease, src: &Source) -> Result<Vec<String>, E> {
 /// FROM-clause for the whole dataset (or for selected partition files).
 fn from_clause(lease: &Lease, src: &Source, files: Option<&[String]>) -> Result<String, E> {
     if let (Layout::Partitioned(_), None, true) = (&src.layout, files, is_http(&src.root)) {
-        let all = partition_files(lease, src)?;
+        let all = partition_files(lease, src, None)?;
         return from_clause(lease, src, Some(&all));
     }
     Ok(match &src.layout {
         Layout::Flat if is_http(&src.root) => format!(
             "read_parquet({}, hive_partitioning = false)",
-            lit(&join(&src.root, "data/part-00000.parquet"))
+            lit(&join(
+                &src.root,
+                if crate::timequery::grain_of(src.manifest.as_ref())?.is_some() {
+                    "data/time_values.parquet"
+                } else {
+                    "data/part-00000.parquet"
+                }
+            ))
         ),
         Layout::Flat => format!(
             "read_parquet({}, hive_partitioning = false)",
@@ -530,7 +575,11 @@ pub fn select_snapshot(lease: &Lease, src: &mut Source, p: &Params) -> Result<()
 /// A whole Iceberg table read with read_parquet over its live files (from the cached
 /// manifests) instead of iceberg_scan, which is very slow on S3. None when the table needs
 /// iceberg_scan (delete files, nothing to prune on, not Iceberg).
-fn iceberg_read_plan(lease: &Lease, src: &Source) -> Result<Option<(Plan, Vec<String>)>, E> {
+fn iceberg_read_plan(
+    lease: &Lease,
+    src: &Source,
+    period: Option<&crate::timequery::PeriodRange>,
+) -> Result<Option<(Plan, Vec<String>)>, E> {
     let Layout::Iceberg { metadata } = &src.layout else {
         return Ok(None);
     };
@@ -544,7 +593,7 @@ fn iceberg_read_plan(lease: &Lease, src: &Source) -> Result<Option<(Plan, Vec<St
     let Some(t) = crate::icefast::load(lease, &src.root, &key, &meta)? else {
         return Ok(None);
     };
-    let Some(files) = t.all_files(lease)? else {
+    let Some(files) = t.all_files(lease, period)? else {
         return Ok(None);
     };
     let names: Vec<String> = t.columns.iter().map(|(n, _)| n.clone()).collect();
@@ -576,16 +625,38 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
     } else {
         None
     };
+    let time = crate::timequery::parse(p, src.manifest.as_ref(), false)?;
+    let range = time.as_ref().and_then(|t| t.range.as_ref());
     let mut present = None;
-    let plan = match iceberg_read_plan(&lease, &src)? {
+    let plan = match iceberg_read_plan(&lease, &src, range)? {
         Some((plan, cols)) => {
             present = Some(cols);
             plan
         }
-        None => Plan::Query(format!(
-            "SELECT * FROM {}",
-            from_clause(&lease, &src, None)?
-        )),
+        None => {
+            let from = match (&src.layout, range) {
+                (Layout::Partitioned(_), Some(r)) => {
+                    let files = partition_files(&lease, &src, Some(r))?;
+                    if files.is_empty() {
+                        // No chunk in the range: the columns of the dataset, no rows.
+                        format!("(SELECT * FROM {} LIMIT 0)", from_clause(&lease, &src, None)?)
+                    } else {
+                        from_clause(&lease, &src, Some(&files))?
+                    }
+                }
+                _ => from_clause(&lease, &src, None)?,
+            };
+            Plan::Query(format!("SELECT * FROM {from}"))
+        }
+    };
+    let plan = match &time {
+        Some(t) => crate::timequery::rollup(
+            crate::timequery::filter(plan, t),
+            t,
+            src.manifest.as_ref(),
+            present.as_deref(),
+        )?,
+        None => plan,
     };
     let plan = match id {
         Some((d, level)) => add_rollup(
@@ -598,6 +669,7 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
                 weight: None,
                 extra: None,
                 present,
+                time,
             },
         )?,
         None if p.int("rollup_level").is_some() => {
@@ -622,6 +694,15 @@ pub struct QueryCtx {
     pub extra: Option<&'static str>,
     /// Columns the plan returns, when known (an older snapshot may lack newer columns).
     pub present: Option<Vec<String>>,
+    /// Time cube read (period range, roll-up in time); None for cell_values datasets.
+    pub time: Option<crate::timequery::TimeQuery>,
+}
+
+impl QueryCtx {
+    /// Whether the rows have a `period` column (a time cube not rolled up over all periods).
+    pub fn has_period(&self) -> bool {
+        self.time.as_ref().is_some_and(|t| t.has_period())
+    }
 }
 
 /// SQL aggregate of value column `c` by rule, each cell weighted by `w`.
@@ -826,10 +907,16 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         Some(w) => format!(", CAST(sum(r.{w}) / {children:?} AS DOUBLE) AS {w}"),
         None => String::new(),
     };
+    // A time cube rolls up per period: one row per (ancestor, period).
+    let (period, group, order) = if ctx.has_period() {
+        ("r.period AS period, ", "1, 3", "2, 3")
+    } else {
+        ("", "1", "2")
+    };
     let wrap = |inner: &str| {
         format!(
-            "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {}, \
-             count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY 1 ORDER BY 2",
+            "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {period}{}, \
+             count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY {group} ORDER BY {order}",
             lit(ctx.code),
             aggs.join(", ")
         )
@@ -887,7 +974,7 @@ pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
     let rollup = p.int("rollup_level").is_some();
     let mut parts = Vec::new();
     for path in &paths {
-        let (plan, ctx) = plan_query_cells(p, path)?;
+        let (plan, ctx) = plan_query_cells(p, path, true)?;
         let plan = add_rollup(plan, p, &ctx)?;
         parts.push((path.clone(), plan, ctx));
     }
@@ -929,6 +1016,21 @@ pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
         format!("{} AS packed_id", coalesce("packed_id")),
         format!("{} AS gid", coalesce("gid")),
     ];
+    // Time cubes join on (cell, period); a dataset without periods joins on the cell alone,
+    // so its values repeat for every period.
+    let timed: Vec<bool> = parts.iter().map(|(_, _, c)| c.has_period()).collect();
+    let periods = |upto: usize| -> Vec<String> {
+        (0..upto).filter(|k| timed[*k]).map(|k| format!("t{k}.period")).collect()
+    };
+    let any_timed = timed.iter().any(|t| *t);
+    if any_timed {
+        let all = periods(n);
+        select.push(if all.len() == 1 {
+            format!("{} AS period", all[0])
+        } else {
+            format!("coalesce({}) AS period", all.join(", "))
+        });
+    }
     let names: Vec<String> = parts.iter().map(|(p, _, _)| dataset_alias(p)).collect();
     let aliases: Vec<String> = names
         .iter()
@@ -970,9 +1072,21 @@ pub fn plan_query_multi(p: &Params) -> Result<Plan, E> {
             } else {
                 format!("coalesce({})", prev.join(", "))
             };
-            from.push_str(&format!(" FULL JOIN ({s}) AS t{i} ON t{i}.{key} = {on}"));
+            let prior = periods(i);
+            let on_period = if timed[i] && !prior.is_empty() {
+                let p = if prior.len() == 1 {
+                    prior[0].clone()
+                } else {
+                    format!("coalesce({})", prior.join(", "))
+                };
+                format!(" AND t{i}.period = {p}")
+            } else {
+                String::new()
+            };
+            from.push_str(&format!(" FULL JOIN ({s}) AS t{i} ON t{i}.{key} = {on}{on_period}"));
         }
-        format!("SELECT {} FROM {from} ORDER BY 1", select.join(", "))
+        let order = if any_timed { "1, 3" } else { "1" };
+        format!("SELECT {} FROM {from} ORDER BY {order}", select.join(", "))
     };
     let typed = parts.iter().all(|(_, pl, _)| matches!(pl, Plan::Typed(..)));
     let plan = if typed {
@@ -1103,18 +1217,35 @@ pub fn plan_query(p: &Params) -> Result<Plan, E> {
         return Err("fill_nulls is for several datasets: query_cell_dataset([path, ...])".into());
     }
     let path = p.pos_text(0, "path")?;
-    let (plan, ctx) = plan_query_cells(p, &path)?;
+    let (plan, ctx) = plan_query_cells(p, &path, false)?;
     let plan = add_rollup(plan, p, &ctx)?;
     add_geometry(plan, p, Some(ctx.code))
 }
 
-/// The cells of the query area joined with the dataset, and the dataset's domain code.
-fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
+/// The cells of the query area joined with the dataset, and the dataset's domain code; for a
+/// time cube only the periods asked for, rolled up in time when asked.
+fn plan_query_cells(p: &Params, path: &str, multi: bool) -> Result<(Plan, QueryCtx), E> {
+    let (plan, ctx) = plan_query_area(p, path, multi)?;
+    let plan = match &ctx.time {
+        Some(t) => crate::timequery::rollup(
+            crate::timequery::filter(plan, t),
+            t,
+            ctx.manifest.as_ref(),
+            ctx.present.as_deref(),
+        )?,
+        None => plan,
+    };
+    Ok((plan, ctx))
+}
+
+fn plan_query_area(p: &Params, path: &str, multi: bool) -> Result<(Plan, QueryCtx), E> {
     let path = path.to_string();
     let lease = sql::lease()?;
     let mut src = open(&lease, &path)?;
     select_snapshot(&lease, &mut src, p)?;
     let (d, level) = identity(&src, p)?;
+    let time = crate::timequery::parse(p, src.manifest.as_ref(), multi)?;
+    let range = time.as_ref().and_then(|t| t.range.clone());
     let limit = p.int("max_candidate_limit").unwrap_or(100_000);
     let (wkt, crs, min_cov) = query_polygon(p, d, level)?;
     let shape = geom::parse_geometry(&wkt)?;
@@ -1198,6 +1329,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
         weight: (extra != "point_count").then_some(extra),
         extra: Some(extra),
         present: None,
+        time,
     };
     let packed: Vec<i64> = cells
         .iter()
@@ -1221,7 +1353,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
             let mut sorted = packed.clone();
             sorted.sort_unstable();
             sorted.dedup();
-            if let Some(sel) = t.files_for(&lease, &sorted)? {
+            if let Some(sel) = t.files_for(&lease, &sorted, range.as_ref())? {
                 if sel.is_empty() {
                     ctx.present = Some(t.columns.iter().map(|(n, _)| n.clone()).collect());
                     return Ok((
@@ -1260,7 +1392,7 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
                 .collect::<Result<_, _>>()?;
             prefixes.sort();
             prefixes.dedup();
-            let all = partition_files(&lease, &src)?;
+            let all = partition_files(&lease, &src, range.as_ref())?;
             Some(
                 all.into_iter()
                     .filter(|f| {
@@ -1295,7 +1427,8 @@ fn plan_query_cells(p: &Params, path: &str) -> Result<(Plan, QueryCtx), E> {
              WHERE d.packed_id BETWEEN {lo} AND {hi}"
         )
     } else if cols.iter().any(|c| c == "gid") {
-        format!("SELECT d.*, k.{extra} FROM {from} AS d JOIN {keys} AS k ON d.gid = k.gid")
+        // No packed_id in the files (the flat time cube): take it from the query cells.
+        format!("SELECT k.packed_id AS packed_id, d.*, k.{extra} FROM {from} AS d JOIN {keys} AS k ON d.gid = k.gid")
     } else {
         return Err("dataset has neither a packed_id nor a gid column".into());
     };
@@ -1359,7 +1492,8 @@ pub fn plan_info(p: &Params) -> Result<Plan, E> {
     Ok(Plan::Query(format!(
         "SELECT {} AS path, {} AS layout, {} AS domain_code, {} AS level, {} AS row_count, \
          {} AS title, {} AS description, {} AS data_period, {} AS data_version, \
-         {} AS source, {} AS coverage, {} AS provenance, {} AS manifest, {} AS dataset_info",
+         {} AS source, {} AS coverage, {} AS provenance, {} AS manifest, {} AS dataset_info, \
+         {} AS dataset_type, {} AS period_type, {} AS period_start, {} AS period_end",
         lit(&src.root),
         lit(layout),
         slit(m.get("domain_code")),
@@ -1374,6 +1508,14 @@ pub fn plan_info(p: &Params) -> Result<Plan, E> {
         jlit(m.get("provenance").unwrap_or(&Json::Null)),
         jlit(&m),
         jlit(&info),
+        slit(m.get("dataset_type")),
+        // 'day', 'hour:4' (bucket written in), as period_type := takes it
+        match crate::timequery::grain_of(Some(&m)).ok().flatten() {
+            Some(g) => lit(&g.spec()),
+            None => "NULL::VARCHAR".into(),
+        },
+        slit(m.get("period_start")),
+        slit(m.get("period_end")),
     )))
 }
 
@@ -1387,14 +1529,15 @@ pub fn plan_columns(p: &Params) -> Result<Plan, E> {
         .unwrap_or_default();
     if fields.is_empty() {
         return Ok(Plan::Query("SELECT NULL::VARCHAR AS \"column\", NULL::VARCHAR AS parquet_type, NULL::VARCHAR AS semantics, \
-            NULL::VARCHAR AS aggregation_rule, NULL::VARCHAR AS unit, NULL::VARCHAR AS description, NULL::BOOLEAN AS nullable LIMIT 0".into()));
+            NULL::VARCHAR AS aggregation_rule, NULL::VARCHAR AS unit, NULL::VARCHAR AS description, NULL::BOOLEAN AS nullable, \
+            NULL::VARCHAR AS time_aggregation LIMIT 0".into()));
     }
     let rows: Vec<String> = fields
         .iter()
         .map(|f| {
             let name = f.get("name").and_then(Json::as_str).unwrap_or("");
             format!(
-                "({}, {}, {}, {}, {}, {}, {})",
+                "({}, {}, {}, {}, {}, {}, {}, {})",
                 lit(name),
                 slit(f.get("parquet_type")),
                 slit(f.get("semantics")),
@@ -1409,11 +1552,12 @@ pub fn plan_columns(p: &Params) -> Result<Plan, E> {
                 } else {
                     "false"
                 },
+                slit(f.get("time_aggregation")),
             )
         })
         .collect();
     Ok(Plan::Query(format!(
-        "SELECT * FROM (VALUES {}) AS t(\"column\", parquet_type, semantics, aggregation_rule, unit, description, nullable)",
+        "SELECT * FROM (VALUES {}) AS t(\"column\", parquet_type, semantics, aggregation_rule, unit, description, nullable, time_aggregation)",
         rows.join(", ")
     )))
 }

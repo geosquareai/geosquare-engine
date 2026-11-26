@@ -24,6 +24,8 @@ mod registry;
 mod sql;
 mod storage;
 mod tables;
+mod timecube;
+mod timequery;
 mod v1;
 mod valid;
 mod writer;
@@ -104,6 +106,14 @@ unsafe fn register_dataset_functions(
             ("rollup_rule", Text),
             ("space_weight", Text),
         ]);
+        let time_params = [
+            ("period", Text),
+            ("period_from", Text),
+            ("period_to", Text),
+            ("time_rollup", Text),
+            ("time_rule", Text),
+        ];
+        read_params.extend(time_params);
         let r = (|| -> Result<(), Box<dyn Error>> {
             sql::register(
                 con,
@@ -131,6 +141,7 @@ unsafe fn register_dataset_functions(
                 ("rollup_rule", Text),
                 ("space_weight", Text),
             ]);
+            q.extend(time_params);
             let mut qm = q;
             qm.push(("fill_nulls", Bool));
             // query_cell_dataset(path | [path, ...]): a list behaves as query_cell_datasets.
@@ -182,6 +193,12 @@ unsafe fn register_dataset_functions(
                 ("share_policy", Text),
                 ("refresh", Text),
                 ("derived_from", Text),
+                ("period_type", Text),
+                ("bucket_hours", Int),
+                ("period_start", Text),
+                ("period_end", Text),
+                ("time_chunk", Text),
+                ("time_aggregation", Text),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),

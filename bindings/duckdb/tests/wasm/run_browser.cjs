@@ -26,7 +26,7 @@ const fs = require("fs");
   let checks = Object.entries(expected);
   if (got.parquet_unavailable) {
     console.log(`skip dataset checks: DuckDB's parquet extension does not load in this bundle (${got.parquet_unavailable})`);
-    checks = checks.filter(([k]) => ["point_to_cell", "v1_gid", "cells"].includes(k));
+    checks = checks.filter(([k]) => ["point_to_cell", "v1_gid", "cells", "period_labels"].includes(k));
   }
   for (const [k, v] of checks) {
     const same = JSON.stringify(got[k]) === JSON.stringify(v);

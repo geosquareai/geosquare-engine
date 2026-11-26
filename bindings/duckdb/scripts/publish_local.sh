@@ -7,10 +7,11 @@
 # (Wasm), the AWS CLI with write access to the bucket.
 #   linux_amd64/arm64  glibc 2.28 (RHEL 8 / Debian 10 / Ubuntu 18.10 and newer)
 #   windows_amd64      MinGW build; imports only Windows system DLLs (Windows 10+)
-#   osx_amd64/arm64    macOS 11+, linked against a CoreFoundation stub (scripts/macos-stubs,
-#                      the 7 functions chrono/iana-time-zone use; macOS has the real
-#                      framework). Built without the native S3 client (no macOS SDK here):
-#                      reading S3 through httpfs works, writing/maintaining S3 tables does not.
+#   osx_amd64/arm64    macOS 11+, with the native S3 client. There is no macOS SDK here, so it
+#                      links against stubs of CoreFoundation and Security (scripts/macos-stubs:
+#                      the functions chrono and rustls' certificate check use); macOS loads the
+#                      real system frameworks. A new dependency that calls more of them fails
+#                      the link with "undefined symbol": add the symbol to the stub.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DEST="${1:-s3://geosquare-static/geosquare-v2}"
@@ -31,7 +32,7 @@ for pair in "aarch64-apple-darwin osx_arm64" "x86_64-apple-darwin osx_amd64"; do
   set -- $pair
   env MACOSX_DEPLOYMENT_TARGET=11.0 \
     "CARGO_TARGET_$(echo "$1" | tr 'a-z-' 'A-Z_')_RUSTFLAGS=-C link-arg=-F$PWD/scripts/macos-stubs" \
-    cargo zigbuild --release --target "$1" --no-default-features
+    cargo zigbuild --release --target "$1"
   mkdir -p "dist/$2"
   python3 scripts/append_extension_metadata.py -l "target/$1/release/libgeosquare_v2.dylib" \
     -n geosquare_v2 -p "$2" -dv v1.2.0 -ev "v$VERSION" -o "dist/$2/geosquare_v2.duckdb_extension" >/dev/null
