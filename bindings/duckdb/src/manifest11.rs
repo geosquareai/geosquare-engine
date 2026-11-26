@@ -568,7 +568,7 @@ mod tests {
             "string",
             "CATEGORICAL",
             Some("majority_weighted"),
-            None
+            Some("w")
         )])
         .is_err());
         assert!(resolve_fields(&[field("n", "int64", "MEASUREMENT", None, Some("area"))]).is_err());

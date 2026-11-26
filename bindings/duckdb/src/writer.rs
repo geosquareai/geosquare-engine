@@ -642,15 +642,10 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
         "cell_count",
     ];
     let mut aggs = Vec::new();
+    let mut majority: Vec<String> = Vec::new();
     for (c, ty) in &cols {
         if skip.contains(&c.as_str()) || Some(c.as_str()) == weight {
             continue;
-        }
-        if !is_numeric_type(ty) {
-            return Err(format!(
-                "rollup_level aggregates numeric columns; {c} is {ty}: aggregate or drop it in the query"
-            )
-            .into());
         }
         let sem = sem_map
             .get(c)
@@ -665,6 +660,14 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
         let Some((rule, space_w)) = crate::dataset::space_rule(c, &sem, rule, space_w)? else {
             continue; // `none`: the column is not rolled up
         };
+        if rule == "majority_weighted" {
+            majority.push(c.clone());
+        } else if !is_numeric_type(ty) {
+            return Err(format!(
+                "rollup_level aggregates numeric columns; {c} is {ty}: give it CATEGORICAL semantics (majority_weighted), or aggregate or drop it in the query"
+            )
+            .into());
+        }
         aggs.push(format!(
             "{} AS {}",
             crate::dataset::space_expr(c, &rule, space_w.as_deref(), &w)?,
@@ -682,9 +685,13 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
     } else {
         String::new()
     };
-    Ok(format!(
-        "SELECT left({gid}, {r}) AS gid{packed}, {} FROM ({src}) AS r GROUP BY 1",
-        aggs.join(", ")
+    Ok(crate::dataset::majority_finish(
+        &format!(
+            "SELECT left({gid}, {r}) AS gid{packed}, {} FROM ({src}) AS r GROUP BY 1",
+            aggs.join(", ")
+        ),
+        &majority,
+        "gid",
     ))
 }
 

@@ -797,10 +797,6 @@ pub fn space_rule(
         "sum" | "min" | "max" | "median" if weight.is_some() => {
             Err(format!("column {column}: {rule} takes no space_weight").into())
         }
-        "majority_weighted" => Err(format!(
-            "column {column}: majority_weighted is not implemented in the engine yet"
-        )
-        .into()),
         _ => Ok(Some((rule, weight))),
     }
 }
@@ -818,6 +814,13 @@ pub fn space_expr(
         None | Some("area") => area_weight.to_string(),
         Some(field) => format!("(r.{} * {area_weight})", sql::ident(field)),
     };
+    if rule == "majority_weighted" {
+        // Scores per class are summed in majority_finish: here the (class, weight) pairs.
+        let c = format!("r.{}", sql::ident(column));
+        return Ok(format!(
+            "list(struct_pack(c := {c}, w := CAST({w} AS DOUBLE))) FILTER (WHERE {c} IS NOT NULL)"
+        ));
+    }
     let engine_rule = if rule == "weighted_mean" {
         "mean"
     } else {
@@ -873,6 +876,7 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         .map(|w| format!("r.{w}"))
         .unwrap_or_else(|| "1.0".into());
     let mut aggs = Vec::new();
+    let mut majority: Vec<String> = Vec::new();
     for f in fields {
         let name = f.get("name").and_then(Json::as_str).unwrap_or("");
         if name.is_empty()
@@ -898,6 +902,9 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         let Some((rule, weight)) = space_rule(name, semantics, rule, weight)? else {
             continue; // `none`: the column is not rolled up
         };
+        if rule == "majority_weighted" {
+            majority.push(name.to_string());
+        }
         aggs.push(format!(
             "{} AS {}",
             space_expr(name, &rule, weight.as_deref(), &w)?,
@@ -918,11 +925,15 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         ("", "1", "2")
     };
     let wrap = |inner: &str| {
-        format!(
-            "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {period}{}, \
-             count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY {group} ORDER BY {order}",
-            lit(ctx.code),
-            aggs.join(", ")
+        majority_finish(
+            &format!(
+                "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {period}{}, \
+                 count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY {group} ORDER BY {order}",
+                lit(ctx.code),
+                aggs.join(", ")
+            ),
+            &majority,
+            order,
         )
     };
     Ok(match plan {
@@ -930,6 +941,26 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         Plan::Typed(q, probe) => Plan::Typed(wrap(&q), wrap(&probe)),
         other => other,
     })
+}
+
+/// `majority_weighted` columns: replace each column's (class, weight) list from space_expr
+/// with the class of the largest summed weight; a tie goes to the greatest class as text
+/// (the rule of geosquare_v2.aggregation.aggregate_categorical). No class: NULL.
+pub fn majority_finish(sql: &str, columns: &[String], order: &str) -> String {
+    if columns.is_empty() {
+        return sql.to_string();
+    }
+    let picks: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let c = sql::ident(c);
+            format!(
+                "(SELECT u.c FROM (SELECT unnest(g.{c}, recursive := true)) AS u GROUP BY u.c \
+                 ORDER BY sum(u.w) DESC, CAST(u.c AS VARCHAR) DESC LIMIT 1) AS {c}"
+            )
+        })
+        .collect();
+    format!("SELECT * REPLACE ({}) FROM ({sql}) AS g ORDER BY {order}", picks.join(", "))
 }
 
 /// Value columns of a dataset (from its cell manifest).
