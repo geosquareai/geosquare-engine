@@ -27,6 +27,7 @@ mod tables;
 mod boundary;
 mod compact;
 mod compact_store;
+mod crosswalk;
 mod geoagg;
 mod timecube;
 mod timequery;
@@ -248,6 +249,28 @@ unsafe fn register_dataset_functions(
                     ("boundary_sha256", Text),
                 ],
                 geoagg::plan,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "validate_crosswalk",
+                vec![Text],
+                vec![("manifest", Text)],
+                crosswalk::plan_validate,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "polygon_crosswalk",
+                vec![Text],
+                vec![
+                    ("domain_code", Text),
+                    ("level", Int),
+                    ("id_column", Text),
+                    ("geometry_column", Text),
+                    ("source_crs", Text),
+                ],
+                crosswalk::plan_polygons,
                 pool.clone(),
             )?;
             sql::register(
