@@ -67,6 +67,9 @@ for layout in ("flat", "partitioned", "iceberg"):
     p = f"{url}/time_{layout}"
     exp[f"time_{layout}_month"] = s(c.execute(f"SELECT count(*), round(sum(rain), 6)::VARCHAR FROM read_cell_dataset('{p}', period := '2026-02')").fetchone())
     exp[f"time_{layout}_query"] = s(c.execute(f"SELECT count(*), round(sum(rain), 6)::VARCHAR FROM query_cell_dataset('{p}', geometry := ?, time_rollup := 'month', period_from := '2026-01-25')", [wkt]).fetchone())
+c.execute(f"SELECT * FROM write_compact_set('SELECT gid FROM polygon_to_cells(''ID'', ''POLYGON ((106.80 -6.21, 106.82 -6.21, 106.82 -6.19, 106.80 -6.19, 106.80 -6.21))'', 12)', '{www}/compact', domain_code := 'ID', canonicalize := true)").fetchall()
+exp["parity_scalars"] = s(c.execute("SELECT compact_canonicalize(['22', '23', '24', '25', '32'])::VARCHAR, boundary_covers_point('ID', 106.81, -6.21, 'POLYGON ((106.80 -6.22, 106.84 -6.22, 106.84 -6.18, 106.80 -6.18, 106.80 -6.22))')::VARCHAR, round(boundary_coverage('ID', point_to_cell('ID', 106.8401, -6.2, 9).gid, 'POLYGON ((106.80 -6.22, 106.84 -6.22, 106.84 -6.18, 106.80 -6.18, 106.80 -6.22))'), 9)::VARCHAR, len(geometry_to_cells('ID', 'POLYGON ((106.800 -6.210, 106.812 -6.210, 106.812 -6.199, 106.800 -6.199, 106.800 -6.210))', 12))::VARCHAR").fetchone())
+exp["compact_read"] = s(c.execute(f"SELECT count(*), count(DISTINCT level) FROM read_compact_set('{url}/compact')").fetchone() + c.execute(f"SELECT count(*) FROM read_compact_set('{url}/compact', level := 12)").fetchone())
 exp["multi"] = s(c.execute(f"SELECT count(*), round(sum(flat__population + iceberg__population), 6)::VARCHAR FROM query_cell_datasets(['{url}/flat', '{url}/iceberg'], geometry := ?, rollup_level := 9)", [wkt]).fetchone())
 json.dump(exp, open(f"{www}/expected.json", "w"), indent=1)
 PY

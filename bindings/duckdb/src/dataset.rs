@@ -73,7 +73,7 @@ fn glob(lease: &Lease, pattern: &str) -> Result<Vec<String>, E> {
     }
 }
 
-fn is_not_found(msg: &str) -> bool {
+pub(crate) fn is_not_found(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("404")
         || m.contains("not found")
@@ -81,7 +81,7 @@ fn is_not_found(msg: &str) -> bool {
         || m.contains("no files found")
 }
 
-fn read_text(lease: &Lease, path: &str) -> Result<String, E> {
+pub(crate) fn read_text(lease: &Lease, path: &str) -> Result<String, E> {
     sql::query_text_on(
         lease,
         &format!("SELECT content FROM read_text({})", lit(path)),
@@ -619,6 +619,10 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
     let path = p.pos_text(0, "path")?;
     let lease = sql::lease()?;
     let mut src = open(&lease, &path)?;
+    if crate::compact_store::is_compact(src.manifest.as_ref()) {
+        // A compact set: its rows, or its cells at `level := L`.
+        return crate::compact_store::read_plan(&src.root, p.int("level"));
+    }
     select_snapshot(&lease, &mut src, p)?;
     let id = if src.manifest.is_some() || p.text("domain_code").is_some() {
         Some(identity(&src, p)?) // also validates the manifest against the engine
@@ -648,6 +652,13 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
             };
             Plan::Query(format!("SELECT * FROM {from}"))
         }
+    };
+    let plan = match id {
+        Some((d, _)) => boundary_filter(plan, p, d)?,
+        None if p.text("boundary").is_some() => {
+            return Err("boundary needs the domain: the dataset has no cell manifest".into())
+        }
+        None => plan,
     };
     let plan = match &time {
         Some(t) => crate::timequery::rollup(
@@ -793,10 +804,6 @@ pub fn space_rule(
         "sum" | "min" | "max" | "median" if weight.is_some() => {
             Err(format!("column {column}: {rule} takes no space_weight").into())
         }
-        "majority_weighted" => Err(format!(
-            "column {column}: majority_weighted is not implemented in the engine yet"
-        )
-        .into()),
         _ => Ok(Some((rule, weight))),
     }
 }
@@ -814,6 +821,13 @@ pub fn space_expr(
         None | Some("area") => area_weight.to_string(),
         Some(field) => format!("(r.{} * {area_weight})", sql::ident(field)),
     };
+    if rule == "majority_weighted" {
+        // Scores per class are summed in majority_finish: here the (class, weight) pairs.
+        let c = format!("r.{}", sql::ident(column));
+        return Ok(format!(
+            "list(struct_pack(c := {c}, w := CAST({w} AS DOUBLE))) FILTER (WHERE {c} IS NOT NULL)"
+        ));
+    }
     let engine_rule = if rule == "weighted_mean" {
         "mean"
     } else {
@@ -869,6 +883,7 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         .map(|w| format!("r.{w}"))
         .unwrap_or_else(|| "1.0".into());
     let mut aggs = Vec::new();
+    let mut majority: Vec<String> = Vec::new();
     for f in fields {
         let name = f.get("name").and_then(Json::as_str).unwrap_or("");
         if name.is_empty()
@@ -894,6 +909,9 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         let Some((rule, weight)) = space_rule(name, semantics, rule, weight)? else {
             continue; // `none`: the column is not rolled up
         };
+        if rule == "majority_weighted" {
+            majority.push(name.to_string());
+        }
         aggs.push(format!(
             "{} AS {}",
             space_expr(name, &rule, weight.as_deref(), &w)?,
@@ -914,11 +932,15 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         ("", "1", "2")
     };
     let wrap = |inner: &str| {
-        format!(
-            "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {period}{}, \
-             count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY {group} ORDER BY {order}",
-            lit(ctx.code),
-            aggs.join(", ")
+        majority_finish(
+            &format!(
+                "SELECT left(r.gid, {r}) AS gid, pack({}, left(r.gid, {r})) AS packed_id, {period}{}, \
+                 count(*) AS cell_count{coverage} FROM ({inner}) AS r GROUP BY {group} ORDER BY {order}",
+                lit(ctx.code),
+                aggs.join(", ")
+            ),
+            &majority,
+            order,
         )
     };
     Ok(match plan {
@@ -926,6 +948,64 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
         Plan::Typed(q, probe) => Plan::Typed(wrap(&q), wrap(&probe)),
         other => other,
     })
+}
+
+/// `boundary`, `boundary_predicate` (default CENTROID_COVERED for cells), `boundary_min_coverage`
+/// and `boundary_sha256` as extra arguments of geometry_to_cells (", spec, predicate, t"), or
+/// "" without a boundary. The boundary is loaded and checked here, at bind time.
+pub fn boundary_args(p: &Params, d: &'static geosquare_core::domain::Domain) -> Result<String, E> {
+    let Some(spec) = p.text("boundary") else {
+        for k in ["boundary_predicate", "boundary_min_coverage", "boundary_sha256"] {
+            if p.get(k).is_some() {
+                return Err(format!("{k} needs boundary := '<GeoJSON or WKT, or a file path>'").into());
+            }
+        }
+        return Ok(String::new());
+    };
+    let pred = p.text("boundary_predicate").unwrap_or_else(|| "CENTROID_COVERED".into());
+    let t = p.float("boundary_min_coverage");
+    crate::boundary::Rule::parse(&pred, t).map_err(|e| e.to_string())?;
+    crate::boundary::load(d, &spec, p.text("boundary_sha256").as_deref(), crate::boundary::read_file)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(", {}, {}{}", lit(&spec), lit(&pred), t.map_or(String::new(), |t| format!(", {t:?}"))))
+}
+
+/// Keep the cells the boundary rule accepts (`boundary := ...`, see boundary_args).
+fn boundary_filter(plan: Plan, p: &Params, d: &'static geosquare_core::domain::Domain) -> Result<Plan, E> {
+    let args = boundary_args(p, d)?;
+    if args.is_empty() {
+        return Ok(plan);
+    }
+    if p.text("boundary_predicate").is_some_and(|x| x.eq_ignore_ascii_case("COVERS_POINT")) {
+        return Err("COVERS_POINT is for points; filter cells with CENTROID_COVERED, INTERSECTS or MIN_COVERAGE".into());
+    }
+    let cond = format!("boundary_cell_matches({}, gid{args})", lit(d.code));
+    let wrap = |q: &str| format!("SELECT * FROM ({q}) WHERE {cond}");
+    Ok(match plan {
+        Plan::Query(q) => Plan::Query(wrap(&q)),
+        Plan::Typed(q, probe) => Plan::Typed(wrap(&q), probe),
+        other => other,
+    })
+}
+
+/// `majority_weighted` columns: replace each column's (class, weight) list from space_expr
+/// with the class of the largest summed weight; a tie goes to the greatest class as text
+/// (the rule of geosquare_v2.aggregation.aggregate_categorical). No class: NULL.
+pub fn majority_finish(sql: &str, columns: &[String], order: &str) -> String {
+    if columns.is_empty() {
+        return sql.to_string();
+    }
+    let picks: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let c = sql::ident(c);
+            format!(
+                "(SELECT u.c FROM (SELECT unnest(g.{c}, recursive := true)) AS u GROUP BY u.c \
+                 ORDER BY sum(u.w) DESC, CAST(u.c AS VARCHAR) DESC LIMIT 1) AS {c}"
+            )
+        })
+        .collect();
+    format!("SELECT * REPLACE ({}) FROM ({sql}) AS g ORDER BY {order}", picks.join(", "))
 }
 
 /// Value columns of a dataset (from its cell manifest).
@@ -1226,6 +1306,7 @@ pub fn plan_query(p: &Params) -> Result<Plan, E> {
 /// time cube only the periods asked for, rolled up in time when asked.
 fn plan_query_cells(p: &Params, path: &str, multi: bool) -> Result<(Plan, QueryCtx), E> {
     let (plan, ctx) = plan_query_area(p, path, multi)?;
+    let plan = boundary_filter(plan, p, crate::grid::domain_by_code(ctx.code).map_err(|e| e.to_string())?)?;
     let plan = match &ctx.time {
         Some(t) => crate::timequery::rollup(
             crate::timequery::filter(plan, t),

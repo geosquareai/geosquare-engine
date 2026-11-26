@@ -24,6 +24,11 @@ mod registry;
 mod sql;
 mod storage;
 mod tables;
+mod boundary;
+mod compact;
+mod compact_store;
+mod crosswalk;
+mod geoagg;
 mod timecube;
 mod timequery;
 mod v1;
@@ -114,6 +119,13 @@ unsafe fn register_dataset_functions(
             ("time_rule", Text),
         ];
         read_params.extend(time_params);
+        let boundary_params = [
+            ("boundary", Text),
+            ("boundary_predicate", Text),
+            ("boundary_min_coverage", Float),
+            ("boundary_sha256", Text),
+        ];
+        read_params.extend(boundary_params);
         let r = (|| -> Result<(), Box<dyn Error>> {
             sql::register(
                 con,
@@ -142,6 +154,7 @@ unsafe fn register_dataset_functions(
                 ("space_weight", Text),
             ]);
             q.extend(time_params);
+            q.extend(boundary_params);
             let mut qm = q;
             qm.push(("fill_nulls", Bool));
             // query_cell_dataset(path | [path, ...]): a list behaves as query_cell_datasets.
@@ -199,6 +212,7 @@ unsafe fn register_dataset_functions(
                 ("period_end", Text),
                 ("time_chunk", Text),
                 ("time_aggregation", Text),
+                ("compact_extent", Bool),
                 ("s3_region", Text),
                 ("s3_endpoint", Text),
                 ("s3_url_style", Text),
@@ -207,6 +221,85 @@ unsafe fn register_dataset_functions(
                 ("s3_secret_access_key", Text),
                 ("s3_session_token", Text),
             ]);
+            sql::register(
+                con,
+                "write_compact_set",
+                vec![Text, Text],
+                vec![("domain_code", Text), ("canonicalize", Bool), ("mode", Text)],
+                compact_store::plan_write,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "aggregate_geometries_to_cells",
+                vec![Text],
+                vec![
+                    ("domain_code", Text),
+                    ("level", Int),
+                    ("value_semantics", Text),
+                    ("geometry_column", Text),
+                    ("source_crs", Text),
+                    ("id_column", Text),
+                    ("category_rule", Text),
+                    ("rate_parts", Text),
+                    ("range_columns", Text),
+                    ("ordinal_order", Text),
+                    ("boundary", Text),
+                    ("boundary_predicate", Text),
+                    ("boundary_min_coverage", Float),
+                    ("boundary_sha256", Text),
+                ],
+                geoagg::plan,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "validate_crosswalk",
+                vec![Text],
+                vec![("manifest", Text)],
+                crosswalk::plan_validate,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "polygon_crosswalk",
+                vec![Text],
+                vec![
+                    ("domain_code", Text),
+                    ("level", Int),
+                    ("id_column", Text),
+                    ("geometry_column", Text),
+                    ("source_crs", Text),
+                ],
+                crosswalk::plan_polygons,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "time_values",
+                vec![Text],
+                vec![
+                    ("period_type", Text),
+                    ("bucket_hours", Int),
+                    ("value_semantics", Text),
+                    ("time_aggregation", Text),
+                    ("period", Text),
+                    ("period_from", Text),
+                    ("period_to", Text),
+                    ("time_rollup", Text),
+                    ("time_rule", Text),
+                ],
+                timequery::plan_time_values,
+                pool.clone(),
+            )?;
+            sql::register(
+                con,
+                "read_compact_set",
+                vec![Text],
+                vec![("level", Int)],
+                compact_store::plan_read,
+                pool.clone(),
+            )?;
             sql::register(
                 con,
                 "cell_dataset_info",

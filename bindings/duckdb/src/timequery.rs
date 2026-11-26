@@ -35,6 +35,11 @@ fn label_grain(label: &str) -> Result<Grain, E> {
     }
 }
 
+/// Check a label of any period type (YYYY, YYYY-MM, YYYY-MM-DD or YYYY-MM-DDTHH).
+pub fn check_any_label(label: &str) -> Result<(), E> {
+    parse_label(label, &label_grain(label)?).map(|_| ())
+}
+
 /// A half-open period range `[from, to)`; either end may be open.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PeriodRange {
@@ -235,6 +240,62 @@ pub fn rollup(plan: Plan, q: &TimeQuery, manifest: Option<&Json>, present: Optio
         Plan::Typed(s, probe) => Plan::Typed(wrap(&s), wrap(&probe)),
         other => other,
     })
+}
+
+/// time_values(query, period_type := 'day' | 'hour:N' | ..., value_semantics := ...,
+///   time_aggregation := ..., period / period_from / period_to, time_rollup, time_rule)
+///
+/// The time cube reads of read_cell_dataset on any query with a cell (`gid` or `packed_id`),
+/// a `period` column and value columns: CSV, Parquet without a manifest, Delta, a database,
+/// read_raster(..., period := ...). Every label must be of the period type.
+pub fn plan_time_values(p: &Params) -> Result<Plan, E> {
+    let query = p.pos_text(0, "query")?;
+    let spec = p.text("period_type").ok_or("time_values needs period_type := 'day' (or year, month, hour:N)")?;
+    let grain = Grain::parse(&spec, p.int("bucket_hours"))?;
+    let lease = sql::lease()?;
+    let cols: Vec<String> = sql::query_text_on(&lease, &format!("SELECT column_name FROM (DESCRIBE {query})"))?
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect();
+    if !cols.iter().any(|c| c == "period") {
+        return Err("time_values needs a period column".into());
+    }
+    let has_gid = cols.iter().any(|c| c == "gid");
+    if !has_gid && !cols.iter().any(|c| c == "packed_id") {
+        return Err("time_values needs a gid or packed_id column".into());
+    }
+    let semantics = crate::metadata::PerColumn::parse(p.text("value_semantics"), "value_semantics")?;
+    let aggregation = crate::metadata::PerColumn::parse(p.text("time_aggregation"), "time_aggregation")?;
+    const KEYS: [&str; 6] = ["gid", "packed_id", "x_idx", "y_idx", "period", "uri"];
+    let fields: Vec<Json> = cols
+        .iter()
+        .filter(|c| !KEYS.contains(&c.as_str()))
+        .map(|c| {
+            serde_json::json!({
+                "name": c,
+                "semantics": semantics.get(c).unwrap_or("MEASUREMENT").to_ascii_uppercase(),
+                "time_aggregation": aggregation.get(c),
+            })
+        })
+        .collect();
+    let manifest = serde_json::json!({
+        "dataset_type": "cell_time_values",
+        "period_type": grain.name(),
+        "bucket_hours": grain.bucket,
+        "value_fields": fields,
+    });
+    let q = parse(p, Some(&manifest), false)?.ok_or("not a time cube")?;
+    let check = format!(
+        "CASE WHEN period IS NULL OR NOT period_valid(CAST(period AS VARCHAR), {}) \
+         THEN error('time_values: ' || coalesce(CAST(period AS VARCHAR), 'NULL') || ' is not a {} label') END",
+        lit(&grain.spec()),
+        grain.spec()
+    );
+    let gid = if has_gid { String::new() } else { "packed_to_gid(packed_id) AS gid, ".into() };
+    let base = format!(
+        "SELECT {gid}* REPLACE (CAST(period AS VARCHAR) AS period) FROM ({query}) WHERE {check} IS NULL"
+    );
+    rollup(filter(Plan::Query(base), &q), &q, Some(&manifest), None)
 }
 
 #[cfg(test)]

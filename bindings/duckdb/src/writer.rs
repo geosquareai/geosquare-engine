@@ -105,6 +105,9 @@ pub struct Options {
     version: String,
     /// Governance and lineage parameters (manifest 1.1).
     gov: manifest11::Params,
+    /// `compact_extent := true` (manifest 1.1): write the compact set of the covered cells
+    /// to compact/cells.parquet and name it in extent.compact_set_path.
+    compact_extent: bool,
     /// Time cube (`cell_time_values`): one row per (cell, period). Set by `period_type`, or
     /// taken from the dataset being appended to or overwritten.
     time: Option<TimeOpt>,
@@ -224,6 +227,7 @@ pub fn plan_write(p: &Params) -> Result<Plan, E> {
         manifest_version: p.text("manifest_version"),
         version: "1.0".into(),
         gov,
+        compact_extent: p.int("compact_extent").is_some_and(|v| v != 0),
         s3: s3_params(p),
         time: match p.text("period_type") {
             Some(t) => {
@@ -333,7 +337,7 @@ fn sync_marker() -> [u8; 16] {
     s
 }
 
-fn iso_now() -> String {
+pub(crate) fn iso_now() -> String {
     let secs = now_ms() / 1000;
     let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
@@ -425,7 +429,7 @@ impl Drop for Staging {
     }
 }
 
-fn ensure_dir(path: &str) -> Result<(), E> {
+pub(crate) fn ensure_dir(path: &str) -> Result<(), E> {
     #[cfg(not(target_family = "wasm"))]
     if is_local(path) {
         std::fs::create_dir_all(local(path)).map_err(|e| format!("cannot create {path}: {e}"))?;
@@ -642,15 +646,10 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
         "cell_count",
     ];
     let mut aggs = Vec::new();
+    let mut majority: Vec<String> = Vec::new();
     for (c, ty) in &cols {
         if skip.contains(&c.as_str()) || Some(c.as_str()) == weight {
             continue;
-        }
-        if !is_numeric_type(ty) {
-            return Err(format!(
-                "rollup_level aggregates numeric columns; {c} is {ty}: aggregate or drop it in the query"
-            )
-            .into());
         }
         let sem = sem_map
             .get(c)
@@ -665,6 +664,14 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
         let Some((rule, space_w)) = crate::dataset::space_rule(c, &sem, rule, space_w)? else {
             continue; // `none`: the column is not rolled up
         };
+        if rule == "majority_weighted" {
+            majority.push(c.clone());
+        } else if !is_numeric_type(ty) {
+            return Err(format!(
+                "rollup_level aggregates numeric columns; {c} is {ty}: give it CATEGORICAL semantics (majority_weighted), or aggregate or drop it in the query"
+            )
+            .into());
+        }
         aggs.push(format!(
             "{} AS {}",
             crate::dataset::space_expr(c, &rule, space_w.as_deref(), &w)?,
@@ -682,9 +689,13 @@ fn rollup_query(lease: &Lease, query: &str, r: i64, o: &Options) -> Result<Strin
     } else {
         String::new()
     };
-    Ok(format!(
-        "SELECT left({gid}, {r}) AS gid{packed}, {} FROM ({src}) AS r GROUP BY 1",
-        aggs.join(", ")
+    Ok(crate::dataset::majority_finish(
+        &format!(
+            "SELECT left({gid}, {r}) AS gid{packed}, {} FROM ({src}) AS r GROUP BY 1",
+            aggs.join(", ")
+        ),
+        &majority,
+        "gid",
     ))
 }
 
@@ -813,6 +824,7 @@ fn compact(
         manifest_version: None,
         version: "1.0".into(),
         gov: Default::default(),
+        compact_extent: false,
         s3: s3.clone(),
         // Taken from the dataset (period type, chunking) by inherit_time; the range is kept.
         time: None,
@@ -1385,7 +1397,7 @@ fn write_manifest(lease: &Lease, root: &str, manifest: &Json) -> Result<(), E> {
 }
 
 /// Write one JSON object as a file through DuckDB (any filesystem DuckDB can write).
-fn write_json(lease: &Lease, path: &str, doc: &Json) -> Result<(), E> {
+pub(crate) fn write_json(lease: &Lease, path: &str, doc: &Json) -> Result<(), E> {
     let obj = doc.as_object().ok_or("document must be a JSON object")?;
     let cols: Vec<String> = obj
         .iter()
@@ -1694,6 +1706,7 @@ fn field_inputs<'a>(vf: &'a Json, o: &Options) -> Result<Vec<FieldIn<'a>>, E> {
 /// the write creates. When appending, the dataset's manifest is the base the facts extend.
 fn facts11(
     lease: &Lease,
+    root: &str,
     st: &Staged,
     o: &Options,
     vf: &Json,
@@ -1708,7 +1721,7 @@ fn facts11(
         .as_ref()
         .map(|(m, _)| m)
         .filter(|_| o.mode == "append");
-    manifest11::facts(
+    let mut facts = manifest11::facts(
         lease,
         &stage_table(),
         st.domain,
@@ -1716,8 +1729,43 @@ fn facts11(
         files,
         base,
         write_threads(),
-    )
-    .map(Some)
+    )?;
+    if o.compact_extent {
+        facts.compact_set_path = Some(write_compact_extent(lease, root, o)?);
+    }
+    Ok(Some(facts))
+}
+
+/// The compact set of every covered cell (the staged cells, plus the dataset's earlier set
+/// when appending), canonical, as compact/cells.parquet (gid, level). Returns its path.
+fn write_compact_extent(lease: &Lease, root: &str, o: &Options) -> Result<String, E> {
+    const REL: &str = "compact/cells.parquet";
+    let mut gids: Vec<String> = rows(lease, &format!("SELECT DISTINCT gid FROM {}", stage_table()))?
+        .into_iter()
+        .filter_map(|r| r.into_iter().next().flatten())
+        .collect();
+    if o.mode != "overwrite" && o.mode != "create" {
+        let prev = o.prev.as_ref().and_then(|(m, _)| m.pointer("/extent/compact_set_path")?.as_str().map(str::to_string));
+        if let Some(rel) = prev {
+            gids.extend(
+                rows(lease, &format!("SELECT gid FROM read_parquet({})", lit(&join(root, &rel))))?
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next().flatten()),
+            );
+        }
+    }
+    let set = crate::compact::canonicalize(gids.iter().map(String::as_str)).map_err(|e| e.to_string())?;
+    ensure_dir(&join(root, "compact"))?;
+    let source = if set.is_empty() {
+        "SELECT NULL::VARCHAR AS gid, NULL::TINYINT AS level LIMIT 0".to_string()
+    } else {
+        format!(
+            "SELECT gid, CAST(length(gid) AS TINYINT) AS level FROM (SELECT unnest([{}]::VARCHAR[]) AS gid) ORDER BY gid",
+            set.iter().map(|g| lit(g)).collect::<Vec<_>>().join(", ")
+        )
+    };
+    sql::exec_on(lease, &format!("COPY ({source}) TO {} (FORMAT parquet, COMPRESSION zstd)", lit(&join(root, REL))))?;
+    Ok(REL.to_string())
 }
 
 /// Columns written to contract folders: everything, or gid + values for 'compact'.
@@ -1747,7 +1795,7 @@ fn write_flat(
         path: "data/part-00000.parquet".into(),
         predicate: "TRUE".into(),
     };
-    let facts = facts11(lease, st, o, &vf, vec![file])?;
+    let facts = facts11(lease, root, st, o, &vf, vec![file])?;
     let m = manifest(st, o, vf, vec![], st.rows, facts.as_ref())?;
     ensure_dir(&join(root, "data"))?;
     sql::exec_on(
@@ -1874,7 +1922,7 @@ fn write_partitioned(
         jobs.push((lo, hi, time_filter, staging.path(&join(root, &rel), &rel)?));
     }
     let vf = value_fields(st, o)?;
-    let facts = facts11(lease, st, o, &vf, specs)?;
+    let facts = facts11(lease, root, st, o, &vf, specs)?;
     let m = manifest(
         st,
         o,
@@ -2521,7 +2569,7 @@ fn write_iceberg(
         jobs.push((*pt, rel, file, filter));
     }
     let vf = value_fields(st, o)?;
-    let facts = facts11(lease, st, o, &vf, specs)?;
+    let facts = facts11(lease, root, st, o, &vf, specs)?;
     let cell_manifest = manifest(
         st,
         o,

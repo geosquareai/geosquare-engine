@@ -63,4 +63,12 @@ assert tc.execute("SELECT period_valid('2026-02-29', 'day'), period_valid('2026-
     False, True, "contained", "2026-11-19")
 assert tc.execute(f"SELECT period_start, period_end FROM cell_dataset_info('{t}/rain_ice')").fetchone() == ("2026-01-01", "2026-04-04")
 assert tc.execute(f"SELECT count(*), count(DISTINCT period) FROM read_cell_dataset('{t}/rain_ice')").fetchone() == (11914 * 93, 93)
+# sets-boundaries-crosswalks.md: the values its comments state
+s, sc = dirs["sets-boundaries-crosswalks.md"], conns["sets-boundaries-crosswalks.md"]
+assert sc.execute("SELECT compact_canonicalize(['22', '23', '24', '25', '32']), compact_contains(['2'], '25'), compact_check(['2', '22']), "
+                  "len(compact_expand(['2', '32'], 2))").fetchone() == (["2", "32"], True, 'GID "22" is inside row "2"', 5)
+assert abs(sc.execute("SELECT sum(population) FROM aggregate_geometries_to_cells('SELECT * FROM villages', domain_code := 'ID', level := 12, "
+                  "value_semantics := '{\"population\": \"TOTAL\", \"flood\": \"ORDINAL\"}', ordinal_order := '{\"flood\": [\"high\", \"low\"]}')").fetchone()[0] - 2000) < 1e-6
+assert sc.execute("SELECT boundary_covers_point('ID', 106.81, -6.21, wkt), boundary_covers_point('ID', 106.82, -6.20, wkt) FROM b").fetchone() == (True, False)
+assert sc.execute(f"SELECT manifest->'extent'->>'compact_set_path' FROM cell_dataset_info('{s}/landcover_11')").fetchone()[0] == "compact/cells.parquet"
 print(f"docs examples OK: {ran} statements in {len(docs)} documents ({skipped} blocks need S3/network)", dirs)

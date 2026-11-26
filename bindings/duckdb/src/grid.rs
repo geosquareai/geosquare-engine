@@ -37,6 +37,32 @@ fn strings(chunk: &DataChunkHandle, col: usize, n: usize) -> Vec<Option<String>>
         .collect()
 }
 
+/// VARCHAR[] input: one list of strings per row (None for a NULL list). NULL items are an error.
+fn string_lists(chunk: &DataChunkHandle, col: usize, n: usize) -> Result<Vec<Option<Vec<String>>>, Box<dyn Error>> {
+    let lv = chunk.list_vector(col);
+    let total = lv.len();
+    let child = lv.child(total);
+    let raw = unsafe { child.as_slice_with_len::<duckdb::ffi::duckdb_string_t>(total) };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if lv.row_is_null(i as u64) {
+            out.push(None);
+            continue;
+        }
+        let (off, len) = lv.get_entry(i);
+        let mut items = Vec::with_capacity(len);
+        for k in off..off + len {
+            if is_null(&child, k) {
+                return Err("a GID list holds NULL".into());
+            }
+            let mut s = raw[k];
+            items.push(DuckString::new(&mut s).as_str().to_string());
+        }
+        out.push(Some(items));
+    }
+    Ok(out)
+}
+
 fn prims<T: Copy>(chunk: &DataChunkHandle, col: usize, n: usize) -> Vec<Option<T>> {
     let v = chunk.flat_vector(col);
     let raw = unsafe { v.as_slice_with_len::<T>(n) };
@@ -1338,6 +1364,398 @@ impl VScalar for PeriodRollup {
 /// on the DuckDB version: `encode`/`decode` are DuckDB BLOB built-ins (DuckDB 1.4
 /// resolves `decode('<gid>')` to the built-in), and `UNPACK(...)` is DuckDB syntax.
 /// Use the v2 names `canonical_to_gid`, `gid_to_canonical` and `unpack_int64`.
+// ---------- cell_compact_set (crate::compact) ----------
+
+fn compact_err(e: Box<dyn Error + Send + Sync>) -> Box<dyn Error> {
+    e.to_string().into()
+}
+
+/// compact_canonicalize(gids VARCHAR[]) -> VARCHAR[]: the canonical compact set, sorted.
+pub struct CompactCanonicalize;
+impl VScalar for CompactCanonicalize {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let mut rows = Vec::with_capacity(n);
+        for l in string_lists(input, 0, n)? {
+            rows.push(match l {
+                Some(l) => Some(crate::compact::canonicalize(l.iter().map(String::as_str)).map_err(compact_err)?),
+                None => None,
+            });
+        }
+        finish_list(out, rows);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar))],
+            LogicalTypeHandle::list(&type_id(Varchar)),
+        )]
+    }
+}
+
+/// compact_expand(gids VARCHAR[], level) -> VARCHAR[]: every level-`level` cell of the set.
+pub struct CompactExpand;
+impl VScalar for CompactExpand {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (lists, level) = (string_lists(input, 0, n)?, prims::<i32>(input, 1, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&lists[i], level[i]) {
+                (Some(l), Some(t)) => {
+                    let t = u8::try_from(t).map_err(|_| "level must be 0 to 14")?;
+                    Some(crate::compact::expand(l.iter().map(String::as_str), t).map_err(compact_err)?)
+                }
+                _ => None,
+            });
+        }
+        finish_list(out, rows);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar)), type_id(Integer)],
+            LogicalTypeHandle::list(&type_id(Varchar)),
+        )]
+    }
+}
+
+/// compact_contains(gids VARCHAR[], gid) -> BOOLEAN: gid is a row of the set or under one.
+pub struct CompactContains;
+impl VScalar for CompactContains {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (lists, g) = (string_lists(input, 0, n)?, strings(input, 1, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&lists[i], &g[i]) {
+                (Some(l), Some(g)) => Some(crate::compact::contains(l.iter().map(String::as_str), g).map_err(compact_err)?),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar)), type_id(Varchar)],
+            type_id(Boolean),
+        )]
+    }
+}
+
+/// compact_check(gids VARCHAR[]) -> VARCHAR: why the list is not a canonical compact set,
+/// NULL when it is (no duplicates, no row inside another, no complete child group).
+pub struct CompactCheck;
+impl VScalar for CompactCheck {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let mut msg: Vec<Option<String>> = Vec::with_capacity(n);
+        for l in string_lists(input, 0, n)? {
+            msg.push(match l {
+                Some(l) => {
+                    let rows: Vec<(String, Option<i64>)> = l.into_iter().map(|g| (g, None)).collect();
+                    crate::compact::check(&rows).map_err(compact_err)?
+                }
+                None => None,
+            });
+        }
+        let mut v = out.flat_vector();
+        for (i, m) in msg.iter().enumerate() {
+            match m {
+                Some(m) => v.insert(i, m.as_str()),
+                None => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::list(&type_id(Varchar))],
+            type_id(Varchar),
+        )]
+    }
+}
+
+// ---------- geometry_to_cells: one feature's cells with its share in each ----------
+
+/// One feature's cells at `level`: (cell, share of the feature, records, cell coverage).
+/// Polygons: share = coverage / sum of coverage (the feature's area share), coverage kept;
+/// lines: share = length ratio; points: share = records = points in the cell.
+pub fn feature_cells(
+    d: &'static domain::Domain,
+    wkt: &str,
+    level: u8,
+    crs: &str,
+    boundary: Option<(&crate::boundary::Boundary, crate::boundary::Rule)>,
+) -> Result<Vec<(Cell, f64, i64, Option<f64>)>, Box<dyn Error>> {
+    use crate::boundary::Rule;
+    // With a boundary: points must be covered (COVERS_POINT); the cells of lines and
+    // polygons must pass the cell rule, and shares are taken over the cells kept.
+    let keep = |c: Cell| -> Result<bool, Box<dyn Error>> {
+        match boundary {
+            None => Ok(true),
+            Some((_, Rule::CoversPoint)) => Err("COVERS_POINT is for points; lines and polygons need CENTROID_COVERED, INTERSECTS or MIN_COVERAGE".into()),
+            Some((b, rule)) => b.cell_matches(c, rule).map_err(|e| e.to_string().into()),
+        }
+    };
+    Ok(match geom::parse_geometry(wkt)? {
+        geom::Geometry::Points(p) if boundary.is_some() => {
+            let b = boundary.unwrap().0;
+            let mut kept = Vec::new();
+            for pt in p {
+                let covered = if crs.eq_ignore_ascii_case("grid") { b.covers(pt) } else { b.covers_lonlat(pt.0, pt.1).map_err(|e| e.to_string())? };
+                if covered {
+                    kept.push(pt);
+                }
+            }
+            crate::lines::points_to_cells(d, &kept, level, crs, false)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(c, n)| (c, n as f64, n as i64, None))
+                .collect()
+        }
+        geom::Geometry::Polygons(p) => {
+            let opts = crate::polyfill::PolyfillOptions {
+                source_crs: crs.to_string(),
+                max_candidate_limit: i64::MAX,
+                ..Default::default()
+            };
+            let mut cells = crate::polyfill::polyfill(d, p, level, &opts).map_err(|e| e.to_string())?;
+            if boundary.is_some() {
+                let mut kept = Vec::with_capacity(cells.len());
+                for x in cells {
+                    if keep(x.0)? {
+                        kept.push(x);
+                    }
+                }
+                cells = kept;
+            }
+            let total: f64 = cells.iter().map(|(_, c)| c).sum();
+            cells
+                .into_iter()
+                .map(|(c, cov)| (c, if total > 0.0 { cov / total } else { 0.0 }, 1, Some(cov)))
+                .collect()
+        }
+        geom::Geometry::Lines(l) => {
+            let mut out = Vec::new();
+            for (c, r) in crate::lines::line_to_cells(d, &l, level, crs, i64::MAX).map_err(|e| e.to_string())? {
+                if keep(c)? {
+                    out.push((c, r, 1, None));
+                }
+            }
+            out
+        }
+        geom::Geometry::Points(p) => crate::lines::points_to_cells(d, &p, level, crs, false)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(c, n)| (c, n as f64, n as i64, None))
+            .collect(),
+    })
+}
+
+/// geometry_to_cells(domain_code, wkt, level [, source_crs]) ->
+///   LIST(STRUCT(gid, packed_id, share, records, coverage_ratio))
+/// The cells of one feature (POINT, LINESTRING, POLYGON or their MULTI forms, lon/lat unless
+/// source_crs). `share` is the feature's share in the cell: a polygon's area share (its
+/// coverage over the sum of its coverage), a line's length ratio, or the points in the cell.
+/// `coverage_ratio` is the cell's share covered by a polygon (NULL for lines and points).
+pub struct GeometryToCells;
+impl VScalar for GeometryToCells {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, wkt, level) = (strings(input, 0, n), strings(input, 1, n), prims::<i32>(input, 2, n));
+        let crs = if input.num_columns() > 3 { strings(input, 3, n) } else { vec![None; n] };
+        let (bspec, bpred, bmin) = if input.num_columns() > 4 {
+            (
+                strings(input, 4, n),
+                strings(input, 5, n),
+                if input.num_columns() > 6 { prims::<f64>(input, 6, n) } else { vec![None; n] },
+            )
+        } else {
+            (vec![None; n], vec![None; n], vec![None; n])
+        };
+        let mut rows: Vec<Option<Vec<(String, i64, f64, i64, Option<f64>)>>> = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], &wkt[i], level[i]) {
+                (Some(c), Some(w), Some(l)) => {
+                    let d = domain_by_code(c)?;
+                    let l = u8::try_from(l).map_err(|_| "level must be 0 to 14")?;
+                    let crs = crs[i].clone().unwrap_or_else(|| "EPSG:4326".into());
+                    let mut v = Vec::new();
+                    let b = match (&bspec[i], &bpred[i]) {
+                        (Some(spec), Some(pred)) => Some((
+                            crate::boundary::load(d, spec, None, crate::boundary::read_file).map_err(|e| e.to_string())?,
+                            crate::boundary::Rule::parse(pred, bmin[i]).map_err(|e| e.to_string())?,
+                        )),
+                        _ => None,
+                    };
+                    for (cell, share, rec, cov) in feature_cells(d, w, l, &crs, b.as_ref().map(|(b, r)| (b.as_ref(), *r)))? {
+                        v.push((codec::encode(cell)?, packing::pack(d.id, cell)?, share, rec, cov));
+                    }
+                    Some(v)
+                }
+                _ => None,
+            });
+        }
+        let mut lv = out.list_vector();
+        let total: usize = rows.iter().map(|r| r.as_ref().map_or(0, Vec::len)).sum();
+        let sv = lv.struct_child(total);
+        let (g, mut p, mut s, mut r, mut c) =
+            (sv.child(0, total), sv.child(1, total), sv.child(2, total), sv.child(3, total), sv.child(4, total));
+        let mut off = 0;
+        for (i, row) in rows.iter().enumerate() {
+            match row {
+                Some(items) => {
+                    for (k, (gid, pk, share, rec, cov)) in items.iter().enumerate() {
+                        let j = off + k;
+                        g.insert(j, gid.as_str());
+                        put_i64(&mut p, j, *pk);
+                        put_f64(&mut s, j, *share);
+                        put_i64(&mut r, j, *rec);
+                        match cov {
+                            Some(x) => put_f64(&mut c, j, *x),
+                            None => c.set_null(j),
+                        }
+                    }
+                    lv.set_entry(i, off, items.len());
+                    off += items.len();
+                }
+                None => {
+                    lv.set_entry(i, off, 0);
+                    lv.set_null(i);
+                }
+            }
+        }
+        lv.set_len(total);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        let ret = || {
+            LogicalTypeHandle::list(&struct_type(&[
+                ("gid", Varchar),
+                ("packed_id", Bigint),
+                ("share", Double),
+                ("records", Bigint),
+                ("coverage_ratio", Double),
+            ]))
+        };
+        vec![
+            sig(&[Varchar, Varchar, Integer], ret()),
+            sig(&[Varchar, Varchar, Integer, Varchar], ret()),
+            // + boundary, boundary_predicate [, min_coverage]
+            sig(&[Varchar, Varchar, Integer, Varchar, Varchar, Varchar], ret()),
+            sig(&[Varchar, Varchar, Integer, Varchar, Varchar, Varchar, Double], ret()),
+        ]
+    }
+}
+
+// ---------- operational boundary (crate::boundary) ----------
+
+fn bnd(code: &str, spec: &str) -> Result<std::sync::Arc<crate::boundary::Boundary>, Box<dyn Error>> {
+    crate::boundary::load(domain_by_code(code)?, spec, None, crate::boundary::read_file).map_err(|e| e.to_string().into())
+}
+
+/// boundary_covers_point(domain_code, lon, lat, boundary) -> BOOLEAN (COVERS_POINT; on the
+/// boundary counts as covered). `boundary`: GeoJSON or WKT text, or a file path.
+pub struct BoundaryCoversPoint;
+impl VScalar for BoundaryCoversPoint {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, lon, lat, spec) = (strings(input, 0, n), prims::<f64>(input, 1, n), prims::<f64>(input, 2, n), strings(input, 3, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], lon[i], lat[i], &spec[i]) {
+                (Some(c), Some(x), Some(y), Some(s)) => Some(bnd(c, s)?.covers_lonlat(x, y).map_err(|e| e.to_string())?),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar, Double, Double, Varchar], type_id(Boolean))]
+    }
+}
+
+/// boundary_coverage(domain_code, gid, boundary) -> DOUBLE: share of the cell inside.
+pub struct BoundaryCoverage;
+impl VScalar for BoundaryCoverage {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, gid, spec) = (strings(input, 0, n), strings(input, 1, n), strings(input, 2, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], &gid[i], &spec[i]) {
+                (Some(c), Some(g), Some(s)) => Some(bnd(c, s)?.coverage(codec::decode(g)?).map_err(|e| e.to_string())?),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_f64);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar, Varchar, Varchar], type_id(Double))]
+    }
+}
+
+/// boundary_cell_matches(domain_code, gid, boundary, predicate [, min_coverage]) -> BOOLEAN
+/// predicate: CENTROID_COVERED, INTERSECTS or MIN_COVERAGE (with min_coverage).
+pub struct BoundaryCellMatches;
+impl VScalar for BoundaryCellMatches {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, gid, spec, pred) = (strings(input, 0, n), strings(input, 1, n), strings(input, 2, n), strings(input, 3, n));
+        let t = if input.num_columns() > 4 { prims::<f64>(input, 4, n) } else { vec![None; n] };
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], &gid[i], &spec[i], &pred[i]) {
+                (Some(c), Some(g), Some(s), Some(p)) => {
+                    let rule = crate::boundary::Rule::parse(p, t[i]).map_err(|e| e.to_string())?;
+                    Some(bnd(c, s)?.cell_matches(codec::decode(g)?, rule).map_err(|e| e.to_string())?)
+                }
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Varchar, Varchar, Varchar, Varchar], type_id(Boolean)),
+            sig(&[Varchar, Varchar, Varchar, Varchar, Double], type_id(Boolean)),
+        ]
+    }
+}
+
+/// file_sha256(path) -> VARCHAR: SHA-256 of a file's bytes (hex), e.g. to check a boundary file.
+pub struct FileSha256;
+impl VScalar for FileSha256 {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let mut v = out.flat_vector();
+        for (i, p) in strings(input, 0, n).into_iter().enumerate() {
+            match p {
+                Some(p) => v.insert(i, crate::boundary::file_sha256(&p).map_err(|e| e.to_string())?.as_str()),
+                None => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar], type_id(Varchar))]
+    }
+}
+
 pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<PointToCell>("point_to_cell")?;
     con.register_scalar_function::<PackInt64>("pack_int64")?;
@@ -1348,6 +1766,15 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<Pack>("pack")?;
     con.register_scalar_function::<Parent>("parent")?;
     con.register_scalar_function::<Children>("children")?;
+    con.register_scalar_function::<CompactCanonicalize>("compact_canonicalize")?;
+    con.register_scalar_function::<CompactExpand>("compact_expand")?;
+    con.register_scalar_function::<CompactContains>("compact_contains")?;
+    con.register_scalar_function::<CompactCheck>("compact_check")?;
+    con.register_scalar_function::<GeometryToCells>("geometry_to_cells")?;
+    con.register_scalar_function::<BoundaryCoversPoint>("boundary_covers_point")?;
+    con.register_scalar_function::<BoundaryCoverage>("boundary_coverage")?;
+    con.register_scalar_function::<BoundaryCellMatches>("boundary_cell_matches")?;
+    con.register_scalar_function::<FileSha256>("file_sha256")?;
     con.register_scalar_function::<KRing>("k_ring")?;
     con.register_scalar_function::<KDisk>("k_disk")?;
     con.register_scalar_function::<DistanceM>("distance_m")?;

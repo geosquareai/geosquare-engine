@@ -148,6 +148,10 @@ pub fn plan_validate(p: &Params) -> Result<Plan, E> {
     let Some(m) = src.manifest.clone() else {
         return Err(format!("{root} has no cell manifest; nothing to validate against").into());
     };
+    if crate::compact_store::is_compact(Some(&m)) {
+        let checks = crate::compact_store::checks(&lease, &root, &m)?;
+        return Ok(checks_plan(&checks));
+    }
     let code = m
         .get("domain_code")
         .and_then(Json::as_str)

@@ -217,6 +217,10 @@ changes, for every layout): [docs/write-guide.md](docs/write-guide.md).
 Time cubes (`cell_time_values`, one row per cell and period: `period_type`, `period`,
 `period_from` / `period_to`, `time_rollup`, file pruning by period):
 [docs/time-cube.md](docs/time-cube.md).
+Compact cell sets (`cell_compact_set`), CATEGORICAL `majority_weighted` roll-ups, features to
+cells by value semantics, operational country boundaries, Crosswalk 1.0, time values from any
+query and manifest 1.1 compact extents: [docs/sets-boundaries-crosswalks.md](docs/sets-boundaries-crosswalks.md)
+(checked against the Python reference by `tests/test_parity_oracles.py`).
 Ready-to-use wrappers for Node (`@duckdb/node-api`), the browser (DuckDB-Wasm) and Python,
 with one API (`summarize`, `cells`, `rollup`, `atPoints`, `featureCollection`, `stream`,
 `write`): [examples/](examples/README.md).
@@ -422,6 +426,11 @@ Time cube (`cell_time_values`, satu baris per sel dan periode) untuk ketiga layo
 dengan `period_type`, baca dengan `period`, `period_from` / `period_to` dan `time_rollup`;
 Iceberg dan partitioned hanya membaca file yang periodenya masuk rentang. Lihat
 [docs/time-cube.md](docs/time-cube.md).
+Compact set (`cell_compact_set`), rollup kelas `majority_weighted`, agregasi fitur geometri ke
+sel menurut semantics, batas negara operasional (COVERS_POINT, CENTROID_COVERED, INTERSECTS,
+MIN_COVERAGE), Crosswalk 1.0, `time_values` untuk query apa pun, dan compact extent manifest
+1.1 ada di [docs/sets-boundaries-crosswalks.md](docs/sets-boundaries-crosswalks.md); semuanya
+dicocokkan sel per sel dengan rujukan Python oleh `tests/test_parity_oracles.py`.
 Skrip siap pakai untuk backend Node, frontend (DuckDB-Wasm) dan Python ada di
 [examples/](examples/README.md).
 Beberapa nama fungsi berbeda dari binding Python/Wasm karena bentrok dengan DuckDB (`encode` → `canonical_to_gid`,
