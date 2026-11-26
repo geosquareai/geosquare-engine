@@ -653,6 +653,13 @@ pub fn plan_read(p: &Params) -> Result<Plan, E> {
             Plan::Query(format!("SELECT * FROM {from}"))
         }
     };
+    let plan = match id {
+        Some((d, _)) => boundary_filter(plan, p, d)?,
+        None if p.text("boundary").is_some() => {
+            return Err("boundary needs the domain: the dataset has no cell manifest".into())
+        }
+        None => plan,
+    };
     let plan = match &time {
         Some(t) => crate::timequery::rollup(
             crate::timequery::filter(plan, t),
@@ -939,6 +946,44 @@ fn add_rollup(plan: Plan, p: &Params, ctx: &QueryCtx) -> Result<Plan, E> {
     Ok(match plan {
         Plan::Query(q) => Plan::Query(wrap(&q)),
         Plan::Typed(q, probe) => Plan::Typed(wrap(&q), wrap(&probe)),
+        other => other,
+    })
+}
+
+/// `boundary`, `boundary_predicate` (default CENTROID_COVERED for cells), `boundary_min_coverage`
+/// and `boundary_sha256` as extra arguments of geometry_to_cells (", spec, predicate, t"), or
+/// "" without a boundary. The boundary is loaded and checked here, at bind time.
+pub fn boundary_args(p: &Params, d: &'static geosquare_core::domain::Domain) -> Result<String, E> {
+    let Some(spec) = p.text("boundary") else {
+        for k in ["boundary_predicate", "boundary_min_coverage", "boundary_sha256"] {
+            if p.get(k).is_some() {
+                return Err(format!("{k} needs boundary := '<GeoJSON or WKT, or a file path>'").into());
+            }
+        }
+        return Ok(String::new());
+    };
+    let pred = p.text("boundary_predicate").unwrap_or_else(|| "CENTROID_COVERED".into());
+    let t = p.float("boundary_min_coverage");
+    crate::boundary::Rule::parse(&pred, t).map_err(|e| e.to_string())?;
+    crate::boundary::load(d, &spec, p.text("boundary_sha256").as_deref(), crate::boundary::read_file)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(", {}, {}{}", lit(&spec), lit(&pred), t.map_or(String::new(), |t| format!(", {t:?}"))))
+}
+
+/// Keep the cells the boundary rule accepts (`boundary := ...`, see boundary_args).
+fn boundary_filter(plan: Plan, p: &Params, d: &'static geosquare_core::domain::Domain) -> Result<Plan, E> {
+    let args = boundary_args(p, d)?;
+    if args.is_empty() {
+        return Ok(plan);
+    }
+    if p.text("boundary_predicate").is_some_and(|x| x.eq_ignore_ascii_case("COVERS_POINT")) {
+        return Err("COVERS_POINT is for points; filter cells with CENTROID_COVERED, INTERSECTS or MIN_COVERAGE".into());
+    }
+    let cond = format!("boundary_cell_matches({}, gid{args})", lit(d.code));
+    let wrap = |q: &str| format!("SELECT * FROM ({q}) WHERE {cond}");
+    Ok(match plan {
+        Plan::Query(q) => Plan::Query(wrap(&q)),
+        Plan::Typed(q, probe) => Plan::Typed(wrap(&q), probe),
         other => other,
     })
 }
@@ -1261,6 +1306,7 @@ pub fn plan_query(p: &Params) -> Result<Plan, E> {
 /// time cube only the periods asked for, rolled up in time when asked.
 fn plan_query_cells(p: &Params, path: &str, multi: bool) -> Result<(Plan, QueryCtx), E> {
     let (plan, ctx) = plan_query_area(p, path, multi)?;
+    let plan = boundary_filter(plan, p, crate::grid::domain_by_code(ctx.code).map_err(|e| e.to_string())?)?;
     let plan = match &ctx.time {
         Some(t) => crate::timequery::rollup(
             crate::timequery::filter(plan, t),

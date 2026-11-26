@@ -1491,26 +1491,65 @@ pub fn feature_cells(
     wkt: &str,
     level: u8,
     crs: &str,
+    boundary: Option<(&crate::boundary::Boundary, crate::boundary::Rule)>,
 ) -> Result<Vec<(Cell, f64, i64, Option<f64>)>, Box<dyn Error>> {
+    use crate::boundary::Rule;
+    // With a boundary: points must be covered (COVERS_POINT); the cells of lines and
+    // polygons must pass the cell rule, and shares are taken over the cells kept.
+    let keep = |c: Cell| -> Result<bool, Box<dyn Error>> {
+        match boundary {
+            None => Ok(true),
+            Some((_, Rule::CoversPoint)) => Err("COVERS_POINT is for points; lines and polygons need CENTROID_COVERED, INTERSECTS or MIN_COVERAGE".into()),
+            Some((b, rule)) => b.cell_matches(c, rule).map_err(|e| e.to_string().into()),
+        }
+    };
     Ok(match geom::parse_geometry(wkt)? {
+        geom::Geometry::Points(p) if boundary.is_some() => {
+            let b = boundary.unwrap().0;
+            let mut kept = Vec::new();
+            for pt in p {
+                let covered = if crs.eq_ignore_ascii_case("grid") { b.covers(pt) } else { b.covers_lonlat(pt.0, pt.1).map_err(|e| e.to_string())? };
+                if covered {
+                    kept.push(pt);
+                }
+            }
+            crate::lines::points_to_cells(d, &kept, level, crs, false)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(c, n)| (c, n as f64, n as i64, None))
+                .collect()
+        }
         geom::Geometry::Polygons(p) => {
             let opts = crate::polyfill::PolyfillOptions {
                 source_crs: crs.to_string(),
                 max_candidate_limit: i64::MAX,
                 ..Default::default()
             };
-            let cells = crate::polyfill::polyfill(d, p, level, &opts).map_err(|e| e.to_string())?;
+            let mut cells = crate::polyfill::polyfill(d, p, level, &opts).map_err(|e| e.to_string())?;
+            if boundary.is_some() {
+                let mut kept = Vec::with_capacity(cells.len());
+                for x in cells {
+                    if keep(x.0)? {
+                        kept.push(x);
+                    }
+                }
+                cells = kept;
+            }
             let total: f64 = cells.iter().map(|(_, c)| c).sum();
             cells
                 .into_iter()
                 .map(|(c, cov)| (c, if total > 0.0 { cov / total } else { 0.0 }, 1, Some(cov)))
                 .collect()
         }
-        geom::Geometry::Lines(l) => crate::lines::line_to_cells(d, &l, level, crs, i64::MAX)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|(c, r)| (c, r, 1, None))
-            .collect(),
+        geom::Geometry::Lines(l) => {
+            let mut out = Vec::new();
+            for (c, r) in crate::lines::line_to_cells(d, &l, level, crs, i64::MAX).map_err(|e| e.to_string())? {
+                if keep(c)? {
+                    out.push((c, r, 1, None));
+                }
+            }
+            out
+        }
         geom::Geometry::Points(p) => crate::lines::points_to_cells(d, &p, level, crs, false)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -1532,6 +1571,15 @@ impl VScalar for GeometryToCells {
         let n = input.len();
         let (code, wkt, level) = (strings(input, 0, n), strings(input, 1, n), prims::<i32>(input, 2, n));
         let crs = if input.num_columns() > 3 { strings(input, 3, n) } else { vec![None; n] };
+        let (bspec, bpred, bmin) = if input.num_columns() > 4 {
+            (
+                strings(input, 4, n),
+                strings(input, 5, n),
+                if input.num_columns() > 6 { prims::<f64>(input, 6, n) } else { vec![None; n] },
+            )
+        } else {
+            (vec![None; n], vec![None; n], vec![None; n])
+        };
         let mut rows: Vec<Option<Vec<(String, i64, f64, i64, Option<f64>)>>> = Vec::with_capacity(n);
         for i in 0..n {
             rows.push(match (&code[i], &wkt[i], level[i]) {
@@ -1540,7 +1588,14 @@ impl VScalar for GeometryToCells {
                     let l = u8::try_from(l).map_err(|_| "level must be 0 to 14")?;
                     let crs = crs[i].clone().unwrap_or_else(|| "EPSG:4326".into());
                     let mut v = Vec::new();
-                    for (cell, share, rec, cov) in feature_cells(d, w, l, &crs)? {
+                    let b = match (&bspec[i], &bpred[i]) {
+                        (Some(spec), Some(pred)) => Some((
+                            crate::boundary::load(d, spec, None, crate::boundary::read_file).map_err(|e| e.to_string())?,
+                            crate::boundary::Rule::parse(pred, bmin[i]).map_err(|e| e.to_string())?,
+                        )),
+                        _ => None,
+                    };
+                    for (cell, share, rec, cov) in feature_cells(d, w, l, &crs, b.as_ref().map(|(b, r)| (b.as_ref(), *r)))? {
                         v.push((codec::encode(cell)?, packing::pack(d.id, cell)?, share, rec, cov));
                     }
                     Some(v)
@@ -1593,7 +1648,111 @@ impl VScalar for GeometryToCells {
         vec![
             sig(&[Varchar, Varchar, Integer], ret()),
             sig(&[Varchar, Varchar, Integer, Varchar], ret()),
+            // + boundary, boundary_predicate [, min_coverage]
+            sig(&[Varchar, Varchar, Integer, Varchar, Varchar, Varchar], ret()),
+            sig(&[Varchar, Varchar, Integer, Varchar, Varchar, Varchar, Double], ret()),
         ]
+    }
+}
+
+// ---------- operational boundary (crate::boundary) ----------
+
+fn bnd(code: &str, spec: &str) -> Result<std::sync::Arc<crate::boundary::Boundary>, Box<dyn Error>> {
+    crate::boundary::load(domain_by_code(code)?, spec, None, crate::boundary::read_file).map_err(|e| e.to_string().into())
+}
+
+/// boundary_covers_point(domain_code, lon, lat, boundary) -> BOOLEAN (COVERS_POINT; on the
+/// boundary counts as covered). `boundary`: GeoJSON or WKT text, or a file path.
+pub struct BoundaryCoversPoint;
+impl VScalar for BoundaryCoversPoint {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, lon, lat, spec) = (strings(input, 0, n), prims::<f64>(input, 1, n), prims::<f64>(input, 2, n), strings(input, 3, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], lon[i], lat[i], &spec[i]) {
+                (Some(c), Some(x), Some(y), Some(s)) => Some(bnd(c, s)?.covers_lonlat(x, y).map_err(|e| e.to_string())?),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar, Double, Double, Varchar], type_id(Boolean))]
+    }
+}
+
+/// boundary_coverage(domain_code, gid, boundary) -> DOUBLE: share of the cell inside.
+pub struct BoundaryCoverage;
+impl VScalar for BoundaryCoverage {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, gid, spec) = (strings(input, 0, n), strings(input, 1, n), strings(input, 2, n));
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], &gid[i], &spec[i]) {
+                (Some(c), Some(g), Some(s)) => Some(bnd(c, s)?.coverage(codec::decode(g)?).map_err(|e| e.to_string())?),
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_f64);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar, Varchar, Varchar], type_id(Double))]
+    }
+}
+
+/// boundary_cell_matches(domain_code, gid, boundary, predicate [, min_coverage]) -> BOOLEAN
+/// predicate: CENTROID_COVERED, INTERSECTS or MIN_COVERAGE (with min_coverage).
+pub struct BoundaryCellMatches;
+impl VScalar for BoundaryCellMatches {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let (code, gid, spec, pred) = (strings(input, 0, n), strings(input, 1, n), strings(input, 2, n), strings(input, 3, n));
+        let t = if input.num_columns() > 4 { prims::<f64>(input, 4, n) } else { vec![None; n] };
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            rows.push(match (&code[i], &gid[i], &spec[i], &pred[i]) {
+                (Some(c), Some(g), Some(s), Some(p)) => {
+                    let rule = crate::boundary::Rule::parse(p, t[i]).map_err(|e| e.to_string())?;
+                    Some(bnd(c, s)?.cell_matches(codec::decode(g)?, rule).map_err(|e| e.to_string())?)
+                }
+                _ => None,
+            });
+        }
+        finish_scalar(out, rows, put_bool);
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![
+            sig(&[Varchar, Varchar, Varchar, Varchar], type_id(Boolean)),
+            sig(&[Varchar, Varchar, Varchar, Varchar, Double], type_id(Boolean)),
+        ]
+    }
+}
+
+/// file_sha256(path) -> VARCHAR: SHA-256 of a file's bytes (hex), e.g. to check a boundary file.
+pub struct FileSha256;
+impl VScalar for FileSha256 {
+    type State = ();
+    fn invoke(_: &(), input: &mut DataChunkHandle, out: &mut dyn WritableVector) -> R {
+        let n = input.len();
+        let mut v = out.flat_vector();
+        for (i, p) in strings(input, 0, n).into_iter().enumerate() {
+            match p {
+                Some(p) => v.insert(i, crate::boundary::file_sha256(&p).map_err(|e| e.to_string())?.as_str()),
+                None => v.set_null(i),
+            }
+        }
+        Ok(())
+    }
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![sig(&[Varchar], type_id(Varchar))]
     }
 }
 
@@ -1612,6 +1771,10 @@ pub fn register(con: &Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<CompactContains>("compact_contains")?;
     con.register_scalar_function::<CompactCheck>("compact_check")?;
     con.register_scalar_function::<GeometryToCells>("geometry_to_cells")?;
+    con.register_scalar_function::<BoundaryCoversPoint>("boundary_covers_point")?;
+    con.register_scalar_function::<BoundaryCoverage>("boundary_coverage")?;
+    con.register_scalar_function::<BoundaryCellMatches>("boundary_cell_matches")?;
+    con.register_scalar_function::<FileSha256>("file_sha256")?;
     con.register_scalar_function::<KRing>("k_ring")?;
     con.register_scalar_function::<KDisk>("k_disk")?;
     con.register_scalar_function::<DistanceM>("distance_m")?;

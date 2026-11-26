@@ -24,6 +24,7 @@ mod registry;
 mod sql;
 mod storage;
 mod tables;
+mod boundary;
 mod compact;
 mod compact_store;
 mod geoagg;
@@ -117,6 +118,13 @@ unsafe fn register_dataset_functions(
             ("time_rule", Text),
         ];
         read_params.extend(time_params);
+        let boundary_params = [
+            ("boundary", Text),
+            ("boundary_predicate", Text),
+            ("boundary_min_coverage", Float),
+            ("boundary_sha256", Text),
+        ];
+        read_params.extend(boundary_params);
         let r = (|| -> Result<(), Box<dyn Error>> {
             sql::register(
                 con,
@@ -145,6 +153,7 @@ unsafe fn register_dataset_functions(
                 ("space_weight", Text),
             ]);
             q.extend(time_params);
+            q.extend(boundary_params);
             let mut qm = q;
             qm.push(("fill_nulls", Bool));
             // query_cell_dataset(path | [path, ...]): a list behaves as query_cell_datasets.
@@ -233,6 +242,10 @@ unsafe fn register_dataset_functions(
                     ("rate_parts", Text),
                     ("range_columns", Text),
                     ("ordinal_order", Text),
+                    ("boundary", Text),
+                    ("boundary_predicate", Text),
+                    ("boundary_min_coverage", Float),
+                    ("boundary_sha256", Text),
                 ],
                 geoagg::plan,
                 pool.clone(),

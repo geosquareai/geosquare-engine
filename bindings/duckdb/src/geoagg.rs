@@ -57,6 +57,7 @@ pub fn plan(p: &Params) -> Result<Plan, E> {
         return Err("category_rule must be 'majority_weighted' or 'centroid_category'".into());
     }
     let semantics = PerColumn::parse(p.text("value_semantics"), "value_semantics")?;
+    let boundary = crate::dataset::boundary_args(p, d)?;
     let rate_parts = json_map(p.text("rate_parts"), "rate_parts")?;
     let ranges = json_map(p.text("range_columns"), "range_columns")?;
     let orders = json_map(p.text("ordinal_order"), "ordinal_order")?;
@@ -145,7 +146,7 @@ pub fn plan(p: &Params) -> Result<Plan, E> {
     let aggs = if aggs.is_empty() { String::new() } else { format!("{}, ", aggs.join(", ")) };
     let grouped = format!(
         "WITH f AS (SELECT *, row_number() OVER () AS __fid FROM ({query})), \
-         x AS (SELECT f.*, unnest(geometry_to_cells({}, CAST(f.{} AS VARCHAR), {level}, {})) AS __c FROM f WHERE f.{} IS NOT NULL) \
+         x AS (SELECT f.*, unnest(geometry_to_cells({}, CAST(f.{} AS VARCHAR), {level}, {}{boundary})) AS __c FROM f WHERE f.{} IS NOT NULL) \
          SELECT x.__c.gid AS gid, x.__c.packed_id AS packed_id, {aggs}{feature} AS feature_count FROM x GROUP BY 1, 2",
         lit(d.code),
         ident(&geom_col),
