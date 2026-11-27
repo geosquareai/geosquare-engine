@@ -1,0 +1,22 @@
+# Weekly dependency update PRs. Minor and patch updates come grouped in one PR per ecosystem; major updates come one by one.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly, day: monday }
+    target-branch: main
+    groups: { actions: { patterns: ["*"] } }
+  - package-ecosystem: cargo
+    directories: ["/core", "/bindings/*"]
+    schedule: { interval: weekly, day: monday }
+    target-branch: main
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch: { update-types: [minor, patch] }
+  - package-ecosystem: pip
+    directories: ["/bindings/python", "/cli"]
+    schedule: { interval: weekly, day: monday }
+    target-branch: main
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch: { update-types: [minor, patch] }
