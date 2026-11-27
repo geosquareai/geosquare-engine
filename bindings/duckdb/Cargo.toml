@@ -17,7 +17,7 @@ duckdb = { version = "=1.20000.2", default-features = false, features = ["loadab
 serde_json = "1"
 base64 = "0.22"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 miniz_oxide = "0.9"
 i_overlay = "9.2"
 # Native S3 client for metadata/deletes (left out of the Wasm build: --no-default-features).
