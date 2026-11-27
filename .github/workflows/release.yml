@@ -35,10 +35,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust 1.94.0
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
@@ -52,7 +52,7 @@ jobs:
             rustup default 1.94.0
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v10.3.3
+        uses: astral-sh/setup-uv@v10.4.0
 
       - name: Test wheel from a clean environment
         shell: bash
@@ -77,10 +77,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust 1.94.0
-        uses: dtolnay/rust-toolchain@1.94.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -90,7 +90,7 @@ jobs:
           args: --out dist
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v10.3.3
+        uses: astral-sh/setup-uv@v10.4.0
 
       - name: Check that the sdist builds and imports
         shell: bash
@@ -142,7 +142,7 @@ jobs:
       id-token: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check that the tag matches the package version
         shell: bash
