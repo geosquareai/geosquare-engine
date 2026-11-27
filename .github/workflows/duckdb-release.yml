@@ -43,9 +43,9 @@ jobs:
         shell: bash
         working-directory: bindings/duckdb
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           targets: ${{ matrix.target || '' }}
 
@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -80,7 +80,7 @@ jobs:
             "../../.venv-$v/$( [ "$RUNNER_OS" = Windows ] && echo Scripts || echo bin )/python" tests/test_registry.py "dist/${{ matrix.platform }}/geosquare_v2.duckdb_extension"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ext-${{ matrix.platform }}
           path: bindings/duckdb/dist/${{ matrix.platform }}
@@ -92,7 +92,7 @@ jobs:
       run:
         working-directory: bindings/duckdb
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # std is rebuilt (panic=abort, and atomics for wasm_threads): nightly with rust-src.
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -108,15 +108,15 @@ jobs:
           for p in wasm_eh wasm_mvp wasm_threads; do
             mkdir -p dist/$p && cp build/$p/geosquare_v2.duckdb_extension.wasm dist/$p/
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ext-wasm_eh
           path: bindings/duckdb/dist/wasm_eh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ext-wasm_mvp
           path: bindings/duckdb/dist/wasm_mvp
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ext-wasm_threads
           path: bindings/duckdb/dist/wasm_threads
@@ -129,14 +129,14 @@ jobs:
       run:
         working-directory: bindings/duckdb
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: ext-*
           path: bindings/duckdb/dist
@@ -164,8 +164,8 @@ jobs:
     needs: [test]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: ext-*
           path: artifacts
@@ -182,7 +182,7 @@ jobs:
           python3 -c "import duckdb;c=duckdb.connect(config={'allow_unsigned_extensions':'true'});c.execute(\"INSTALL geosquare_v2 FROM 'http://127.0.0.1:8811'\");c.execute('LOAD geosquare_v2');print(c.execute('SELECT geosquare_engine_version()').fetchone()[0])"
       - name: GitHub release assets
         if: startsWith(github.ref, 'refs/tags/duckdb-v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             geosquare_v2-duckdb-repository.tar.gz
