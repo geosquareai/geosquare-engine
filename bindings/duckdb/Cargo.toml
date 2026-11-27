@@ -15,7 +15,7 @@ geosquare-core = { path = "../../core" }
 # Pinned: the C API (v1.2.0 struct) keeps one binary loadable in DuckDB 1.4 to 2.0.
 duckdb = { version = "=1.20000.2", default-features = false, features = ["loadable-extension", "vscalar", "vtab"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 sha2 = "0.10"
 miniz_oxide = "0.9"
